@@ -117,6 +117,6 @@
 | label | fps (median 90–140 s) | GPU busy | errors |
 |---|---|---|---|
 | baseline | 15.0 | 76 % | 0 |
-| map_hoist | | | |
+| map_hoist | 15.0 | 71 % | 0 |
 | sbase_cache | | | |
 | ud_const | | | |

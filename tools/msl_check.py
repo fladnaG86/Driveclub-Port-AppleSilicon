@@ -57,8 +57,23 @@ def check_compiles():
         assert msl.count('{') == msl.count('}'), '%s: unbalanced braces' % name
 
 
+def dc_ptr_text(msl):
+    i = msl.find('dc_ptr(thread const DcMem')
+    return msl[i:msl.find('\n}', i)] if i >= 0 else ''
+
+
+def check_map_header_read_once():
+    msl, ok, _ = gen('two_loads_same_base', map_hoist=1)
+    assert ok, 'map_hoist=1: MSL does not compile'
+    assert 'DcMapL' in msl, 'map_hoist=1: no hoisted header'
+    assert 'm.map->' not in dc_ptr_text(msl), 'map_hoist=1: dc_ptr still reads m.map->'
+    msl, ok, _ = gen('two_loads_same_base', map_hoist=0)
+    assert ok and 'm.map->' in dc_ptr_text(msl), 'map_hoist=0: old path gone'
+
+
 CHECKS = {
     'compiles': check_compiles,
+    'map_header_read_once': check_map_header_read_once,
 }
 
 

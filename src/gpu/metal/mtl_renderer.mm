@@ -440,6 +440,7 @@ struct MetalRenderer::Impl {
   static constexpr u32 kProbeSlots = 4096;
   id<MTLTexture> pass_tex[9] = {};
   u64 pass_addr[9] = {};
+  bool map_hoist = true; // DC_NO_MAP_HOIST: shaders read the page-table header per access
   bool stats = false;   // DC_GPU_STATS: per-second GPU time and submit counts
   bool profile = false; // DC_GPU_PROFILE: GPU time per shader (one command
                         // buffer per call)
@@ -517,6 +518,7 @@ struct MetalRenderer::Impl {
       std::memset(probe_buf.contents, 0, probe_buf.length);
     }
     stats = std::getenv("DC_GPU_STATS") != nullptr;
+    map_hoist = std::getenv("DC_NO_MAP_HOIST") == nullptr;
     profile = std::getenv("DC_GPU_PROFILE") != nullptr;
     compiler = std::make_unique<ShaderCompiler>(device, 4);
     signal_event = [device newSharedEvent];
@@ -2821,7 +2823,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   const bool capture = debug_vsout && vs_addr == debug_vsout && !debug_vs_buf;
   vo.debug_capture = capture;
   vo.textures = vs_types;
+  vo.map_hoist = map_hoist;
   u64 vs_key = Hash(vs->hash);
+  vs_key = Hash(vo.map_hoist, vs_key);
   vs_key = Hash(rect, vs_key);
   vs_key = Hash(u32(vo.points) | (u32(vo.vtx_point_size) << 1), vs_key);
   vs_key = Hash(capture, vs_key);
@@ -2836,6 +2840,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     fo.ps_input_addr = r[Reg::SPI_PS_INPUT_ADDR];
     fo.col_format = col_format;
     fo.dual_source = dual_source;
+    fo.map_hoist = map_hoist;
     for (u32 k = 0; k < 8; ++k) {
       fo.mrt_type[k] = out_type[k];
       if (color_fmt[k] == MTLPixelFormatRG11B10Float) {
@@ -2859,6 +2864,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     ps_key = Hash(fo.ps_input_addr, ps_key);
     ps_key = Hash(fo.col_format, ps_key);
     ps_key = Hash(fo.dual_source, ps_key);
+    ps_key = Hash(fo.map_hoist, ps_key);
     ps_key = Fnv(fo.mrt_type.data(), sizeof(fo.mrt_type), ps_key);
     ps_key = Hash(fo.mrt_ufloat, ps_key);
     ps_key =
@@ -3401,6 +3407,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
 
   Shader::MslOptions o;
   o.textures = types;
+  o.map_hoist = map_hoist;
   const int probe_slot = ProbeSlot(
       addr, "dispatch " + std::to_string(stat_dispatches) + " cs " + Hex(addr));
   if (probe_slot >= 0) {
@@ -3411,6 +3418,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   u64 key = Hash(cs->hash);
   key = Hash(o.probe_pc, key);
   key = Hash(rsrc2, key);
+  key = Hash(o.map_hoist, key);
   key = Fnv(types.data(), types.size() * sizeof(TextureType), key);
   const u32 group = tx * ty * tz;
   const u64 pkey = Hash(group, key);

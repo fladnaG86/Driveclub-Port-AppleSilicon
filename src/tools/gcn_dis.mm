@@ -28,9 +28,10 @@ bool Query(VAddr, bool, Vma*) {
 
 // key=value overrides of the MslOptions the generator is tested with.
 static bool SetOption(Gpu::Shader::MslOptions& o, const std::string& key, unsigned long v) {
-    (void)o;
-    (void)key;
-    (void)v;
+    if (key == "map_hoist") {
+        o.map_hoist = v != 0;
+        return true;
+    }
     return false;
 }
 

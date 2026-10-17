@@ -88,6 +88,9 @@ struct MslOptions {
     // Dual-source blending: the MRT1 export is the second blend source,
     // [[color(0), index(1)]], declared even when the shader never writes it.
     bool dual_source = false;
+    // Guest memory helpers read the page-table header from registers filled
+    // once at entry instead of from the buffer on every access.
+    bool map_hoist = false;
     // DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE: discard where the stored depth (a copy at
     // texture(kDepthBoundsTexture)) is outside [min, max] (buffer(kDepthBoundsBuffer)).
     bool depth_bounds = false;

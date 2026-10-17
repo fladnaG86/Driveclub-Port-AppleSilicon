@@ -221,6 +221,12 @@ private:
         Line(p.stage == Stage::Compute ? "return;" : "return out;");
     }
 
+    std::string MemInit() const {
+        return o.map_hoist ? "DcMem mem = {gm0, gm1, &gmap, {gmap.base, gmap.pages, gmap.split, gmap.limit, "
+                             "gmap.shift, (device const int*)(&gmap + 1)}};"
+                           : "DcMem mem = {gm0, gm1, &gmap};";
+    }
+
     bool Structure();
     void EmitStructured();
     void EmitSwitch();
@@ -1688,6 +1694,14 @@ std::string Emitter::Run() {
     }
 
     std::string src = kMslPrelude;
+    if (o.map_hoist) {
+        for (const auto& [from, to] : {std::pair<std::string, std::string>{"((device const int*)(m.map + 1))", "m.mapl.entries"},
+                                       {"m.map->", "m.mapl."}}) {
+            for (size_t at; (at = src.find(from)) != std::string::npos;) {
+                src.replace(at, from.size(), to);
+            }
+        }
+    }
     src += "\n";
     const std::string mem_params =
         "constant uint* ud [[buffer(0)]], device uint* gm0 [[buffer(1)]], device uint* gm1 [[buffer(2)]], "
@@ -1709,7 +1723,7 @@ std::string Emitter::Run() {
         src += "vertex VsOut main0(uint vid [[vertex_id]], uint iid [[instance_id]], " + mem_params +
                ", constant DcDraw& draw [[buffer(4)]]" + (o.debug_capture ? ", device float4* dbg [[buffer(6)]]" : "") +
                TexParams(true) + ") {\n";
-        src += "    DcMem mem = {gm0, gm1, &gmap};\n    VsOut o;\n";
+        src += "    " + MemInit() + "\n    VsOut o;\n";
         if (o.rect_list) {
             // As shadPS4's rect list TCS: the vertex whose x matches one neighbour and y
             // the other is the right-angle corner; the 4th vertex is opposite it. Triangles:
@@ -1779,7 +1793,7 @@ std::string Emitter::Run() {
         if (o.depth_bounds) {
             src += "    { float z_ = dc_zb.read(uint2(pin.pos.xy)).x; float bmin = min(dc_zbr.x, dc_zbr.y); float bmax = max(dc_zbr.x, dc_zbr.y); if (z_ < bmin || z_ > bmax) discard_fragment(); }\n";
         }
-        src += "    DcMem mem = {gm0, gm1, &gmap};\n    PsOut out = {};\n    bool dc_exported = false;\n";
+        src += "    " + MemInit() + "\n    PsOut out = {};\n    bool dc_exported = false;\n";
         src += "    uint dc_qlane = (uint(pin.pos.x) & 1u) | ((uint(pin.pos.y) & 1u) << 1);\n";
         src += "    (void)mem; (void)dc_qlane;\n";
         src += decl + wrapped + "}\n";
@@ -1789,7 +1803,7 @@ std::string Emitter::Run() {
                "uint3 dc_gtid [[thread_position_in_grid]], " +
                mem_params + ", device uint* gds [[buffer(5)]], threadgroup uint* lds [[threadgroup(0)]]" + probe_param + TexParams(true) +
                ") {\n";
-        src += "    DcMem mem = {gm0, gm1, &gmap};\n    uint dc_lane = dc_lidx & 63u;\n";
+        src += "    " + MemInit() + "\n    uint dc_lane = dc_lidx & 63u;\n";
         src += "    (void)mem; (void)dc_lane; (void)lds; (void)gds;\n";
         src += decl + wrapped + "}\n";
     }
