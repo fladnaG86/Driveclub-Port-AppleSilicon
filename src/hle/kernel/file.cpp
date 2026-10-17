@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -139,6 +140,13 @@ s32 sceKernelOpen(const char* path, int flags, u16 mode) {
         const int err = errno;
         if (err != ENOENT) {
             DC_WARN("open(%s) failed: %d", path, err);
+        } else if (static const bool log = std::getenv("DC_LOG_MISSING") != nullptr; log) {
+            static std::mutex lock;
+            static std::set<std::string> missing;
+            std::scoped_lock lk(lock);
+            if (missing.insert(path).second) {
+                DC_INFO("open(%s): not found (%s)", path, host.c_str());
+            }
         }
         return OrbisError(err);
     }
