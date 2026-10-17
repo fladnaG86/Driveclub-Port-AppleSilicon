@@ -51,6 +51,14 @@ static std::atomic<u8> g_left_y{128};
 static std::atomic<u8> g_right_x{128};
 static std::atomic<u8> g_right_y{128};
 
+// Microseconds, like sceKernelGetProcessTime: games skip samples whose time
+// did not move.
+static u64 PadTimestamp() {
+    using namespace std::chrono;
+    static const auto t0 = steady_clock::now();
+    return duration_cast<microseconds>(steady_clock::now() - t0).count();
+}
+
 s32 scePadReadState(s32 handle, OrbisPadData* data) {
     if (data) {
         std::memset(data, 0, sizeof(*data));
@@ -61,6 +69,7 @@ s32 scePadReadState(s32 handle, OrbisPadData* data) {
         data->acceleration[2] = 9.8f;
         data->connected = true;
         data->connectedCount = 1;
+        data->timestamp = PadTimestamp();
     }
     return 0;
 }
@@ -76,6 +85,7 @@ s32 scePadRead(s32 handle, OrbisPadData* data, s32 count) {
             data[i].acceleration[2] = 9.8f;
             data[i].connected = true;
             data[i].connectedCount = 1;
+            data[i].timestamp = PadTimestamp();
         }
     }
     return count;
@@ -143,14 +153,19 @@ static void StartAutoPress() {
         p = *q == ',' ? q + 1 : q;
         if (q == p && *p) break;
     }
-    std::thread([times] {
+    // DC_AUTOPRESS_BUTTON=<hex mask> (default Cross), DC_AUTOPRESS_HOLD=<ms>.
+    const char* be = std::getenv("DC_AUTOPRESS_BUTTON");
+    const u32 button = be ? static_cast<u32>(std::strtoul(be, nullptr, 16)) : 0x4000;
+    const char* he = std::getenv("DC_AUTOPRESS_HOLD");
+    const s64 hold = he ? std::strtoll(he, nullptr, 10) : 250;
+    std::thread([times, button, hold] {
         const auto t0 = std::chrono::steady_clock::now();
         for (double t : times) {
             std::this_thread::sleep_until(t0 + std::chrono::milliseconds(static_cast<s64>(t * 1000)));
-            DC_INFO("pad: auto-press Cross at %.1f s", t);
-            SetButton(0x4000, true);
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-            SetButton(0x4000, false);
+            DC_INFO("pad: auto-press %#x at %.1f s", button, t);
+            SetButton(button, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(hold));
+            SetButton(button, false);
         }
     }).detach();
 }
