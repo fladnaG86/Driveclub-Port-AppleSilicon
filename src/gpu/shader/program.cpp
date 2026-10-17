@@ -360,14 +360,34 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
     return p;
 }
 
-u32 ResolveSgpr(const SgprSource& src, const u32* ud) {
+namespace {
+
+bool ReadableCached(u64 addr, u64 size, SgprReadCache* cache) {
+    if (!cache) {
+        return Readable(addr, size);
+    }
+    if (addr >= cache->start && addr + size <= cache->end) {
+        return true;
+    }
+    Core::Memory::Vma vma;
+    if (!addr || !Core::Memory::Query(addr, false, &vma) || addr + size > vma.start + vma.size) {
+        return false;
+    }
+    cache->start = vma.start;
+    cache->end = vma.start + vma.size;
+    return true;
+}
+
+} // namespace
+
+u32 ResolveSgpr(const SgprSource& src, const u32* ud, SgprReadCache* cache) {
     switch (src.kind) {
     case SgprSource::UserData:
         return ud[src.ud];
     case SgprSource::PointerLoad: {
         const u64 base = (u64(ud[src.ud]) | (u64(ud[src.ud + 1]) << 32)) & 0xFFFFFFFFFFFFull;
         const u64 addr = base + src.offset;
-        if (!Readable(addr, 4)) {
+        if (!ReadableCached(addr, 4, cache)) {
             return 0;
         }
         u32 v;
@@ -377,7 +397,7 @@ u32 ResolveSgpr(const SgprSource& src, const u32* ud) {
     case SgprSource::BufferLoad: {
         const u64 base = u64(ud[src.ud]) | (u64(ud[src.ud + 1] & 0xFFF) << 32);
         const u64 addr = base + src.offset;
-        if (!Readable(addr, 4)) {
+        if (!ReadableCached(addr, 4, cache)) {
             return 0;
         }
         u32 v;

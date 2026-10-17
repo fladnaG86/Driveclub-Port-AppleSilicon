@@ -2463,17 +2463,18 @@ struct MetalRenderer::Impl {
     out.tex.clear();
     out.smp.clear();
     ssharps_.clear();
+    Shader::SgprReadCache rc;
     for (const auto &ss : p.samplers) {
       std::array<u32, 4> s{};
       for (u32 k = 0; k < 4; ++k) {
-        s[k] = Shader::ResolveSgpr(ss[k], ud);
+        s[k] = Shader::ResolveSgpr(ss[k], ud, &rc);
       }
       ssharps_.push_back(s);
     }
     for (const auto &img : p.images) {
       u32 t[8];
       for (u32 k = 0; k < 8; ++k) {
-        t[k] = Shader::ResolveSgpr(img.tsharp[k], ud);
+        t[k] = Shader::ResolveSgpr(img.tsharp[k], ud, &rc);
       }
       TextureType tt;
       id<MTLTexture> tex = GetTexture(t, &tt, img.storage);
@@ -4209,6 +4210,17 @@ bool MetalRenderer::DmaData(std::uint32_t dst_sel, std::uint64_t dst,
 
 void MetalRenderer::OnContextRegs(const std::uint32_t *body,
                                   std::uint32_t body_dwords) {
+  // Only color target and depth info writes matter: skip the lock (which the
+  // compute queues contend for) for every other register.
+  if (body_dwords < 2) {
+    return;
+  }
+  const u32 reg = kContextRegBase + body[0];
+  const u32 base0 = Reg::CB_COLOR0_BASE;
+  if ((reg < base0 || reg >= base0 + 8 * Reg::kColorTargetStride) &&
+      reg != Reg::DB_Z_INFO) {
+    return;
+  }
   std::scoped_lock lk(impl->lock);
   impl->OnContextRegs(body, body_dwords);
 }

@@ -99,7 +99,14 @@ struct BuildInput {
 // Decodes and analyzes a program. Returns null if the code is unreadable.
 std::unique_ptr<Program> BuildProgram(const BuildInput& in);
 
-// Evaluates a descriptor dword at draw time.
-u32 ResolveSgpr(const SgprSource& src, const u32* user_data);
+// The last guest mapping a descriptor read went through: descriptor words
+// sit next to each other, so one lookup serves a whole draw's worth.
+struct SgprReadCache {
+    u64 start = 0, end = 0;
+};
+
+// Evaluates a descriptor dword at draw time. `cache` (optional) must not
+// outlive the draw: a mapping may go away between draws.
+u32 ResolveSgpr(const SgprSource& src, const u32* user_data, SgprReadCache* cache = nullptr);
 
 } // namespace Gpu::Shader
