@@ -746,7 +746,17 @@ struct MetalRenderer::Impl {
     }
   }
 
+  // DC_GPU_STATS: why passes over the same targets get split.
+  PassState last_pass;
+  void *last_end_ra = nullptr;
+  std::unordered_map<void *, u64> split_by;
+  u64 stat_passes = 0, stat_split = 0;
+
   void EndPass() {
+    if (enc && stats) {
+      last_pass = pass;
+      last_end_ra = __builtin_return_address(0);
+    }
     if (enc) {
       [enc endEncoding];
       enc = nil;
@@ -2056,6 +2066,14 @@ struct MetalRenderer::Impl {
     rp.renderTargetWidth = w;
     rp.renderTargetHeight = h;
     enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    if (stats) {
+      ++stat_passes;
+      if (ps == last_pass && last_end_ra) {
+        ++stat_split;
+        ++split_by[last_end_ra];
+      }
+      last_end_ra = nullptr;
+    }
     pass = ps;
     if (dump_passes && trace) {
       for (u32 k = 0; k < 8; ++k) {
@@ -3548,6 +3566,24 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
           stat_dispatches / double(frames), stat_commits / double(frames),
           stat_waits / double(frames),
           stat_hashed / double(frames) / (1 << 20), pending.size());
+      {
+        std::vector<std::pair<u64, void *>> top;
+        for (auto &[ra, n] : split_by) {
+          top.push_back({n, ra});
+        }
+        std::sort(top.rbegin(), top.rend());
+        std::string by;
+        for (size_t k = 0; k < top.size() && k < 6; ++k) {
+          char buf[48];
+          std::snprintf(buf, sizeof(buf), " %p:%llu", top[k].second,
+                        (unsigned long long)top[k].first);
+          by += buf;
+        }
+        DC_INFO("gpu stats: %.0f passes/frame, %.0f split from the same targets by%s",
+                stat_passes / double(frames), stat_split / double(frames), by.c_str());
+        split_by.clear();
+        stat_passes = stat_split = 0;
+      }
       stat_hashed = 0;
       frames = stat_commits = stat_waits = stat_draws = stat_dispatches = 0;
       if (profile) {
