@@ -484,6 +484,34 @@ struct MetalRenderer::Impl {
   };
   std::mutex profile_lock;
   std::unordered_map<std::string, ProfileEntry> profile_data;
+  // DC_PASS_TIMING (with DC_GPU_STATS): GPU timestamps at the start and end of
+  // every render pass and dispatch, from stage-boundary counters, so nothing
+  // is split or committed early. Reported per second as ms per frame.
+  bool pass_timing = false;
+  static constexpr u32 kTsPerBuf = 4096; // Metal caps a sample buffer at 32 KB
+  static constexpr u32 kTsBufs = 8;
+  id<MTLCounterSampleBuffer> ts_buf[kTsBufs] = {};
+  u32 ts_next = 0; // next group of 4 samples in the ring
+  struct TsPass {
+    u32 sample;
+    u64 shader; // first pixel shader of a render pass, or the compute shader
+    u32 draws;
+    u32 w, h;
+    bool compute;
+  };
+  std::vector<TsPass> ts_cmd; // passes recorded into `cmd`
+  std::mutex ts_lock;
+  std::unordered_map<std::string, ProfileEntry> ts_data;
+  double ts_vs_s = 0, ts_fs_s = 0, ts_cs_s = 0;
+  MTLTimestamp ts_cpu0 = 0, ts_gpu0 = 0;
+  double ts_ns_per_tick = 1.0;
+
+  u32 TsBegin(u64 shader, u32 w, u32 h, bool compute) {
+    const u32 sample = ts_next;
+    ts_next = (ts_next + 4) % (kTsPerBuf * kTsBufs);
+    ts_cmd.push_back({sample, shader, 0, w, h, compute});
+    return sample;
+  }
   std::atomic<u64> gpu_ns{0};
   u64 stat_hashed = 0;
   u64 stat_commits = 0, stat_waits = 0, stat_dispatches = 0, stat_draws = 0;
@@ -581,6 +609,25 @@ struct MetalRenderer::Impl {
     tex_cache_check = std::getenv("DC_TEX_CACHE_CHECK") != nullptr;
     map_hoist = std::getenv("DC_NO_MAP_HOIST") == nullptr;
     profile = std::getenv("DC_GPU_PROFILE") != nullptr;
+    if (std::getenv("DC_PASS_TIMING") &&
+        [device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+      for (id<MTLCounterSet> set in device.counterSets) {
+        if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+          MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+          d.counterSet = set;
+          d.storageMode = MTLStorageModeShared;
+          d.sampleCount = kTsPerBuf;
+          pass_timing = true;
+          for (u32 k = 0; k < kTsBufs; ++k) {
+            NSError *err = nil;
+            ts_buf[k] = [device newCounterSampleBufferWithDescriptor:d error:&err];
+            pass_timing = pass_timing && ts_buf[k];
+          }
+        }
+      }
+      [device sampleTimestamps:&ts_cpu0 gpuTimestamp:&ts_gpu0];
+      DC_INFO("gpu: pass timing %s", pass_timing ? "on" : "unavailable");
+    }
     compiler = std::make_unique<ShaderCompiler>(device, 4);
     signal_event = [device newSharedEvent];
     signal_listener = [[MTLSharedEventListener alloc]
@@ -959,6 +1006,50 @@ struct MetalRenderer::Impl {
         arena_released.store(head, std::memory_order_release);
       }];
     }
+    if (pass_timing && !ts_cmd.empty()) {
+      __block std::vector<TsPass> passes = std::move(ts_cmd);
+      ts_cmd.clear();
+      [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+        std::scoped_lock lk(ts_lock);
+        for (const TsPass &t : passes) {
+          const u32 n = t.compute ? 2 : 4;
+          NSData *d = [ts_buf[t.sample / kTsPerBuf]
+              resolveCounterRange:NSMakeRange(t.sample % kTsPerBuf, n)];
+          if (!d || d.length < n * sizeof(MTLCounterResultTimestamp)) {
+            continue;
+          }
+          const auto *v = static_cast<const MTLCounterResultTimestamp *>(d.bytes);
+          // Span of one stage (vertex, fragment or the compute encoder).
+          auto span = [&](u32 i) {
+            if (v[i].timestamp == MTLCounterErrorValue ||
+                v[i + 1].timestamp == MTLCounterErrorValue ||
+                v[i + 1].timestamp < v[i].timestamp) {
+              return 0.0;
+            }
+            return double(v[i + 1].timestamp - v[i].timestamp) * ts_ns_per_tick * 1e-9;
+          };
+          char what[64];
+          if (t.compute) {
+            std::snprintf(what, sizeof(what), "cs %#llx", (unsigned long long)t.shader);
+          } else {
+            std::snprintf(what, sizeof(what), "ps %#llx %ux%u", (unsigned long long)t.shader,
+                          t.w, t.h);
+          }
+          auto &e = ts_data[what];
+          const double sec = t.compute ? span(0) : span(2);
+          e.seconds += sec;
+          e.calls += t.compute ? 1 : t.draws;
+          (t.compute ? ts_cs_s : ts_fs_s) += sec;
+          if (!t.compute) {
+            const double vsec = span(0);
+            ts_vs_s += vsec;
+            auto &ve = ts_data[std::string("vertex ") + what];
+            ve.seconds += vsec;
+            ve.calls += t.draws;
+          }
+        }
+      }];
+    }
     if (stats) {
       ++stat_commits;
       [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
@@ -1109,6 +1200,36 @@ struct MetalRenderer::Impl {
       ++e.calls;
     }];
     Commit(false);
+  }
+
+  void PassTimingReport(u64 frames) {
+    MTLTimestamp cpu = 0, gpu = 0;
+    [device sampleTimestamps:&cpu gpuTimestamp:&gpu];
+    if (gpu > ts_gpu0 && cpu > ts_cpu0) {
+      ts_ns_per_tick = double(cpu - ts_cpu0) / double(gpu - ts_gpu0);
+    }
+    std::vector<std::pair<std::string, ProfileEntry>> v;
+    double vs = 0, fs = 0, cs = 0;
+    {
+      std::scoped_lock lk(ts_lock);
+      v.assign(ts_data.begin(), ts_data.end());
+      ts_data.clear();
+      vs = ts_vs_s;
+      fs = ts_fs_s;
+      cs = ts_cs_s;
+      ts_vs_s = ts_fs_s = ts_cs_s = 0;
+    }
+    std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) {
+      return a.second.seconds > b.second.seconds;
+    });
+    const double f = frames ? double(frames) : 1.0;
+    DC_INFO("pass timing: ms/frame summed over passes: fragment %.1f, vertex %.1f, "
+            "compute %.1f (%.3f ns/tick); per pass: fragment (or compute) span",
+            fs * 1e3 / f, vs * 1e3 / f, cs * 1e3 / f, ts_ns_per_tick);
+    for (size_t k = 0; k < v.size() && k < 30; ++k) {
+      DC_INFO("pass timing: %6.2f ms/frame %6.1f calls/frame  %s",
+              v[k].second.seconds * 1e3 / f, v[k].second.calls / f, v[k].first.c_str());
+    }
   }
 
   void ProfileReport() {
@@ -2201,6 +2322,16 @@ struct MetalRenderer::Impl {
     pass_height = h;
     rp.renderTargetWidth = w;
     rp.renderTargetHeight = h;
+    if (pass_timing) {
+      const u32 sample = TsBegin(0, w, h, false);
+      MTLRenderPassSampleBufferAttachmentDescriptor *a =
+          rp.sampleBufferAttachments[0];
+      a.sampleBuffer = ts_buf[sample / kTsPerBuf];
+      a.startOfVertexSampleIndex = sample % kTsPerBuf;
+      a.endOfVertexSampleIndex = sample % kTsPerBuf + 1;
+      a.startOfFragmentSampleIndex = sample % kTsPerBuf + 2;
+      a.endOfFragmentSampleIndex = sample % kTsPerBuf + 3;
+    }
     enc = [cmd renderCommandEncoderWithDescriptor:rp];
     if (stats) {
       ++stat_passes;
@@ -3630,7 +3761,17 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   std::memcpy(cud, ud, sizeof(cud));
   PatchUserData(cud);
   UpdateMemMap();
-  id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+  id<MTLComputeCommandEncoder> e = nil;
+  if (pass_timing) {
+    const u32 sample = TsBegin(addr, gx, gy, true);
+    MTLComputePassDescriptor *cp = [MTLComputePassDescriptor computePassDescriptor];
+    cp.sampleBufferAttachments[0].sampleBuffer = ts_buf[sample / kTsPerBuf];
+    cp.sampleBufferAttachments[0].startOfEncoderSampleIndex = sample % kTsPerBuf;
+    cp.sampleBufferAttachments[0].endOfEncoderSampleIndex = sample % kTsPerBuf + 1;
+    e = [cmd computeCommandEncoderWithDescriptor:cp];
+  } else {
+    e = [cmd computeCommandEncoder];
+  }
   [e setComputePipelineState:pso];
   [e setBytes:cud length:64 atIndex:Shader::Binding::UserData];
   [e setBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
@@ -3778,6 +3919,9 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
                 (unsigned long long)tex_cache_mismatches);
       }
       stat_hashed = 0;
+      if (pass_timing) {
+        PassTimingReport(frames);
+      }
       frames = stat_commits = stat_waits = stat_draws = stat_dispatches = 0;
       if (profile) {
         ProfileReport();
@@ -3923,6 +4067,13 @@ void MetalRenderer::Draw(const RegFile &regs, const DrawCall &draw) {
                    regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_PS),
                    draw.count, draw.instances, draw.indexed);
     impl->Draw(regs, draw);
+    if (impl->pass_timing && impl->enc && !impl->ts_cmd.empty() &&
+        !impl->ts_cmd.back().compute) {
+      Impl::TsPass &t = impl->ts_cmd.back();
+      if (!t.draws++) {
+        t.shader = regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_PS);
+      }
+    }
     if (impl->profile) {
       char what[64];
       std::snprintf(what, sizeof(what), "vs %#llx ps %#llx",
