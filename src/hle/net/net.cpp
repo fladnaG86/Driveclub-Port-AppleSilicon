@@ -3,6 +3,7 @@
 #include "hle/net/net.h"
 
 #include <arpa/inet.h>
+#include <cstdlib>
 #include <cstring>
 
 #include "common/log.h"
@@ -57,9 +58,18 @@ s32 sceNetCtlTerm() {
     return 0;
 }
 
+// DC_OFFLINE=1: no network, as on a console with the cable out.
+static bool Offline() {
+    static const bool off = std::getenv("DC_OFFLINE") != nullptr;
+    return off;
+}
+
 s32 sceNetCtlGetInfo(s32 code, OrbisNetCtlInfo* info) {
     if (!info) {
         return -1;
+    }
+    if (Offline()) {
+        return static_cast<s32>(0x80412104); // ORBIS_NET_CTL_ERROR_NOT_CONNECTED
     }
     info->device = 1; // wired
     info->ether_addr.data[0] = 0x00;
@@ -83,7 +93,7 @@ s32 sceNetInit() {
 
 s32 sceNetCtlGetState(s32* state) {
     if (state) {
-        *state = 3; // ORBIS_NET_CTL_STATE_IPOBTAINED
+        *state = Offline() ? 0 : 3; // DISCONNECTED / IPOBTAINED
     }
     return 0;
 }

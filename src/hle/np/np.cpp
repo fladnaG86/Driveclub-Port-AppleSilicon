@@ -2,6 +2,7 @@
 
 #include "hle/np/np.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "common/log.h"
@@ -33,7 +34,22 @@ s32 sceNpGetOnlineId(s32 user_id, void* online_id) {
     return 0;
 }
 
+// The state callback: games wait for it to learn whether the user is signed in
+// to PSN. DC_OFFLINE reports signed out, otherwise signed in.
+using NpStateCallback = void (*)(s32 user_id, s32 state, void* np_id, void* arg);
+NpStateCallback g_state_cb = nullptr;
+void* g_state_arg = nullptr;
+bool g_state_sent = false;
+
 s32 sceNpCheckCallback() {
+    if (g_state_cb && !g_state_sent) {
+        g_state_sent = true;
+        static u8 np_id[36];
+        sceNpGetNpId(0x10000000, np_id);
+        const s32 state = std::getenv("DC_OFFLINE") ? 1 : 2; // SIGNED_OUT / SIGNED_IN
+        DC_INFO("sceNpCheckCallback: state callback -> %d", state);
+        g_state_cb(0x10000000, state, np_id, g_state_arg);
+    }
     return 0;
 }
 
@@ -89,6 +105,9 @@ s32 sceNpSetNpTitleId(const void* title_id, const void* secret) {
 }
 
 s32 sceNpRegisterStateCallback(void* cb, void* arg) {
+    g_state_cb = reinterpret_cast<NpStateCallback>(cb);
+    g_state_arg = arg;
+    g_state_sent = false;
     return 0;
 }
 
