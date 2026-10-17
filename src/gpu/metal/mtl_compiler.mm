@@ -1,6 +1,8 @@
 #include "gpu/metal/mtl_compiler.h"
 
 #include <pthread.h>
+#include <cstdlib>
+#include <cstring>
 
 #include "common/log.h"
 
@@ -58,7 +60,19 @@ id<MTLFunction> ShaderCompiler::Function(u64 key, const std::string& src, u64 ad
         }
     }
     MTLCompileOptions* opts = [MTLCompileOptions new];
-    opts.mathMode = MTLMathModeSafe;
+    // Relaxed keeps Inf/NaN semantics but lets the compiler fuse and reorder:
+    // ~5% less GPU time per frame in a race. DC_MATH_MODE=safe|fast for A/B.
+    static const MTLMathMode math_mode = [] {
+        const char* m = std::getenv("DC_MATH_MODE");
+        if (m && std::strcmp(m, "safe") == 0) {
+            return MTLMathModeSafe;
+        }
+        if (m && std::strcmp(m, "fast") == 0) {
+            return MTLMathModeFast;
+        }
+        return MTLMathModeRelaxed;
+    }();
+    opts.mathMode = math_mode;
     opts.languageVersion = MTLLanguageVersion3_0;
     NSError* err = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:@(src.c_str()) options:opts error:&err];
