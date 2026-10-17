@@ -83,6 +83,7 @@ int Run(int argc, char** argv) {
     SDL_MetalView view = SDL_Metal_CreateView(window);
 
     Gpu::Metal::PresenterConfig config{};
+    config.vsync = std::getenv("DC_NO_VSYNC") == nullptr; // DC_NO_VSYNC: uncap fps, for measurement
     auto device = std::make_unique<Gpu::Metal::Device>();
     auto presenter = std::make_unique<Gpu::Metal::Presenter>(*device, SDL_Metal_GetLayer(view), config);
     auto renderer = std::make_unique<Gpu::Metal::MetalRenderer>(*device);

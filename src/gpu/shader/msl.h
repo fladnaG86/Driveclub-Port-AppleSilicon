@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -101,8 +102,8 @@ struct MslOptions {
     // (n < 96), [104 + n] sN (n < 104). kProbeWords per slot.
     u32 probe_pc = ~0u;
     u32 probe_x = 0, probe_y = 0;
-    // Both.
-    std::vector<TextureType> textures; // per Program::images slot
+    // Both. Borrowed: the caller keeps the storage alive for the call.
+    std::span<const TextureType> textures; // per Program::images slot
 };
 
 // Returns the MSL source; the entry point is "main0". Opcodes that could not

@@ -325,6 +325,40 @@ struct MetalRenderer::Impl {
   TargetMap depth_targets;
   u64 write_seq = 0;
 
+  // GetTexture results for one T# descriptor. The answer changes only when a
+  // render target is created, grown or replaced, or a mip alias appears; the
+  // same descriptors come back for thousands of draws per frame. Writes to a
+  // target keep the same texture object, so they leave the cache alone.
+  // DC_NO_TEX_CACHE: resolve every descriptor (A/B).
+  bool tex_cache = true;
+  // DC_TEX_CACHE_CHECK: on a cache hit, also resolve the descriptor the slow
+  // way and report a mismatch. Deterministic, unlike comparing two runs.
+  bool tex_cache_check = false;
+  u64 tex_cache_mismatches = 0, tex_cache_checks = 0;
+  struct TextureCacheEntry {
+    id<MTLTexture> tex = nil;
+    TextureType type;
+    u64 epoch = 0;
+  };
+  std::unordered_map<u64, TextureCacheEntry> texture_cache;
+  u64 texture_cache_frame = ~0ull;
+  u64 texture_epoch = 0;
+
+  // A target was written: Latest() picks the most recently written surface at
+  // an address, so when several share one the answer changes. With one target
+  // there it cannot, and the cache stays valid.
+  void NoteTargetWritten(const RenderTarget &rt) {
+    auto c = color_targets.find(rt.addr);
+    if (c == color_targets.end() || c->second.size() > 1) {
+      ++texture_epoch;
+      return;
+    }
+    auto d = depth_targets.find(rt.addr);
+    if (d != depth_targets.end() && d->second.size() > 1) {
+      ++texture_epoch;
+    }
+  }
+
   // Fast-clear metadata surfaces (CMASK / HTILE) -> the surface they describe.
   struct Meta {
     u64 target = 0;
@@ -454,6 +488,30 @@ struct MetalRenderer::Impl {
   u64 stat_hashed = 0;
   u64 stat_commits = 0, stat_waits = 0, stat_dispatches = 0, stat_draws = 0;
   double stat_wait_s = 0;
+  // DC_CPU_PROFILE: where the CPU time of a frame goes.
+  bool cpu_profile = false;
+  double cpu_draw_s = 0, cpu_resolve_s = 0, cpu_hash_s = 0, cpu_upload_s = 0;
+  double cpu_other_s = 0; // CPU time outside draws (CP parsing, submits, flips)
+  double cpu_gettex_s = 0; // part of resolve spent in GetTexture
+  double cpu_sampler_s = 0; // part of resolve spent in GetSampler
+  double cpu_sgpr_s = 0;    // part of resolve spent resolving S#/T# dwords
+  u64 cpu_gettex_calls = 0, cpu_gettex_hits = 0;
+  double cpu_flip_s = 0, cpu_commit_s = 0, cpu_dma_s = 0;
+  double cpu_notework_s = 0;
+  // Times a scope into `slot` (no-op unless DC_CPU_PROFILE).
+  struct CpuTimer {
+    double *slot;
+    std::chrono::steady_clock::time_point t0;
+    explicit CpuTimer(double *s)
+        : slot(s), t0(std::chrono::steady_clock::now()) {}
+    ~CpuTimer() {
+      if (slot) {
+        *slot += std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - t0)
+                     .count();
+      }
+    }
+  };
   std::chrono::steady_clock::time_point stat_t0 =
       std::chrono::steady_clock::now();
   u64 draw_count = 0;
@@ -518,6 +576,9 @@ struct MetalRenderer::Impl {
       std::memset(probe_buf.contents, 0, probe_buf.length);
     }
     stats = std::getenv("DC_GPU_STATS") != nullptr;
+    cpu_profile = std::getenv("DC_CPU_PROFILE") != nullptr;
+    tex_cache = std::getenv("DC_NO_TEX_CACHE") == nullptr;
+    tex_cache_check = std::getenv("DC_TEX_CACHE_CHECK") != nullptr;
     map_hoist = std::getenv("DC_NO_MAP_HOIST") == nullptr;
     profile = std::getenv("DC_GPU_PROFILE") != nullptr;
     compiler = std::make_unique<ShaderCompiler>(device, 4);
@@ -871,6 +932,7 @@ struct MetalRenderer::Impl {
   }
 
   void Commit(bool wait) {
+    CpuTimer t(cpu_profile ? &cpu_commit_s : nullptr);
     EndPass();
     if (!cmd) {
       if (wait) {
@@ -1115,6 +1177,7 @@ struct MetalRenderer::Impl {
   std::string wd_desc[kWdRing];
 
   template <typename... Args> void NoteWork(const char *fmt, Args... args) {
+    CpuTimer t(cpu_profile ? &cpu_notework_s : nullptr);
     if (wd_work.size() > 8192) {
       wd_work.erase(0, 4096);
     }
@@ -1370,6 +1433,7 @@ struct MetalRenderer::Impl {
   // Cheap change detection: a few dwords spread over the texture.
   u64 Hash64(const u8 *p, u64 size) {
     stat_hashed += size;
+    CpuTimer t(cpu_profile ? &cpu_hash_s : nullptr);
     u64 h[4] = {0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full,
                 0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull};
     u64 off = 0;
@@ -1411,6 +1475,65 @@ struct MetalRenderer::Impl {
   // Decodes a T# and returns a Metal texture for it.
   id<MTLTexture> GetTexture(const u32 t[8], TextureType *type_out,
                             bool storage = false) {
+    // Writable images mark their target written and are rare: never cached.
+    // A texture dump asks for the raw bytes on every upload: also uncached.
+    if (storage || dump_texture || !tex_cache) {
+      return GetTextureUncached(t, type_out, storage);
+    }
+    if (cpu_profile) {
+      ++cpu_gettex_calls;
+    }
+    if (texture_cache_frame != frame_count) {
+      texture_cache.clear();
+      texture_cache_frame = frame_count;
+    }
+    // The descriptor is the key: t[6] and t[7] are unused by the decoder.
+    u64 key = Hash(t[0]);
+    for (u32 k = 1; k < 6; ++k) {
+      key = Hash(t[k], key);
+    }
+    if (auto it = texture_cache.find(key); it != texture_cache.end()) {
+      if (it->second.epoch == texture_epoch) {
+        if (cpu_profile) {
+          ++cpu_gettex_hits;
+        }
+        if (tex_cache_check) {
+          // Same descriptor, slow path: the texture object and the type must
+          // agree, or the cache is answering for a surface that changed.
+          TextureType slow_type;
+          id<MTLTexture> slow = GetTextureUncached(t, &slow_type, false);
+          ++tex_cache_checks;
+          const bool type_same =
+              slow_type.dim == it->second.type.dim &&
+              slow_type.sample == it->second.type.sample &&
+              slow_type.cube == it->second.type.cube &&
+              slow_type.compare == it->second.type.compare &&
+              slow_type.ufloat == it->second.type.ufloat;
+          if (slow != it->second.tex || !type_same) {
+            if (++tex_cache_mismatches <= 8) {
+              DC_ERROR("gpu: tex cache mismatch %#llx (cached %p slow %p, type "
+                       "%d/%d sample %d/%d)",
+                       (u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8,
+                       (__bridge void *)it->second.tex, (__bridge void *)slow,
+                       (int)it->second.type.dim, (int)slow_type.dim,
+                       (int)it->second.type.sample, (int)slow_type.sample);
+            }
+          }
+        }
+        *type_out = it->second.type;
+        return it->second.tex;
+      }
+    }
+    CpuTimer t_(cpu_profile ? &cpu_gettex_s : nullptr);
+    TextureType tt;
+    id<MTLTexture> tex = GetTextureUncached(t, &tt, false);
+    texture_cache[key] = TextureCacheEntry{tex, tt, texture_epoch};
+    *type_out = tt;
+    return tex;
+  }
+
+  id<MTLTexture> GetTextureUncached(const u32 t[8], TextureType *type_out,
+                                    bool storage) {
     const u64 addr =
         ((u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8) & kGpuAddrMask;
     const u32 dfmt = (t[1] >> 20) & 0x3F;
@@ -1458,6 +1581,7 @@ struct MetalRenderer::Impl {
           p->initialized = true;
           p->clear_pending = false;
           p->written = ++write_seq;
+          NoteTargetWritten(*p);
           type_out->ufloat = p->tex.pixelFormat == MTLPixelFormatRG11B10Float;
           return TargetView(*p, lv + base_level, 1, MTLPixelFormatInvalid,
                             base_array, slice_count);
@@ -1582,6 +1706,7 @@ struct MetalRenderer::Impl {
       target.initialized = true;
       target.clear_pending = false;
       target.written = ++write_seq;
+      NoteTargetWritten(target);
       return TargetView(target, base_level, 1, MTLPixelFormatInvalid,
                         base_array, slice_count);
     }
@@ -1640,6 +1765,9 @@ struct MetalRenderer::Impl {
       return e.base_view;
     };
     if (e.tex && e.frame == frame_count) {
+      if (cpu_profile) {
+        ++cpu_gettex_hits;
+      }
       return view();
     }
     if (e.tex) {
@@ -1676,6 +1804,8 @@ struct MetalRenderer::Impl {
     }
     const auto *src = reinterpret_cast<const u8 *>(addr);
     std::vector<u8> linear;
+    {
+    CpuTimer t(cpu_profile ? &cpu_upload_s : nullptr);
     for (u32 lv = 0; lv < levels; ++lv) {
       const Tiling::MipLevel &m = mips[lv];
       const u32 w = std::max(width >> lv, 1u), h = std::max(height >> lv, 1u);
@@ -1711,6 +1841,7 @@ struct MetalRenderer::Impl {
       }
     }
     (void)thick;
+    }
     e.chunks.resize((size + kChunk - 1) / kChunk);
     for (u32 c = 0; c < e.chunks.size(); ++c) {
       e.chunks[c] = ChunkHash(addr, size, c);
@@ -1862,6 +1993,7 @@ struct MetalRenderer::Impl {
         t->levels = new_levels;
         t->depth_or_layers = want_layers;
         t->views.clear();
+        ++texture_epoch; // the old texture object is gone
       }
       return *t;
     }
@@ -1879,6 +2011,7 @@ struct MetalRenderer::Impl {
             depth_or_layers, (unsigned long)fmt,
             (unsigned long long)resolving_shader);
     list.push_back(std::move(rt));
+    ++texture_epoch; // a new surface: descriptors may now resolve elsewhere
     return *list.back();
   }
 
@@ -2028,6 +2161,7 @@ struct MetalRenderer::Impl {
       rt.initialized = true;
       rt.clear_pending = false;
       rt.written = seq;
+      NoteTargetWritten(rt);
       ps.color[k] = reinterpret_cast<u64>(&rt);
       ps.slice[k] = rt.bind_slice | (rt.bind_level << 24);
       w = std::min(w, std::max(rt.width >> rt.bind_level, 1u));
@@ -2153,16 +2287,24 @@ struct MetalRenderer::Impl {
     std::vector<id<MTLTexture>> tex;
     std::vector<id<MTLSamplerState>> smp;
   };
+  // Draw-time scratch, kept across draws so a draw does not allocate.
+  std::vector<TextureType> draw_vs_types, draw_ps_types;
+  Resources draw_vs_res, draw_ps_res;
   // Evaluates each image instruction's descriptors against the user data.
+  // `ssharps_` is a member so a draw does not allocate it again.
+  std::vector<std::array<u32, 4>> ssharps_;
   void Resolve(const Program &p, const u32 *ud, std::vector<TextureType> &types,
                Resources &out) {
-    std::vector<std::array<u32, 4>> ssharps;
+    types.clear();
+    out.tex.clear();
+    out.smp.clear();
+    ssharps_.clear();
     for (const auto &ss : p.samplers) {
       std::array<u32, 4> s{};
       for (u32 k = 0; k < 4; ++k) {
         s[k] = Shader::ResolveSgpr(ss[k], ud);
       }
-      ssharps.push_back(s);
+      ssharps_.push_back(s);
     }
     for (const auto &img : p.images) {
       u32 t[8];
@@ -2193,8 +2335,8 @@ struct MetalRenderer::Impl {
                 (t[5] >> 13) & 0x1FFF);
       }
       if (img.compare && img.has_sampler &&
-          img.sampler_index < ssharps.size()) {
-        tt.compare = static_cast<u8>((ssharps[img.sampler_index][0] >> 12) & 7);
+          img.sampler_index < ssharps_.size()) {
+        tt.compare = static_cast<u8>((ssharps_[img.sampler_index][0] >> 12) & 7);
         static const bool always =
             std::getenv("DC_CMP_ALWAYS") != nullptr; // debug experiment
         if (always) {
@@ -2210,7 +2352,7 @@ struct MetalRenderer::Impl {
                                          : 1;
         }
         if (trace) {
-          const auto &ss = ssharps[img.sampler_index];
+          const auto &ss = ssharps_[img.sampler_index];
           DC_INFO("gpu:   compare sampler S# %08x %08x %08x %08x func %u",
                   ss[0], ss[1], ss[2], ss[3], tt.compare);
         }
@@ -2218,7 +2360,8 @@ struct MetalRenderer::Impl {
       types.push_back(tt);
       out.tex.push_back(tex);
     }
-    for (const auto &s : ssharps) {
+    for (const auto &s : ssharps_) {
+      CpuTimer t(cpu_profile ? &cpu_sampler_s : nullptr);
       out.smp.push_back(GetSampler(s.data()));
     }
   }
@@ -2270,6 +2413,7 @@ struct MetalRenderer::Impl {
       if (!added) {
         continue;
       }
+      ++texture_epoch; // a new level alias: descriptors at `a` resolve to it
       // Already rendered as a target of its own: move its slices in.
       auto list = color_targets.find(a);
       if (list == color_targets.end()) {
@@ -2305,6 +2449,7 @@ struct MetalRenderer::Impl {
                 c.height, m, rt.addr);
         retired.push_back(std::move(v[i]));
         v.erase(v.begin() + i);
+        ++texture_epoch; // surfaces went away: descriptors at `a` change
       }
       if (v.empty()) {
         color_targets.erase(list);
@@ -2540,6 +2685,7 @@ struct MetalRenderer::Impl {
 };
 
 void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
+  CpuTimer draw_timer(cpu_profile ? &cpu_draw_s : nullptr);
   ++draw_count;
   ++stat_draws;
   ++work_since_commit;
@@ -2743,12 +2889,16 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     }
   }
   // ---- resources ----
-  std::vector<TextureType> vs_types, ps_types;
-  Resources vs_res, ps_res;
+  std::vector<TextureType> &vs_types = draw_vs_types;
+  std::vector<TextureType> &ps_types = draw_ps_types;
+  Resources &vs_res = draw_vs_res, &ps_res = draw_ps_res;
   resolving_shader = ps_addr;
+  {
+  CpuTimer t(cpu_profile ? &cpu_resolve_s : nullptr);
   Resolve(*vs, vs_ud, vs_types, vs_res);
   if (ps) {
     Resolve(*ps, ps_ud, ps_types, ps_res);
+  }
   }
 
   bool pending_clear = depth && depth->clear_pending;
@@ -2822,7 +2972,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   vo.vtx_point_size = vo.points && (r[Reg::PA_CL_VS_OUT_CNTL] & 1);
   const bool capture = debug_vsout && vs_addr == debug_vsout && !debug_vs_buf;
   vo.debug_capture = capture;
-  vo.textures = vs_types;
+  vo.textures = vs_types; // borrowed: lives until the end of this draw
   vo.map_hoist = map_hoist;
   u64 vs_key = Hash(vs->hash);
   vs_key = Hash(vo.map_hoist, vs_key);
@@ -2847,7 +2997,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         fo.mrt_ufloat |= 1u << k;
       }
     }
-    fo.textures = ps_types;
+    fo.textures = ps_types; // borrowed, like vo.textures
     fo.depth_target = depth != nullptr;
     fo.depth_bounds = depth_bounds;
     if (probe_slot >= 0) {
@@ -3357,6 +3507,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
       to.clear_color = from->clear_color;
       to.clear_depth = from->clear_depth;
       to.written = ++write_seq;
+      NoteTargetWritten(to);
       if (trace || from->dim != TexDim::Tex2D) {
         DC_INFO("gpu:   surface copy %#llx -> %#llx (%ux%u dim %d layers %u fmt %lu)",
                 src, dst, from->width, from->height, (int)from->dim,
@@ -3406,7 +3557,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   Resolve(*cs, ud, types, res);
 
   Shader::MslOptions o;
-  o.textures = types;
+  o.textures = types; // borrowed: `types` lives until the key is hashed
   o.map_hoist = map_hoist;
   const int probe_slot = ProbeSlot(
       addr, "dispatch " + std::to_string(stat_dispatches) + " cs " + Hex(addr));
@@ -3555,6 +3706,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
 }
 
 void MetalRenderer::Impl::Flip(const FlipInfo &f) {
+  CpuTimer t(cpu_profile ? &cpu_flip_s : nullptr);
   ++frame_count;
   if (trace_frame) {
     trace = frame_count == trace_frame;
@@ -3591,6 +3743,39 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
                 stat_passes / double(frames), stat_split / double(frames), by.c_str());
         split_by.clear();
         stat_passes = stat_split = 0;
+      }
+      if (cpu_profile) {
+        // Wall clock per frame vs the part of it spent inside draws.
+        const double wall = dt * 1e3 / frames;
+        const double draw = cpu_draw_s * 1e3 / frames;
+        DC_INFO("cpu profile: %.1f ms/frame wall, draw %.1f (resolve %.1f, "
+                "texture upload %.1f, hash %.1f), outside draws %.1f",
+                wall, draw, cpu_resolve_s * 1e3 / frames,
+                cpu_upload_s * 1e3 / frames, cpu_hash_s * 1e3 / frames,
+                wall - draw);
+        DC_INFO("cpu profile:   GetTexture %.1f ms/frame, %.0f calls/frame, "
+                "%.0f same-frame hits, %.0f hashed chunks",
+                cpu_gettex_s * 1e3 / frames, cpu_gettex_calls / double(frames),
+                cpu_gettex_hits / double(frames), stat_hashed / 65536.0 / frames);
+        DC_INFO("cpu profile:   resolve: GetTexture %.1f, GetSampler %.1f, "
+                "rest (sgpr+alloc) %.1f",
+                cpu_gettex_s * 1e3 / frames, cpu_sampler_s * 1e3 / frames,
+                (cpu_resolve_s - cpu_gettex_s - cpu_sampler_s) * 1e3 / frames);
+        DC_INFO("cpu profile:   outside draws: flip %.1f, commit %.1f, "
+                "NoteWork %.1f, rest %.1f",
+                cpu_flip_s * 1e3 / frames, cpu_commit_s * 1e3 / frames,
+                cpu_notework_s * 1e3 / frames,
+                (wall - draw - cpu_flip_s * 1e3 / frames -
+                 cpu_commit_s * 1e3 / frames - cpu_notework_s * 1e3 / frames));
+        cpu_draw_s = cpu_resolve_s = cpu_hash_s = cpu_upload_s = 0;
+        cpu_gettex_s = cpu_notework_s = cpu_flip_s = cpu_commit_s = 0;
+        cpu_sampler_s = cpu_sgpr_s = 0;
+        cpu_gettex_calls = cpu_gettex_hits = 0;
+      }
+      if (tex_cache_check) {
+        DC_INFO("tex cache check: %llu hits verified, %llu mismatches",
+                (unsigned long long)tex_cache_checks,
+                (unsigned long long)tex_cache_mismatches);
       }
       stat_hashed = 0;
       frames = stat_commits = stat_waits = stat_draws = stat_dispatches = 0;

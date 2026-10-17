@@ -83,7 +83,8 @@ int main(int argc, char** argv) {
     for (u32 k = 0; k < 32; ++k) {
         o.ps_input_cntl[k] = k;
     }
-    o.textures.resize(prog->images.size());
+    std::vector<TextureType> textures(prog->images.size());
+    o.textures = textures;
     std::vector<std::string> unsupported;
     const std::string src = GenerateMsl(*prog, o, &unsupported);
     if (print_msl) {
