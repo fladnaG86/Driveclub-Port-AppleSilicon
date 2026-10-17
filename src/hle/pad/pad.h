@@ -81,6 +81,10 @@ enum Button : u32 {
 
 void SetButton(u32 button, bool pressed);
 void SetStick(bool right, u8 x, u8 y);
+// One stick axis (x or y) only, leaving the other where it is.
+void SetStickAxis(bool right, bool y, u8 value);
+// L2/R2 analog value; also presses the digital button past a small threshold.
+void SetTrigger(bool right, u8 value);
 
 void RegisterPad();
 

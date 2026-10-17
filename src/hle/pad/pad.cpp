@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <thread>
 #include <vector>
@@ -51,6 +52,8 @@ static std::atomic<u8> g_left_x{128};
 static std::atomic<u8> g_left_y{128};
 static std::atomic<u8> g_right_x{128};
 static std::atomic<u8> g_right_y{128};
+static std::atomic<u8> g_l2{0};
+static std::atomic<u8> g_r2{0};
 
 // Microseconds, like sceKernelGetProcessTime: games skip samples whose time
 // did not move.
@@ -71,6 +74,8 @@ s32 scePadReadState(s32 handle, OrbisPadData* data) {
         data->buttons = g_buttons.load();
         data->leftStick = {g_left_x.load(), g_left_y.load()};
         data->rightStick = {g_right_x.load(), g_right_y.load()};
+        data->analogButtons.l2 = g_l2.load();
+        data->analogButtons.r2 = g_r2.load();
         data->orientation[3] = 1.0f;
         data->acceleration[2] = 9.8f;
         data->connected = true;
@@ -90,6 +95,8 @@ s32 scePadRead(s32 handle, OrbisPadData* data, s32 count) {
             data[i].buttons = g_buttons.load();
             data[i].leftStick = {g_left_x.load(), g_left_y.load()};
             data[i].rightStick = {g_right_x.load(), g_right_y.load()};
+            data[i].analogButtons.l2 = g_l2.load();
+            data[i].analogButtons.r2 = g_r2.load();
             data[i].orientation[3] = 1.0f;
             data[i].acceleration[2] = 9.8f;
             data[i].connected = true;
@@ -151,6 +158,15 @@ void SetStick(bool right, u8 x, u8 y) {
     }
 }
 
+void SetStickAxis(bool right, bool y, u8 value) {
+    (right ? (y ? g_right_y : g_right_x) : (y ? g_left_y : g_left_x)).store(value);
+}
+
+void SetTrigger(bool right, u8 value) {
+    (right ? g_r2 : g_l2).store(value);
+    SetButton(right ? kR2 : kL2, value > 30);
+}
+
 // DC_AUTOPRESS=<sec>,<sec>,...: presses Cross at those times after start
 // (unattended runs that need to get past "Start Event").
 static void StartAutoPress() {
@@ -182,8 +198,27 @@ static void StartAutoPress() {
     }).detach();
 }
 
+// DC_AUTO_THROTTLE=<sec>,<ms>: full R2 for <ms> from <sec> after start.
+static void StartAutoThrottle() {
+    const char* e = std::getenv("DC_AUTO_THROTTLE");
+    if (!e) {
+        return;
+    }
+    double at = 0;
+    s64 ms = 0;
+    std::sscanf(e, "%lf,%lld", &at, &ms);
+    std::thread([at, ms] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<s64>(at * 1000)));
+        DC_INFO("pad: auto-throttle for %lld ms", ms);
+        SetTrigger(true, 255);
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        SetTrigger(true, 0);
+    }).detach();
+}
+
 void RegisterPad() {
     StartAutoPress();
+    StartAutoThrottle();
     constexpr const char* lib = "libScePad";
     DC_HLE(lib, scePadInit);
     DC_HLE(lib, scePadOpen);
