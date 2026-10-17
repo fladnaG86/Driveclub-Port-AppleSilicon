@@ -2428,6 +2428,7 @@ struct MetalRenderer::Impl {
 
   void Draw(const RegFile &r, const DrawCall &dc);
   void Dispatch(const RegFile &r, u32 x, u32 y, u32 z);
+  u64 indirect_args = 0; // guest address of the group counts (DispatchIndirect)
   void Flip(const FlipInfo &f);
   std::unordered_map<u64, id<MTLComputePipelineState>> compute_pipelines;
 
@@ -3473,8 +3474,16 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   // LDS_SIZE is in 128-dword units on CI; Metal wants a multiple of 16 bytes.
   const u32 lds = std::max<u32>(16, Bits(rsrc2, 15, 9) * 512);
   [e setThreadgroupMemoryLength:std::min<u32>(lds, 32768) atIndex:0];
-  [e dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
-      threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+  id<MTLBuffer> ibuf = nil;
+  u64 ioff = 0;
+  if (indirect_args && Locate(indirect_args, 12, &ibuf, &ioff)) {
+    [e dispatchThreadgroupsWithIndirectBuffer:ibuf
+                         indirectBufferOffset:ioff
+                        threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+  } else {
+    [e dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
+        threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+  }
   [e endEncoding];
   if (dump_passes && trace && dump_frames) {
     u32 n = 0;
@@ -3709,6 +3718,29 @@ void MetalRenderer::Dispatch(const RegFile &regs, std::uint32_t x,
       impl->ProfileCut(what);
     }
   }
+}
+
+bool MetalRenderer::DispatchIndirect(const RegFile &regs, std::uint64_t args) {
+  std::scoped_lock lk(impl->lock);
+  id<MTLBuffer> buf = nil;
+  u64 off = 0;
+  if ((args & 3) || !impl->Locate(args, 12, &buf, &off)) {
+    return false;
+  }
+  @autoreleasepool {
+    impl->NoteWork("  dispatch cs %#llx indirect %#llx\n",
+                   regs.ProgramAddr(Liverpool::Reg::COMPUTE_PGM_LO), args);
+    impl->indirect_args = args;
+    impl->Dispatch(regs, 1, 1, 1);
+    impl->indirect_args = 0;
+    if (impl->profile) {
+      char what[64];
+      std::snprintf(what, sizeof(what), "cs %#llx indirect",
+                    regs.ProgramAddr(Liverpool::Reg::COMPUTE_PGM_LO));
+      impl->ProfileCut(what);
+    }
+  }
+  return true;
 }
 
 void MetalRenderer::OnSubmit() {

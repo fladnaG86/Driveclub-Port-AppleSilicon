@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 
 #include <pthread.h>
 #include <sched.h>
@@ -15,6 +16,12 @@
 #include "gpu/renderer.h"
 
 namespace Gpu::Liverpool {
+
+namespace {
+// DMA_DATA copies of group counts into a DISPATCH_DIRECT of the command buffer
+// being parsed: packet body address -> source of the counts.
+thread_local std::unordered_map<u64, u64> t_dispatch_args;
+} // namespace
 
 namespace {
 
@@ -559,6 +566,15 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 const u64 ib_lo = reinterpret_cast<u64>(cmds.data());
                 const u64 ib_hi = reinterpret_cast<u64>(end);
                 const bool patches_ib = !dsel && dst_addr < ib_hi && dst_addr + bytes > ib_lo;
+                // A copy of the group counts into a DISPATCH_DIRECT further down:
+                // the host GPU reads them itself when that dispatch runs, no wait.
+                if (patches_ib && ssel == 0 && bytes == 12 && dst_addr >= ib_lo + 4) {
+                    const u32 h = *reinterpret_cast<const u32*>(dst_addr - 4);
+                    if (HeaderType(h) == 3 && HeaderOpcode(h) == Op::DispatchDirect) {
+                        t_dispatch_args[dst_addr] = src_addr;
+                        break;
+                    }
+                }
                 if (bytes && !patches_ib && renderer->DmaData(dsel, dst_addr, ssel, src_addr, bytes)) {
                     break;
                 }
@@ -572,7 +588,9 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 }
                 break;
             }
-            SyncRenderer(); // the GPU may still be producing what we copy
+            if (src_sel != 2) {
+                SyncRenderer(); // the GPU may still be producing what we copy
+            }
             if (src_sel == 2) {
                 for (u32 k = 0; k + 4 <= bytes; k += 4) {
                     std::memcpy(dst + k, &body[1], 4);
@@ -685,6 +703,17 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
         case Op::DispatchDirect:
             ++stats.dispatches;
             if (renderer) {
+                if (auto it = t_dispatch_args.find(reinterpret_cast<u64>(body)); it != t_dispatch_args.end()) {
+                    const u64 args = it->second;
+                    t_dispatch_args.erase(it);
+                    if (renderer->DispatchIndirect(regs, args)) {
+                        break;
+                    }
+                    SyncRenderer(); // no GPU-side counts: read them once they are there
+                    const u32* a = reinterpret_cast<const u32*>(args);
+                    renderer->Dispatch(regs, a[0], a[1], a[2]);
+                    break;
+                }
                 renderer->Dispatch(regs, body[0], body[1], body[2]);
             }
             break;
