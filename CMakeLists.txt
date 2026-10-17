@@ -128,7 +128,7 @@ target_include_directories(driveclub PRIVATE src)
 target_compile_options(driveclub PRIVATE
     -Wall -Wextra -Wno-unused-parameter
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
-    $<$<CONFIG:Release>:-O3 -march=native>
+    $<$<CONFIG:Release>:-O3 -march=btver2>
 )
 
 # Guest memory is mapped at its PS4 addresses (executable at 0x400000), which
@@ -140,7 +140,7 @@ target_link_options(driveclub PRIVATE
     -Wl,-segaddr,GUEST_TCB,0x4000
     -Wl,-segaddr,GUEST_SYSMGD,0x400000
     -Wl,-segaddr,GUEST_SYSRSV,0x7FFFFC000
-    -Wl,-segaddr,GUEST_USER,0x1000000000
+    -Wl,-segaddr,GUEST_USER,0x7000000000
 )
 
 target_link_libraries(driveclub PRIVATE

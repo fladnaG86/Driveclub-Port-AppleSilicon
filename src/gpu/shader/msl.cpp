@@ -15,6 +15,9 @@ using namespace Gcn;
 
 namespace {
 
+// Back edges one invocation may take before it gives up (see LoopGuard).
+constexpr u32 kLoopBudget = 1u << 20;
+
 std::string Hex(u32 v) {
     char b[16];
     std::snprintf(b, sizeof(b), "0x%xu", v);
@@ -195,19 +198,33 @@ private:
             Line("}");
         }
     }
+    // A loop the emulation cannot finish (e.g. a spin on memory another
+    // wave never writes) would hang the GPU and, on macOS, WindowServer with
+    // it: back edges spend a budget and the invocation gives up when it runs out.
+    std::string LoopGuard() const {
+        return std::string("if (++guard_ > ") + N(kLoopBudget) + "u) { " +
+               (p.stage == Stage::Fragment ? "discard_fragment(); " : "") +
+               (p.stage == Stage::Compute ? "return; " : "return out; ") + "} ";
+    }
     void Jump(u32 target) {
         if (!structured) {
-            Line("{ pc_ = " + Hex(target) + "; continue; }");
+            Line("{ " + LoopGuard() + "pc_ = " + Hex(target) + "; continue; }");
             return;
         }
         const u32 t = index_of.at(target);
-        Line(t <= cur ? "{ tgt_ = " + N(t) + "u; continue; }" : "tgt_ = " + N(t) + "u;");
+        Line(t <= cur ? "{ " + LoopGuard() + "tgt_ = " + N(t) + "u; continue; }" : "tgt_ = " + N(t) + "u;");
     }
     void End() {
         if (p.stage == Stage::Fragment) {
             Line("if (!dc_exported) discard_fragment();");
         }
         Line(p.stage == Stage::Compute ? "return;" : "return out;");
+    }
+
+    std::string MemInit() const {
+        return o.map_hoist ? "DcMem mem = {gm0, gm1, &gmap, {gmap.base, gmap.pages, gmap.split, gmap.limit, "
+                             "gmap.shift, (device const int*)(&gmap + 1)}};"
+                           : "DcMem mem = {gm0, gm1, &gmap};";
     }
 
     bool Structure();
@@ -231,6 +248,36 @@ private:
     u32 cur = 0;                              // index of the instruction being emitted
     std::unordered_map<u32, u32> index_of;    // pc -> instruction index
     std::unordered_map<u32, u32> loop_end;    // loop header index -> index of its last back edge
+
+    // A guest wave is 64 lanes in lockstep: LDS one lane writes is there for the
+    // others at the next instruction, so shaders sized to one wave skip s_barrier.
+    // Metal runs the threadgroup as 32-wide SIMD groups that drift apart. Where the
+    // kind of LDS access changes (write -> read, read -> write, atomics) a barrier
+    // restores the order -- only where every thread passes (outside loops).
+    u32 lds_last = 0; // 0 none, 1 read, 2 write, 3 atomic
+    bool LdsBarrier(const Inst& i) {
+        if (p.stage != Stage::Compute) {
+            return false;
+        }
+        if (i.enc == Enc::SOPP && static_cast<Sopp>(i.op) == Sopp::S_BARRIER) {
+            lds_last = 0;
+            return false;
+        }
+        if (i.enc != Enc::DS) {
+            return false;
+        }
+        const char* n = OpName(i.enc, i.op);
+        const std::string name = n ? n : "";
+        const u32 kind = name.rfind("DS_READ", 0) == 0 ? 1u : name.rfind("DS_WRITE", 0) == 0 ? 2u : 3u;
+        const bool need = lds_last != 0 && lds_last != kind;
+        lds_last = kind;
+        for (const auto& [h, e] : loop_end) {
+            if (h <= cur && cur <= e) {
+                return false;
+            }
+        }
+        return need;
+    }
 };
 
 void Emitter::Emit(const Inst& i) {
@@ -454,7 +501,13 @@ void Emitter::EmitSopc(const Inst& i) {
 
 void Emitter::EmitSopp(const Inst& i) {
     switch (static_cast<Sopp>(i.op)) {
-    case Sopp::S_ENDPGM: End(); break;
+    case Sopp::S_ENDPGM:
+        if (structured && p.stage == Stage::Compute && cur + 1 < p.code.size()) {
+            Line("tgt_ = " + N(static_cast<u32>(p.code.size())) + "u;"); // to the end: later barriers see every thread
+            break;
+        }
+        End();
+        break;
     case Sopp::S_BRANCH: Jump(BranchTarget(i)); break;
     case Sopp::S_CBRANCH_SCC0: Line("if (!scc)"); Jump(BranchTarget(i)); break;
     case Sopp::S_CBRANCH_SCC1: Line("if (scc)"); Jump(BranchTarget(i)); break;
@@ -1460,6 +1513,8 @@ void Emitter::EmitStructured() {
         if (IsBranch(i)) {
             starts.insert(index_of.at(BranchTarget(i)));
             starts.insert(k + 1);
+        } else if (i.enc == Enc::SOPP && static_cast<Sopp>(i.op) == Sopp::S_ENDPGM) {
+            starts.insert(k + 1);
         }
     }
     bool open = false;
@@ -1476,6 +1531,14 @@ void Emitter::EmitStructured() {
         }
         if (cur == 0 || starts.count(cur)) {
             close();
+            body += "    if (tgt_ <= " + N(cur) + "u) {\n";
+            open = true;
+        }
+        if (LdsBarrier(p.code[cur])) {
+            // Jump targets are block starts, so a thread skipping this block has
+            // tgt_ past cur: splitting it here keeps the barrier uniform.
+            close();
+            body += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
             body += "    if (tgt_ <= " + N(cur) + "u) {\n";
             open = true;
         }
@@ -1499,6 +1562,9 @@ void Emitter::EmitSwitch() {
                 body += "    case " + Hex(i.pc) + ":\n";
             }
             ++label;
+        }
+        if (!p.has_branches && LdsBarrier(i)) {
+            Line("threadgroup_barrier(mem_flags::mem_threadgroup);");
         }
         Emit(i);
     }
@@ -1618,9 +1684,9 @@ std::string Emitter::Run() {
 
     std::string wrapped;
     if (structured) {
-        wrapped = "    uint tgt_ = 0u;\n" + body;
+        wrapped = "    uint tgt_ = 0u;\n    uint guard_ = 0u;\n" + body;
     } else if (p.has_branches) {
-        wrapped = "    uint pc_ = 0u;\n    while (true) {\n    switch (pc_) {\n    case 0u:\n" + body +
+        wrapped = "    uint pc_ = 0u;\n    uint guard_ = 0u;\n    while (true) {\n    switch (pc_) {\n    case 0u:\n" + body +
                   "    default:\n        " + (p.stage == Stage::Fragment ? "if (!dc_exported) discard_fragment(); " : "") +
                   (p.stage == Stage::Compute ? "return;" : "return out;") + "\n    }\n    }\n";
     } else {
@@ -1628,6 +1694,14 @@ std::string Emitter::Run() {
     }
 
     std::string src = kMslPrelude;
+    if (o.map_hoist) {
+        for (const auto& [from, to] : {std::pair<std::string, std::string>{"((device const int*)(m.map + 1))", "m.mapl.entries"},
+                                       {"m.map->", "m.mapl."}}) {
+            for (size_t at; (at = src.find(from)) != std::string::npos;) {
+                src.replace(at, from.size(), to);
+            }
+        }
+    }
     src += "\n";
     const std::string mem_params =
         "constant uint* ud [[buffer(0)]], device uint* gm0 [[buffer(1)]], device uint* gm1 [[buffer(2)]], "
@@ -1649,7 +1723,7 @@ std::string Emitter::Run() {
         src += "vertex VsOut main0(uint vid [[vertex_id]], uint iid [[instance_id]], " + mem_params +
                ", constant DcDraw& draw [[buffer(4)]]" + (o.debug_capture ? ", device float4* dbg [[buffer(6)]]" : "") +
                TexParams(true) + ") {\n";
-        src += "    DcMem mem = {gm0, gm1, &gmap};\n    VsOut o;\n";
+        src += "    " + MemInit() + "\n    VsOut o;\n";
         if (o.rect_list) {
             // As shadPS4's rect list TCS: the vertex whose x matches one neighbour and y
             // the other is the right-angle corner; the 4th vertex is opposite it. Triangles:
@@ -1700,9 +1774,10 @@ std::string Emitter::Run() {
         }
         src += "};\nstruct PsOut {\n";
         for (u32 k = 0; k < 8; ++k) {
-            if ((p.mrt_mask & (1u << k)) && ((o.col_format >> (4 * k)) & 0xF)) {
+            const bool src1 = o.dual_source && k == 1;
+            if (((p.mrt_mask & (1u << k)) || src1) && ((o.col_format >> (4 * k)) & 0xF)) {
                 const char* t = o.mrt_type[k] == OutType::Float ? "float4" : o.mrt_type[k] == OutType::Uint ? "uint4" : "int4";
-                src += std::string("    ") + t + " c" + N(k) + " [[color(" + N(k) + ")]];\n";
+                src += std::string("    ") + t + " c" + N(k) + (src1 ? " [[color(0), index(1)]];\n" : " [[color(" + N(k) + ")]];\n");
             }
         }
         if (p.exports_depth && o.depth_target) {
@@ -1718,7 +1793,7 @@ std::string Emitter::Run() {
         if (o.depth_bounds) {
             src += "    { float z_ = dc_zb.read(uint2(pin.pos.xy)).x; float bmin = min(dc_zbr.x, dc_zbr.y); float bmax = max(dc_zbr.x, dc_zbr.y); if (z_ < bmin || z_ > bmax) discard_fragment(); }\n";
         }
-        src += "    DcMem mem = {gm0, gm1, &gmap};\n    PsOut out = {};\n    bool dc_exported = false;\n";
+        src += "    " + MemInit() + "\n    PsOut out = {};\n    bool dc_exported = false;\n";
         src += "    uint dc_qlane = (uint(pin.pos.x) & 1u) | ((uint(pin.pos.y) & 1u) << 1);\n";
         src += "    (void)mem; (void)dc_qlane;\n";
         src += decl + wrapped + "}\n";
@@ -1728,7 +1803,7 @@ std::string Emitter::Run() {
                "uint3 dc_gtid [[thread_position_in_grid]], " +
                mem_params + ", device uint* gds [[buffer(5)]], threadgroup uint* lds [[threadgroup(0)]]" + probe_param + TexParams(true) +
                ") {\n";
-        src += "    DcMem mem = {gm0, gm1, &gmap};\n    uint dc_lane = dc_lidx & 63u;\n";
+        src += "    " + MemInit() + "\n    uint dc_lane = dc_lidx & 63u;\n";
         src += "    (void)mem; (void)dc_lane; (void)lds; (void)gds;\n";
         src += decl + wrapped + "}\n";
     }

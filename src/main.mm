@@ -3,6 +3,7 @@
 // Loads and links the game's modules, then brings up the window and the
 // Metal renderer.
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -138,21 +139,31 @@ int Run(int argc, char** argv) {
                     Hle::Pad::SetButton(Hle::Pad::kTriangle, pressed);
                     break;
                 case SDLK_UP:
-                case SDLK_W:
                     Hle::Pad::SetButton(Hle::Pad::kUp, pressed);
                     break;
                 case SDLK_DOWN:
-                case SDLK_S:
                     Hle::Pad::SetButton(Hle::Pad::kDown, pressed);
                     break;
                 case SDLK_LEFT:
-                case SDLK_A:
                     Hle::Pad::SetButton(Hle::Pad::kLeft, pressed);
                     break;
                 case SDLK_RIGHT:
-                case SDLK_D:
                     Hle::Pad::SetButton(Hle::Pad::kRight, pressed);
                     break;
+                // Driving: W throttle (R2), S brake (L2), A/D steer (left stick).
+                case SDLK_W:
+                    Hle::Pad::SetTrigger(true, pressed ? 255 : 0);
+                    break;
+                case SDLK_S:
+                    Hle::Pad::SetTrigger(false, pressed ? 255 : 0);
+                    break;
+                case SDLK_A:
+                case SDLK_D: {
+                    static bool left = false, right = false;
+                    (ev.key.key == SDLK_A ? left : right) = pressed;
+                    Hle::Pad::SetStickAxis(false, false, left == right ? 128 : left ? 0 : 255);
+                    break;
+                }
                 case SDLK_Q:
                     Hle::Pad::SetButton(Hle::Pad::kL1, pressed);
                     break;
@@ -201,8 +212,43 @@ int Run(int argc, char** argv) {
                 case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
                     Hle::Pad::SetButton(Hle::Pad::kR1, pressed);
                     break;
+                case SDL_GAMEPAD_BUTTON_LEFT_STICK:
+                    Hle::Pad::SetButton(Hle::Pad::kL3, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_RIGHT_STICK:
+                    Hle::Pad::SetButton(Hle::Pad::kR3, pressed);
+                    break;
+                case SDL_GAMEPAD_BUTTON_TOUCHPAD:
+                    Hle::Pad::SetButton(Hle::Pad::kTouchPad, pressed);
+                    break;
                 default:
                     break;
+                }
+                break;
+            }
+            // SDL3 reports a gamepad's input only once it is opened.
+            case SDL_EVENT_GAMEPAD_ADDED:
+                if (SDL_Gamepad* pad = SDL_OpenGamepad(ev.gdevice.which)) {
+                    DC_INFO("gamepad: %s", SDL_GetGamepadName(pad));
+                }
+                break;
+            case SDL_EVENT_GAMEPAD_REMOVED:
+                if (SDL_Gamepad* pad = SDL_GetGamepadFromID(ev.gdevice.which)) {
+                    SDL_CloseGamepad(pad);
+                }
+                break;
+            case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+                const s32 v = ev.gaxis.value; // sticks -32768..32767, triggers 0..32767
+                const u8 stick = static_cast<u8>((v + 32768) >> 8);
+                const u8 trigger = static_cast<u8>(std::max<s32>(v, 0) * 255 / 32767);
+                switch (ev.gaxis.axis) {
+                case SDL_GAMEPAD_AXIS_LEFTX: Hle::Pad::SetStickAxis(false, false, stick); break;
+                case SDL_GAMEPAD_AXIS_LEFTY: Hle::Pad::SetStickAxis(false, true, stick); break;
+                case SDL_GAMEPAD_AXIS_RIGHTX: Hle::Pad::SetStickAxis(true, false, stick); break;
+                case SDL_GAMEPAD_AXIS_RIGHTY: Hle::Pad::SetStickAxis(true, true, stick); break;
+                case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: Hle::Pad::SetTrigger(false, trigger); break;
+                case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: Hle::Pad::SetTrigger(true, trigger); break;
+                default: break;
                 }
                 break;
             }

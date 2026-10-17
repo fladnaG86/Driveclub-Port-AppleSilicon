@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -139,8 +140,18 @@ s32 sceKernelOpen(const char* path, int flags, u16 mode) {
         const int err = errno;
         if (err != ENOENT) {
             DC_WARN("open(%s) failed: %d", path, err);
+        } else if (static const bool log = std::getenv("DC_LOG_MISSING") != nullptr; log) {
+            static std::mutex lock;
+            static std::set<std::string> missing;
+            std::scoped_lock lk(lock);
+            if (missing.insert(path).second) {
+                DC_INFO("open(%s): not found (%s)", path, host.c_str());
+            }
         }
         return OrbisError(err);
+    }
+    if (static const bool log = std::getenv("DC_LOG_OPEN") != nullptr; log) {
+        DC_INFO("open(%s, %#x) -> fd %d", path, flags, fd);
     }
     return fd;
 }
@@ -166,9 +177,25 @@ s32 sceKernelClose(int fd) {
     return Sce(close(fd));
 }
 
-s64 sceKernelRead(int fd, void* buf, u64 n) { return Sce64(read(fd, buf, n)); }
+// DC_LOG_IO: every read with its fd, size and offset.
+static bool LogIo() {
+    static const bool log = std::getenv("DC_LOG_IO") != nullptr;
+    return log;
+}
+
+s64 sceKernelRead(int fd, void* buf, u64 n) {
+    if (LogIo()) {
+        DC_INFO("read(fd %d, %llu) at %lld", fd, (unsigned long long)n, (long long)lseek(fd, 0, SEEK_CUR));
+    }
+    return Sce64(read(fd, buf, n));
+}
 s64 sceKernelWrite(int fd, const void* buf, u64 n) { return Sce64(write(fd, buf, n)); }
-s64 sceKernelPread(int fd, void* buf, u64 n, s64 off) { return Sce64(pread(fd, buf, n, off)); }
+s64 sceKernelPread(int fd, void* buf, u64 n, s64 off) {
+    if (LogIo()) {
+        DC_INFO("pread(fd %d, %llu, %lld)", fd, (unsigned long long)n, (long long)off);
+    }
+    return Sce64(pread(fd, buf, n, off));
+}
 s64 sceKernelPwrite(int fd, const void* buf, u64 n, s64 off) { return Sce64(pwrite(fd, buf, n, off)); }
 s64 sceKernelLseek(int fd, s64 off, int whence) { return Sce64(lseek(fd, off, whence)); }
 s32 sceKernelFsync(int fd) { return Sce(fsync(fd)); }

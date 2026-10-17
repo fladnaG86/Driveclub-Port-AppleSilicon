@@ -7,7 +7,9 @@
 #import <Metal/Metal.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <fstream>
 #include <iterator>
 #include <vector>
@@ -24,6 +26,15 @@ bool Query(VAddr, bool, Vma*) {
 }
 } // namespace Core::Memory
 
+// key=value overrides of the MslOptions the generator is tested with.
+static bool SetOption(Gpu::Shader::MslOptions& o, const std::string& key, unsigned long v) {
+    if (key == "map_hoist") {
+        o.map_hoist = v != 0;
+        return true;
+    }
+    return false;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: gcn_dis <shader.bin> [vs|ps|cs] [--msl]\n");
@@ -37,7 +48,21 @@ int main(int argc, char** argv) {
     using namespace Gpu::Shader;
     const bool ps = argc > 2 && std::strcmp(argv[2], "ps") == 0;
     const bool cs = argc > 2 && std::strcmp(argv[2], "cs") == 0;
-    const bool print_msl = argc > 3 && std::strcmp(argv[3], "--msl") == 0;
+    bool print_msl = false;
+    MslOptions o;
+    // After the stage: --msl and MslOptions overrides as key=value.
+    for (int k = 3; k < argc; ++k) {
+        const char* arg = argv[k];
+        if (std::strcmp(arg, "--msl") == 0) {
+            print_msl = true;
+            continue;
+        }
+        const char* eq = std::strchr(arg, '=');
+        if (!eq || !SetOption(o, std::string(arg, eq - arg), std::strtoul(eq + 1, nullptr, 0))) {
+            std::fprintf(stderr, "unknown option %s\n", arg);
+            return 1;
+        }
+    }
 
     u32 ud[16] = {};
     BuildInput in{cs ? Stage::Compute : ps ? Stage::Fragment : Stage::Vertex, 0x10000000, ud, 16, cs ? 2u : 3u,
@@ -52,7 +77,6 @@ int main(int argc, char** argv) {
         std::printf("%s\n", Gcn::Disassemble(i).c_str());
     }
 
-    MslOptions o;
     o.vs_param_mask = 0xFFFFFFFF;
     o.ps_input_addr = 0x2; // PERSP_CENTER
     o.col_format = 0x4;    // MRT0 FP16

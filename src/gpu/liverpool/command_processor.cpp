@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 
 #include <pthread.h>
 #include <sched.h>
@@ -15,6 +16,12 @@
 #include "gpu/renderer.h"
 
 namespace Gpu::Liverpool {
+
+namespace {
+// DMA_DATA copies of group counts into a DISPATCH_DIRECT of the command buffer
+// being parsed: packet body address -> source of the counts.
+thread_local std::unordered_map<u64, u64> t_dispatch_args;
+} // namespace
 
 namespace {
 
@@ -346,7 +353,9 @@ void CommandProcessor::RunConstantEngine(const std::function<bool()>& done) {
             ++ce.ce_counter;
             break;
         case Op::WaitOnDeCounterDiff:
-            if (ce.ce_counter - ce.de_counter >= body[0]) {
+            // Signed: a DE that is ahead (it can count a draw before the CE starts)
+            // leaves the CE free to run, not blocked on an underflowed difference.
+            if (static_cast<s64>(ce.ce_counter - ce.de_counter) >= static_cast<s64>(body[0])) {
                 return; // blocked until the DE catches up; retried later
             }
             break;
@@ -381,6 +390,10 @@ void CommandProcessor::Draw(bool indexed, u32 count, u32 index_offset, u32 first
     dc.first_vertex = first_vertex;
     renderer->Draw(CurRegs(), dc);
 }
+
+// Sanity limits for indirect args (a 1080p frame never needs more).
+constexpr u32 kMaxIndirectCount = 1u << 24;
+constexpr u64 kMaxIndirectGroups = 1ull << 20;
 
 // Indirect draw/dispatch arguments live at the SET_BASE address + offset.
 const u32* CommandProcessor::IndirectArgs(u32 offset, u32 dwords) {
@@ -547,7 +560,22 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 const u64 dst_addr = dsel ? (body[3] & 0xFFFF) : u64(body[3]) | (u64(body[4]) << 32);
                 const u64 src_addr = ssel == 2 ? body[1]
                                    : ssel == 1 ? (body[1] & 0xFFFF) : u64(body[1]) | (u64(body[2]) << 32);
-                if (bytes && renderer->DmaData(dsel, dst_addr, ssel, src_addr, bytes)) {
+                // The game patches packets further down this very command buffer
+                // (e.g. DISPATCH_DIRECT sizes): we parse it now, so such a copy
+                // cannot wait on the host GPU queue.
+                const u64 ib_lo = reinterpret_cast<u64>(cmds.data());
+                const u64 ib_hi = reinterpret_cast<u64>(end);
+                const bool patches_ib = !dsel && dst_addr < ib_hi && dst_addr + bytes > ib_lo;
+                // A copy of the group counts into a DISPATCH_DIRECT further down:
+                // the host GPU reads them itself when that dispatch runs, no wait.
+                if (patches_ib && ssel == 0 && bytes == 12 && dst_addr >= ib_lo + 4) {
+                    const u32 h = *reinterpret_cast<const u32*>(dst_addr - 4);
+                    if (HeaderType(h) == 3 && HeaderOpcode(h) == Op::DispatchDirect) {
+                        t_dispatch_args[dst_addr] = src_addr;
+                        break;
+                    }
+                }
+                if (bytes && !patches_ib && renderer->DmaData(dsel, dst_addr, ssel, src_addr, bytes)) {
                     break;
                 }
             }
@@ -560,7 +588,9 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 }
                 break;
             }
-            SyncRenderer(); // the GPU may still be producing what we copy
+            if (src_sel != 2) {
+                SyncRenderer(); // the GPU may still be producing what we copy
+            }
             if (src_sel == 2) {
                 for (u32 k = 0; k + 4 <= bytes; k += 4) {
                     std::memcpy(dst + k, &body[1], 4);
@@ -656,6 +686,12 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             if (start_inst_loc) {
                 regs[kShRegBase + start_inst_loc] = indexed ? a[4] : a[3];
             }
+            // The args may be GPU-written and not landed yet; garbage counts
+            // would make a draw that hangs the GPU.
+            if (a[0] > kMaxIndirectCount || a[1] > kMaxIndirectCount) {
+                DC_WARN("gpu: skipping indirect draw with count=%u instances=%u", a[0], a[1]);
+                break;
+            }
             if (indexed) {
                 Draw(true, a[0], a[2], 0, a[1]);
             } else {
@@ -667,12 +703,27 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
         case Op::DispatchDirect:
             ++stats.dispatches;
             if (renderer) {
+                if (auto it = t_dispatch_args.find(reinterpret_cast<u64>(body)); it != t_dispatch_args.end()) {
+                    const u64 args = it->second;
+                    t_dispatch_args.erase(it);
+                    if (renderer->DispatchIndirect(regs, args)) {
+                        break;
+                    }
+                    SyncRenderer(); // no GPU-side counts: read them once they are there
+                    const u32* a = reinterpret_cast<const u32*>(args);
+                    renderer->Dispatch(regs, a[0], a[1], a[2]);
+                    break;
+                }
                 renderer->Dispatch(regs, body[0], body[1], body[2]);
             }
             break;
         case Op::DispatchIndirect: {
             ++stats.dispatches;
             const u32* a = IndirectArgs(body[0], 3);
+            if (a && u64(a[0]) * a[1] * a[2] > kMaxIndirectGroups) {
+                DC_WARN("gpu: skipping indirect dispatch %ux%ux%u", a[0], a[1], a[2]);
+                break;
+            }
             if (renderer && a) {
                 renderer->Dispatch(regs, a[0], a[1], a[2]);
             }

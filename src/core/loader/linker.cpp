@@ -1,6 +1,8 @@
 #include "core/loader/linker.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -92,8 +94,9 @@ std::vector<std::filesystem::path> ListPrx(const std::filesystem::path& dir) {
 // most unimportant system calls need; DC_STRICT=1 stops at the first one.
 extern "C" u64 DcUnresolvedImport(u32 index) {
     static const bool strict = std::getenv("DC_STRICT") != nullptr;
+    static const bool all = std::getenv("DC_LOG_UNRESOLVED_ALL") != nullptr; // every call
     auto& u = Linker::unresolved[index];
-    if (u.calls++ < 3 || strict) {
+    if (u.calls++ < 3 || strict || all) {
         const std::string caller =
             Linker::Instance()->Describe(reinterpret_cast<u64>(__builtin_return_address(0)));
         DC_WARN("unimplemented: %s %.*s (%s) from %s", u.library.c_str(),
@@ -104,6 +107,90 @@ extern "C" u64 DcUnresolvedImport(u32 index) {
         std::abort();
     }
     return 0;
+}
+
+// DC_TRACE_HLE=<sec>: HLE calls go through a trampoline that logs them (the
+// first 20 of each function made <sec> seconds or more after start).
+namespace {
+
+struct TracedFn {
+    std::string name;
+    std::atomic<u32> calls{0};
+};
+std::vector<std::unique_ptr<TracedFn>> traced;
+u8* trace_code = nullptr;
+constexpr size_t kTraceSize = 192;
+constexpr size_t kMaxTraced = 4096;
+
+double TraceStart() {
+    static const double t = [] {
+        const char* e = std::getenv("DC_TRACE_HLE");
+        return e ? std::strtod(e, nullptr) : -1.0;
+    }();
+    return t;
+}
+
+} // namespace
+
+extern "C" void DcTraceHle(u32 index, u64 ret) {
+    static const auto t0 = std::chrono::steady_clock::now();
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (now < TraceStart()) {
+        return;
+    }
+    TracedFn& f = *traced[index];
+    if (f.calls++ < 20) {
+        DC_INFO("hle: %.2f %s from %s", now, f.name.c_str(),
+                Linker::Instance()->Describe(ret).c_str());
+    }
+}
+
+// push the argument registers (and al for varargs), log, restore, jump on.
+static VAddr MakeTrace(const std::string& name, void* fn) {
+    if (!trace_code) {
+        void* mem = mmap(nullptr, kTraceSize * kMaxTraced, PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (mem == MAP_FAILED) {
+            return reinterpret_cast<VAddr>(fn);
+        }
+        trace_code = static_cast<u8*>(mem);
+    }
+    const u32 index = static_cast<u32>(traced.size());
+    if (index >= kMaxTraced) {
+        return reinterpret_cast<VAddr>(fn);
+    }
+    traced.push_back(std::make_unique<TracedFn>());
+    traced.back()->name = name;
+    u8* p = trace_code + index * kTraceSize;
+    u8* q = p;
+    auto put = [&](std::initializer_list<u8> bytes) {
+        for (u8 b : bytes) *q++ = b;
+    };
+    auto put64 = [&](u64 v) {
+        std::memcpy(q, &v, 8);
+        q += 8;
+    };
+    put({0x57, 0x56, 0x52, 0x51, 0x41, 0x50, 0x41, 0x51, 0x50}); // rdi rsi rdx rcx r8 r9 rax
+    put({0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00});             // sub rsp, 128
+    for (u8 k = 0; k < 8; ++k) {                                   // movdqu [rsp+16k], xmmk
+        put({0xF3, 0x0F, 0x7F, static_cast<u8>(0x44 | (k << 3)), 0x24, static_cast<u8>(16 * k)});
+    }
+    put({0xBF});                                                   // mov edi, index
+    std::memcpy(q, &index, 4);
+    q += 4;
+    put({0x48, 0x8B, 0xB4, 0x24, 0xB8, 0x00, 0x00, 0x00});       // mov rsi, [rsp+184] (return address)
+    put({0x48, 0xB8});                                             // movabs rax, DcTraceHle
+    put64(reinterpret_cast<u64>(&DcTraceHle));
+    put({0xFF, 0xD0});                                             // call rax
+    for (u8 k = 0; k < 8; ++k) {                                   // movdqu xmmk, [rsp+16k]
+        put({0xF3, 0x0F, 0x6F, static_cast<u8>(0x44 | (k << 3)), 0x24, static_cast<u8>(16 * k)});
+    }
+    put({0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00});             // add rsp, 128
+    put({0x58, 0x41, 0x59, 0x41, 0x58, 0x59, 0x5A, 0x5E, 0x5F}); // pop in reverse
+    put({0x49, 0xBB});                                             // movabs r11, fn
+    put64(reinterpret_cast<u64>(fn));
+    put({0x41, 0xFF, 0xE3});                                       // jmp r11
+    return reinterpret_cast<VAddr>(p);
 }
 
 Linker::Linker() {
@@ -232,6 +319,9 @@ VAddr Linker::ResolveImport(const Module& m, std::string_view symbol_name) {
     }
     if (void* fn = Hle::Lookup(lib->name, sn.nid)) {
         ++stats.bound_to_hle;
+        if (TraceStart() >= 0) {
+            return MakeTrace(std::string(Hle::NameOf(std::string(sn.nid))), fn);
+        }
         return reinterpret_cast<VAddr>(fn);
     }
     ++stats.bound_to_stub;

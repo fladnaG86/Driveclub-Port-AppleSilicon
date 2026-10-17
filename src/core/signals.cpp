@@ -1,6 +1,8 @@
 #include "core/signals.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -181,8 +183,13 @@ void DumpStackStrings(u64 rsp) {
 
 std::atomic<FaultHandler> g_fault_handler{nullptr};
 
+bool WatchFault(ucontext_t* uc, u64 fault); // DC_PROBE_WATCH, below
+
 void Handler(int sig, siginfo_t* info, void* raw) {
     if (sig != SIGILL) {
+        if (WatchFault(static_cast<ucontext_t*>(raw), reinterpret_cast<u64>(info->si_addr))) {
+            return;
+        }
         const FaultHandler fault = g_fault_handler.load(std::memory_order_acquire);
         if (fault && fault(raw, info->si_addr)) {
             return;
@@ -220,7 +227,180 @@ void Handler(int sig, siginfo_t* info, void* raw) {
     Die(sig);
 }
 
+struct Probe {
+    std::atomic<u64> addr{0};
+    std::atomic<u64> hits{0};
+    std::atomic<u64> rdi{0};
+    std::atomic<u64> rdis[8]{}; // distinct rdi values seen
+    std::atomic<u64> rets[8]{}; // distinct return addresses (callers)
+    std::atomic<u64> rsis[8]{}; // distinct rsi values (second argument)
+};
+
+void NoteDistinct(std::atomic<u64> (&slots)[8], u64 v) {
+    for (auto& slot : slots) {
+        u64 cur = slot.load(std::memory_order_relaxed);
+        if (cur == v || (!cur && slot.compare_exchange_strong(cur, v))) {
+            return;
+        }
+    }
+}
+
+std::atomic<u64> g_watch_lo{0}, g_watch_hi{0};
+thread_local bool t_watch_step = false;
+void WatchProtect();
+std::mutex g_watch_lock;
+std::vector<u64> g_watch_sites;
+
+bool WatchFault(ucontext_t* uc, u64 fault) {
+    const u64 lo = g_watch_lo.load(std::memory_order_acquire);
+    if (!lo || fault < (lo & ~0xFFFull) || fault >= ((g_watch_hi.load() + 0xFFF) & ~0xFFFull)) {
+        return false;
+    }
+    if (fault >= lo && fault < g_watch_hi.load()) {
+        std::scoped_lock lk(g_watch_lock);
+        const u64 rip = uc->uc_mcontext->__ss.__rip;
+        if (std::find(g_watch_sites.begin(), g_watch_sites.end(), rip) == g_watch_sites.end()) {
+            g_watch_sites.push_back(rip);
+            const auto& ss = uc->uc_mcontext->__ss;
+            DC_INFO("watch: new site %s addr %#llx rdi %#llx rsi %#llx rdx %#llx rbx %#llx r12 %#llx r14 %#llx ret %s",
+                    g_describer ? g_describer(rip).c_str() : "?", fault, ss.__rdi, ss.__rsi, ss.__rdx,
+                    ss.__rbx, ss.__r12, ss.__r14,
+                    g_describer ? g_describer(*reinterpret_cast<u64*>(ss.__rsp)).c_str() : "?");
+        }
+    }
+    const u64 page = lo & ~0xFFFull;
+    mprotect(reinterpret_cast<void*>(page), ((g_watch_hi.load() + 0xFFF) & ~0xFFFull) - page, PROT_READ | PROT_WRITE);
+    uc->uc_mcontext->__ss.__rflags |= 0x100; // single-step: protect again right after
+    t_watch_step = true;
+    return true;
+}
+Probe g_probes[16];
+std::atomic<u32> g_probe_count{0};
+
+void TrapHandler(int sig, siginfo_t*, void* raw) {
+    auto* uc = static_cast<ucontext_t*>(raw);
+    auto& ss = uc->uc_mcontext->__ss;
+    if (t_watch_step) {
+        t_watch_step = false;
+        ss.__rflags &= ~0x100ull;
+        WatchProtect();
+        return;
+    }
+    const u32 n = g_probe_count.load(std::memory_order_acquire);
+    for (u32 k = 0; k < n; ++k) {
+        if (g_probes[k].addr.load(std::memory_order_relaxed) == ss.__rip - 1) {
+            g_probes[k].hits.fetch_add(1, std::memory_order_relaxed);
+            g_probes[k].rdi.store(ss.__rdi, std::memory_order_relaxed);
+            NoteDistinct(g_probes[k].rdis, ss.__rdi);
+            NoteDistinct(g_probes[k].rets, *reinterpret_cast<u64*>(ss.__rsp));
+            NoteDistinct(g_probes[k].rsis, ss.__rsi);
+            ss.__rsp -= 8; // the push rbp the int3 replaced
+            *reinterpret_cast<u64*>(ss.__rsp) = ss.__rbp;
+            return;
+        }
+    }
+    Describe("trap", ss.__rip, 0, ss.__rsp);
+    Die(sig);
+}
+
 } // namespace
+
+bool AddProbe(VAddr function) {
+    auto* code = reinterpret_cast<u8*>(function);
+    const u32 k = g_probe_count.load();
+    if (k >= std::size(g_probes) || code[0] != 0x55) {
+        return false;
+    }
+    static std::once_flag once;
+    std::call_once(once, [] {
+        struct sigaction sa{};
+        sa.sa_sigaction = TrapHandler;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGTRAP, &sa, nullptr);
+    });
+    g_probes[k].addr = function;
+    g_probe_count.store(k + 1, std::memory_order_release);
+    const VAddr page = function & ~0xFFFull;
+    mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+    code[0] = 0xCC;
+    mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_EXEC);
+    return true;
+}
+
+std::vector<u64> ProbeArgs() {
+    std::vector<u64> v;
+    for (u32 k = 0; k < g_probe_count.load(); ++k) {
+        v.push_back(g_probes[k].rdi.load());
+    }
+    return v;
+}
+
+std::vector<u64> ProbeDistinctArgs(u32 probe, bool second) {
+    std::vector<u64> v;
+    if (probe < g_probe_count.load()) {
+        for (const auto& slot : second ? g_probes[probe].rsis : g_probes[probe].rdis) {
+            if (const u64 x = slot.load()) {
+                v.push_back(x);
+            }
+        }
+    }
+    return v;
+}
+
+void WatchAccess(VAddr addr, u64 size) {
+    struct sigaction sa{};
+    sa.sa_sigaction = TrapHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTRAP, &sa, nullptr);
+    g_watch_hi = addr + size;
+    g_watch_lo.store(addr, std::memory_order_release);
+    WatchRearm();
+}
+
+void WatchRearm() {
+    WatchProtect();
+}
+
+namespace {
+void WatchProtect() {
+    const u64 lo = g_watch_lo.load();
+    if (lo) {
+        const u64 page = lo & ~0xFFFull;
+        const int r = mprotect(reinterpret_cast<void*>(page), ((g_watch_hi.load() + 0xFFF) & ~0xFFFull) - page, PROT_NONE);
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            DC_INFO("watch: mprotect(%#llx) -> %d (errno %d)", page, r, r ? errno : 0);
+        }
+    }
+}
+} // namespace
+
+std::vector<u64> WatchSites() {
+    std::scoped_lock lk(g_watch_lock);
+    return g_watch_sites;
+}
+
+std::vector<u64> ProbeCallers(u32 probe) {
+    std::vector<u64> v;
+    if (probe < g_probe_count.load()) {
+        for (const auto& slot : g_probes[probe].rets) {
+            if (const u64 x = slot.load()) {
+                v.push_back(x);
+            }
+        }
+    }
+    return v;
+}
+
+std::vector<u64> ProbeHits() {
+    std::vector<u64> v;
+    for (u32 k = 0; k < g_probe_count.load(); ++k) {
+        v.push_back(g_probes[k].hits.load());
+    }
+    return v;
+}
 
 void Install(AddressDescriber describer) {
     g_describer = describer;

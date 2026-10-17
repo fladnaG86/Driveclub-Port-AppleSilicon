@@ -19,6 +19,7 @@ public:
     void Draw(const Liverpool::RegFile& regs, const DrawCall& draw) override;
     void Dispatch(const Liverpool::RegFile& regs, std::uint32_t x, std::uint32_t y,
                   std::uint32_t z) override;
+    bool DispatchIndirect(const Liverpool::RegFile& regs, std::uint64_t args) override;
     void OnSubmit() override;
     void WaitIdle() override;
     void Signal(std::function<void()> done) override;

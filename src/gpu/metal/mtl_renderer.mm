@@ -17,6 +17,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -439,6 +440,7 @@ struct MetalRenderer::Impl {
   static constexpr u32 kProbeSlots = 4096;
   id<MTLTexture> pass_tex[9] = {};
   u64 pass_addr[9] = {};
+  bool map_hoist = true; // DC_NO_MAP_HOIST: shaders read the page-table header per access
   bool stats = false;   // DC_GPU_STATS: per-second GPU time and submit counts
   bool profile = false; // DC_GPU_PROFILE: GPU time per shader (one command
                         // buffer per call)
@@ -516,6 +518,7 @@ struct MetalRenderer::Impl {
       std::memset(probe_buf.contents, 0, probe_buf.length);
     }
     stats = std::getenv("DC_GPU_STATS") != nullptr;
+    map_hoist = std::getenv("DC_NO_MAP_HOIST") == nullptr;
     profile = std::getenv("DC_GPU_PROFILE") != nullptr;
     compiler = std::make_unique<ShaderCompiler>(device, 4);
     signal_event = [device newSharedEvent];
@@ -745,7 +748,17 @@ struct MetalRenderer::Impl {
     }
   }
 
+  // DC_GPU_STATS: why passes over the same targets get split.
+  PassState last_pass;
+  void *last_end_ra = nullptr;
+  std::unordered_map<void *, u64> split_by;
+  u64 stat_passes = 0, stat_split = 0;
+
   void EndPass() {
+    if (enc && stats) {
+      last_pass = pass;
+      last_end_ra = __builtin_return_address(0);
+    }
     if (enc) {
       [enc endEncoding];
       enc = nil;
@@ -888,6 +901,40 @@ struct MetalRenderer::Impl {
       ++stat_commits;
       [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
         gpu_ns += static_cast<u64>((c.GPUEndTime - c.GPUStartTime) * 1e9);
+      }];
+    }
+    // A command buffer that hogs the GPU for seconds starves WindowServer
+    // until its watchdog reboots the Mac: bail out before that happens.
+    // DC_GPU_WATCHDOG=<seconds>, 0 disables.
+    static const double watchdog_s = [] {
+      const char *v = std::getenv("DC_GPU_WATCHDOG");
+      return v ? std::atof(v) : 1.0;
+    }();
+    if (watchdog_s > 0) {
+      StartWatchdog(watchdog_s);
+      const u64 seq = wd_committed.load(std::memory_order_relaxed) + 1;
+      wd_commit_ns[seq % kWdRing].store(NowNs(), std::memory_order_relaxed);
+      {
+        std::scoped_lock lk(wd_lock);
+        wd_desc[seq % kWdRing] = std::move(wd_work);
+      }
+      wd_work.clear();
+      wd_committed.store(seq, std::memory_order_release);
+      [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        wd_done.store(seq, std::memory_order_release);
+        const double s = c.GPUEndTime - c.GPUStartTime;
+        if (c.status == MTLCommandBufferStatusError || s > watchdog_s) {
+          std::string work;
+          {
+            std::scoped_lock lk(wd_lock);
+            work = wd_desc[seq % kWdRing];
+          }
+          DC_ERROR("gpu watchdog: command buffer took %.2f s (%s), exiting; "
+                   "it holds:\n%s",
+                   s, c.error ? c.error.localizedDescription.UTF8String : "ok",
+                   work.c_str());
+          std::_Exit(3);
+        }
       }];
     }
     [cmd commit];
@@ -1056,6 +1103,59 @@ struct MetalRenderer::Impl {
       }
       fn();
     }
+  }
+
+  // GPU watchdog: a hung command buffer never completes, so a thread also
+  // checks how long the oldest pending one has been waiting.
+  static constexpr u64 kWdRing = 4096;
+  std::atomic<u64> wd_committed{0}, wd_done{0};
+  std::atomic<s64> wd_commit_ns[kWdRing] = {};
+  std::string wd_work; // draws/dispatches recorded into `cmd`
+  std::mutex wd_lock;
+  std::string wd_desc[kWdRing];
+
+  template <typename... Args> void NoteWork(const char *fmt, Args... args) {
+    if (wd_work.size() > 8192) {
+      wd_work.erase(0, 4096);
+    }
+    char line[96];
+    std::snprintf(line, sizeof(line), fmt, args...);
+    wd_work += line;
+  }
+
+  static s64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  void StartWatchdog(double limit_s) {
+    static std::once_flag once;
+    std::call_once(once, [this, limit_s] {
+      std::thread([this, limit_s] {
+        const s64 limit_ns = static_cast<s64>(limit_s * 3e9);
+        for (;;) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+          const u64 done = wd_done.load(std::memory_order_acquire);
+          if (done >= wd_committed.load(std::memory_order_acquire)) {
+            continue;
+          }
+          const s64 t = wd_commit_ns[(done + 1) % kWdRing].load(
+              std::memory_order_relaxed);
+          if (NowNs() - t > limit_ns) {
+            std::string work;
+            {
+              std::scoped_lock lk(wd_lock);
+              work = wd_desc[(done + 1) % kWdRing];
+            }
+            DC_ERROR("gpu watchdog: command buffer pending for %.2f s, "
+                     "exiting; it holds:\n%s",
+                     (NowNs() - t) / 1e9, work.c_str());
+            std::_Exit(3);
+          }
+        }
+      }).detach();
+    });
   }
 
   // Command buffers on one queue complete in order: the last one is enough.
@@ -1968,6 +2068,14 @@ struct MetalRenderer::Impl {
     rp.renderTargetWidth = w;
     rp.renderTargetHeight = h;
     enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    if (stats) {
+      ++stat_passes;
+      if (ps == last_pass && last_end_ra) {
+        ++stat_split;
+        ++split_by[last_end_ra];
+      }
+      last_end_ra = nullptr;
+    }
     pass = ps;
     if (dump_passes && trace) {
       for (u32 k = 0; k < 8; ++k) {
@@ -2340,6 +2448,7 @@ struct MetalRenderer::Impl {
 
   void Draw(const RegFile &r, const DrawCall &dc);
   void Dispatch(const RegFile &r, u32 x, u32 y, u32 z);
+  u64 indirect_args = 0; // guest address of the group counts (DispatchIndirect)
   void Flip(const FlipInfo &f);
   std::unordered_map<u64, id<MTLComputePipelineState>> compute_pipelines;
 
@@ -2504,6 +2613,25 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     }
   } else {
     col_format = 0;
+  }
+  // Dual-source blending: CB blends MRT0 with the MRT1 export as Source1.
+  // Metal takes that second source as color(0) index(1), with no attachment 1.
+  const u32 blend0 = colors[0] ? r[Reg::CB_BLEND0_CONTROL] : 0;
+  auto source1 = [](u32 f) { return f >= 15 && f <= 18; };
+  const bool dual_source =
+      ((blend0 >> 30) & 1) &&
+      (source1(blend0 & 0x1F) || source1((blend0 >> 8) & 0x1F) ||
+       (((blend0 >> 29) & 1) &&
+        (source1((blend0 >> 16) & 0x1F) || source1((blend0 >> 24) & 0x1F))));
+  if (dual_source) {
+    u32 f1 = (r[Reg::SPI_SHADER_COL_FORMAT] >> 4) & 0xF;
+    if (!f1) {
+      f1 = col_format & 0xF;
+    }
+    col_format = (col_format & ~0xF0u) | (f1 << 4);
+    colors[1] = nullptr;
+    color_fmt[1] = MTLPixelFormatInvalid;
+    out_type[1] = out_type[0];
   }
 
   RenderTarget *depth = nullptr;
@@ -2695,7 +2823,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   const bool capture = debug_vsout && vs_addr == debug_vsout && !debug_vs_buf;
   vo.debug_capture = capture;
   vo.textures = vs_types;
+  vo.map_hoist = map_hoist;
   u64 vs_key = Hash(vs->hash);
+  vs_key = Hash(vo.map_hoist, vs_key);
   vs_key = Hash(rect, vs_key);
   vs_key = Hash(u32(vo.points) | (u32(vo.vtx_point_size) << 1), vs_key);
   vs_key = Hash(capture, vs_key);
@@ -2709,6 +2839,8 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     fo.vs_param_mask = vs->param_mask;
     fo.ps_input_addr = r[Reg::SPI_PS_INPUT_ADDR];
     fo.col_format = col_format;
+    fo.dual_source = dual_source;
+    fo.map_hoist = map_hoist;
     for (u32 k = 0; k < 8; ++k) {
       fo.mrt_type[k] = out_type[k];
       if (color_fmt[k] == MTLPixelFormatRG11B10Float) {
@@ -2731,6 +2863,8 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     ps_key = Hash(fo.vs_param_mask, ps_key);
     ps_key = Hash(fo.ps_input_addr, ps_key);
     ps_key = Hash(fo.col_format, ps_key);
+    ps_key = Hash(fo.dual_source, ps_key);
+    ps_key = Hash(fo.map_hoist, ps_key);
     ps_key = Fnv(fo.mrt_type.data(), sizeof(fo.mrt_type), ps_key);
     ps_key = Hash(fo.mrt_ufloat, ps_key);
     ps_key =
@@ -2951,8 +3085,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   consts.vte = vte;
 
   // ---- bindings ----
-  if (std::getenv("DC_DEBUG_MEMTEST")) {
-    MemTest(vs_addr);
+  if (const char *mt = std::getenv("DC_DEBUG_MEMTEST")) {
+    const u64 a = std::strtoull(mt, nullptr, 16);
+    MemTest(a ? a : vs_addr);
   }
   u32 vud[16], pud[16];
   std::memcpy(vud, vs_ud, sizeof(vud));
@@ -3272,6 +3407,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
 
   Shader::MslOptions o;
   o.textures = types;
+  o.map_hoist = map_hoist;
   const int probe_slot = ProbeSlot(
       addr, "dispatch " + std::to_string(stat_dispatches) + " cs " + Hex(addr));
   if (probe_slot >= 0) {
@@ -3282,6 +3418,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   u64 key = Hash(cs->hash);
   key = Hash(o.probe_pc, key);
   key = Hash(rsrc2, key);
+  key = Hash(o.map_hoist, key);
   key = Fnv(types.data(), types.size() * sizeof(TextureType), key);
   const u32 group = tx * ty * tz;
   const u64 pkey = Hash(group, key);
@@ -3363,8 +3500,16 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   // LDS_SIZE is in 128-dword units on CI; Metal wants a multiple of 16 bytes.
   const u32 lds = std::max<u32>(16, Bits(rsrc2, 15, 9) * 512);
   [e setThreadgroupMemoryLength:std::min<u32>(lds, 32768) atIndex:0];
-  [e dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
-      threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+  id<MTLBuffer> ibuf = nil;
+  u64 ioff = 0;
+  if (indirect_args && Locate(indirect_args, 12, &ibuf, &ioff)) {
+    [e dispatchThreadgroupsWithIndirectBuffer:ibuf
+                         indirectBufferOffset:ioff
+                        threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+  } else {
+    [e dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
+        threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+  }
   [e endEncoding];
   if (dump_passes && trace && dump_frames) {
     u32 n = 0;
@@ -3429,6 +3574,24 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
           stat_dispatches / double(frames), stat_commits / double(frames),
           stat_waits / double(frames),
           stat_hashed / double(frames) / (1 << 20), pending.size());
+      {
+        std::vector<std::pair<u64, void *>> top;
+        for (auto &[ra, n] : split_by) {
+          top.push_back({n, ra});
+        }
+        std::sort(top.rbegin(), top.rend());
+        std::string by;
+        for (size_t k = 0; k < top.size() && k < 6; ++k) {
+          char buf[48];
+          std::snprintf(buf, sizeof(buf), " %p:%llu", top[k].second,
+                        (unsigned long long)top[k].first);
+          by += buf;
+        }
+        DC_INFO("gpu stats: %.0f passes/frame, %.0f split from the same targets by%s",
+                stat_passes / double(frames), stat_split / double(frames), by.c_str());
+        split_by.clear();
+        stat_passes = stat_split = 0;
+      }
       stat_hashed = 0;
       frames = stat_commits = stat_waits = stat_draws = stat_dispatches = 0;
       if (profile) {
@@ -3570,6 +3733,10 @@ MetalRenderer::~MetalRenderer() {
 void MetalRenderer::Draw(const RegFile &regs, const DrawCall &draw) {
   std::scoped_lock lk(impl->lock);
   @autoreleasepool {
+    impl->NoteWork("  draw vs %#llx ps %#llx count %u x%u (idx %u)\n",
+                   regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_VS),
+                   regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_PS),
+                   draw.count, draw.instances, draw.indexed);
     impl->Draw(regs, draw);
     if (impl->profile) {
       char what[64];
@@ -3585,6 +3752,8 @@ void MetalRenderer::Dispatch(const RegFile &regs, std::uint32_t x,
                              std::uint32_t y, std::uint32_t z) {
   std::scoped_lock lk(impl->lock);
   @autoreleasepool {
+    impl->NoteWork("  dispatch cs %#llx %ux%ux%u\n",
+                   regs.ProgramAddr(Liverpool::Reg::COMPUTE_PGM_LO), x, y, z);
     impl->Dispatch(regs, x, y, z);
     if (impl->profile) {
       char what[64];
@@ -3593,6 +3762,29 @@ void MetalRenderer::Dispatch(const RegFile &regs, std::uint32_t x,
       impl->ProfileCut(what);
     }
   }
+}
+
+bool MetalRenderer::DispatchIndirect(const RegFile &regs, std::uint64_t args) {
+  std::scoped_lock lk(impl->lock);
+  id<MTLBuffer> buf = nil;
+  u64 off = 0;
+  if ((args & 3) || !impl->Locate(args, 12, &buf, &off)) {
+    return false;
+  }
+  @autoreleasepool {
+    impl->NoteWork("  dispatch cs %#llx indirect %#llx\n",
+                   regs.ProgramAddr(Liverpool::Reg::COMPUTE_PGM_LO), args);
+    impl->indirect_args = args;
+    impl->Dispatch(regs, 1, 1, 1);
+    impl->indirect_args = 0;
+    if (impl->profile) {
+      char what[64];
+      std::snprintf(what, sizeof(what), "cs %#llx indirect",
+                    regs.ProgramAddr(Liverpool::Reg::COMPUTE_PGM_LO));
+      impl->ProfileCut(what);
+    }
+  }
+  return true;
 }
 
 void MetalRenderer::OnSubmit() {

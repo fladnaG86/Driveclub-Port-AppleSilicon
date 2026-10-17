@@ -9,6 +9,7 @@
 //    the guest module and offset.
 
 #include <string>
+#include <vector>
 
 #include "common/types.h"
 
@@ -28,5 +29,25 @@ void AddPatchArea(VAddr code_begin, VAddr code_end, VAddr area, u64 area_size);
 // guest pages this way).
 using FaultHandler = bool (*)(void* ucontext, void* fault_address);
 void SetFaultHandler(FaultHandler handler);
+
+// Debugging: counts entries of a guest function that starts with `push rbp`
+// (replaced by int3; the trap handler emulates the push). False if the code
+// there does not start with push rbp or the probe table is full.
+bool AddProbe(VAddr function);
+// Entries so far of each probe, in the order they were added.
+std::vector<u64> ProbeHits();
+// rdi (first argument, `this` for methods) of each probe's latest entry.
+std::vector<u64> ProbeArgs();
+// Up to 8 distinct rdi (or, with `second`, rsi) values a probe has seen.
+std::vector<u64> ProbeDistinctArgs(u32 probe, bool second = false);
+// Up to 8 distinct return addresses (callers) a probe has seen.
+std::vector<u64> ProbeCallers(u32 probe);
+
+// Debugging: records the code that reads or writes [addr, addr + size). The
+// page is protected; a fault there notes the instruction and unprotects it
+// until the next WatchRearm(). Returns the sites seen so far.
+void WatchAccess(VAddr addr, u64 size);
+void WatchRearm();
+std::vector<u64> WatchSites();
 
 } // namespace Core::Signals

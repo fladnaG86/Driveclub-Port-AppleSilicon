@@ -62,6 +62,10 @@ bool Overlaps(VAddr start, u64 size) {
 // First free, aligned gap of `size` bytes at or above `hint` (or the default
 // base without a hint).
 VAddr FindFree(VAddr hint, u64 size, u64 align) {
+    // Rosetta: hints in the hole below the (moved) user range start at its base.
+    if (hint >= AddressSpace::kSystemReservedMax && hint < AddressSpace::kUserMin) {
+        hint = AddressSpace::kUserMin;
+    }
     VAddr addr = AlignUp(hint ? hint : kDefaultSearchBase, std::max(align, kPage));
     for (;;) {
         if (!AddressSpace::Contains(addr, size)) {
