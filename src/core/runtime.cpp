@@ -1,11 +1,14 @@
 #include "core/runtime.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <set>
 #include <string>
 
 #include <pthread.h>
+#include <sys/mman.h>
 
 #include "common/log.h"
 #include "core/loader/linker.h"
@@ -50,8 +53,36 @@ void ProgramExit() {
     __builtin_unreachable();
 }
 
+// Rosetta reserves 0xFC0000000-0x7000000000, so the game's fixed heap at
+// 0x1000000000 cannot be mapped. Rewrite the movabs that hold that base (v1.28
+// eboot) to 0x9000000000, which keeps bits 36-38 for the game's range checks.
+void RelocateFixedHeap(const Loader::Module& exe) {
+    constexpr u64 kOld = 0x1000000000, kNew = 0x9000000000;
+    const char* env = std::getenv("DC_HEAP_SITES");
+    const std::string sites = env ? env : "748d85,748d8f,749247,74925a,5fa001";
+    size_t pos = 0;
+    while (pos < sites.size()) {
+        const size_t comma = std::min(sites.find(',', pos), sites.size());
+        const VAddr site = exe.Base() + std::strtoull(sites.substr(pos, comma - pos).c_str(), nullptr, 16);
+        pos = comma + 1;
+        auto* code = reinterpret_cast<u8*>(site);
+        u64 imm;
+        std::memcpy(&imm, code + 2, 8);
+        if ((code[0] & 0xFE) != 0x48 || (code[1] & 0xF8) != 0xB8 || imm != kOld) {
+            DC_WARN("heap remap: no movabs %#llx at %#llx", kOld, site);
+            continue;
+        }
+        const VAddr page = site & ~0xFFFull;
+        mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+        std::memcpy(code + 2, &kNew, 8);
+        mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_EXEC);
+        DC_INFO("heap remap: %#llx -> %#llx at %#llx", kOld, kNew, site);
+    }
+}
+
 void* GuestMain(void*) {
     Tls::SetupThread();
+    RelocateFixedHeap(*Loader::Linker::Instance()->Executable());
 
     for (const char* name : kPreloadedModules) {
         StartModule(name);

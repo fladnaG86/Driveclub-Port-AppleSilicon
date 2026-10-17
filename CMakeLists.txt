@@ -127,7 +127,7 @@ target_link_options(driveclub PRIVATE
     -Wl,-segaddr,GUEST_TCB,0x4000
     -Wl,-segaddr,GUEST_SYSMGD,0x400000
     -Wl,-segaddr,GUEST_SYSRSV,0x7FFFFC000
-    -Wl,-segaddr,GUEST_USER,0x1000000000
+    -Wl,-segaddr,GUEST_USER,0x7000000000
 )
 
 # Vulkan renderer (shadPS4's, third_party/shadps4): the Windows/Linux backend,

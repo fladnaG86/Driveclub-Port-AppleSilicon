@@ -19,7 +19,7 @@ constexpr VAddr kSystemManagedMax = 0x7FFFFC000;
 constexpr VAddr kSystemReservedMin = 0x7FFFFC000;
 constexpr VAddr kSystemReservedMax = 0xFC0000000;
 // Direct and flexible memory mappings; games use fixed addresses from 64 GB up.
-constexpr VAddr kUserMin = 0x1000000000;
+constexpr VAddr kUserMin = 0x7000000000; // Rosetta: 0xFC0000000-0x7000000000 is taken
 constexpr VAddr kUserMax = 0x600000000000;
 
 enum class Prot : int { None = 0, Read = 1, Write = 2, Exec = 4, ReadWrite = 3 };
