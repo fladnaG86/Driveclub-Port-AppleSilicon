@@ -1,6 +1,7 @@
 #include "gpu/metal/mtl_renderer.h"
 
 #import <Metal/Metal.h>
+#include <mach/mach.h>
 
 #include <algorithm>
 #include <atomic>
@@ -515,6 +516,7 @@ struct MetalRenderer::Impl {
     return sample;
   }
   std::atomic<u64> gpu_ns{0};
+  mach_port_t draw_thread = 0; // DC_GPU_STATS: whose CPU time to report
   u64 stat_hashed = 0;
   u64 stat_commits = 0, stat_waits = 0, stat_dispatches = 0, stat_draws = 0;
   double stat_wait_s = 0;
@@ -532,8 +534,11 @@ struct MetalRenderer::Impl {
   struct CpuTimer {
     double *slot;
     std::chrono::steady_clock::time_point t0;
-    explicit CpuTimer(double *s)
-        : slot(s), t0(std::chrono::steady_clock::now()) {}
+    explicit CpuTimer(double *s) : slot(s) {
+      if (slot) {
+        t0 = std::chrono::steady_clock::now();
+      }
+    }
     ~CpuTimer() {
       if (slot) {
         *slot += std::chrono::duration<double>(
@@ -1091,7 +1096,7 @@ struct MetalRenderer::Impl {
           std::string work;
           {
             std::scoped_lock lk(wd_lock);
-            work = wd_desc[seq % kWdRing];
+            work = FormatNotes(wd_desc[seq % kWdRing]);
           }
           DC_ERROR("gpu watchdog: command buffer took %.2f s (%s), exiting; "
                    "it holds:\n%s",
@@ -1326,18 +1331,38 @@ struct MetalRenderer::Impl {
   static constexpr u64 kWdRing = 4096;
   std::atomic<u64> wd_committed{0}, wd_done{0};
   std::atomic<s64> wd_commit_ns[kWdRing] = {};
-  std::string wd_work; // draws/dispatches recorded into `cmd`
+  // A draw or dispatch, formatted only if the watchdog reports its buffer.
+  struct WorkNote {
+    void (*format)(const WorkNote &, std::string &);
+    const char *fmt;
+    u64 args[5];
+  };
+  template <typename... Args>
+  static void FormatNote(const WorkNote &n, std::string &out) {
+    char line[96];
+    [&]<size_t... I>(std::index_sequence<I...>) {
+      std::snprintf(line, sizeof(line), n.fmt, static_cast<Args>(n.args[I])...);
+    }(std::index_sequence_for<Args...>{});
+    out += line;
+  }
+  static std::string FormatNotes(const std::vector<WorkNote> &notes) {
+    std::string out;
+    for (const WorkNote &n : notes) {
+      n.format(n, out);
+    }
+    return out;
+  }
+  std::vector<WorkNote> wd_work; // draws/dispatches recorded into `cmd`
   std::mutex wd_lock;
-  std::string wd_desc[kWdRing];
+  std::vector<WorkNote> wd_desc[kWdRing];
 
   template <typename... Args> void NoteWork(const char *fmt, Args... args) {
+    static_assert(sizeof...(Args) <= 5);
     CpuTimer t(cpu_profile ? &cpu_notework_s : nullptr);
-    if (wd_work.size() > 8192) {
-      wd_work.erase(0, 4096);
+    if (wd_work.size() >= 128) { // the latest ones tell the most
+      wd_work.erase(wd_work.begin(), wd_work.begin() + 64);
     }
-    char line[96];
-    std::snprintf(line, sizeof(line), fmt, args...);
-    wd_work += line;
+    wd_work.push_back({&FormatNote<Args...>, fmt, {static_cast<u64>(args)...}});
   }
 
   static s64 NowNs() {
@@ -1363,7 +1388,7 @@ struct MetalRenderer::Impl {
             std::string work;
             {
               std::scoped_lock lk(wd_lock);
-              work = wd_desc[(done + 1) % kWdRing];
+              work = FormatNotes(wd_desc[(done + 1) % kWdRing]);
             }
             DC_ERROR("gpu watchdog: command buffer pending for %.2f s, "
                      "exiting; it holds:\n%s",
@@ -3124,7 +3149,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   const bool probe_target =
       !probe_cb || (u64(r.ColorTarget(0, Reg::CB_BASE)) << 8) == probe_cb;
   const int probe_slot =
-      ps && probe_target
+      ps && probe_target && probe_buf && trace
           ? ProbeSlot(ps_addr,
                       "draw " + std::to_string(draw_count) + " ps " +
                           Hex(ps_addr) + " cb0 " +
@@ -3724,8 +3749,11 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   Shader::MslOptions o;
   o.textures = types; // borrowed: `types` lives until the key is hashed
   o.map_hoist = map_hoist;
-  const int probe_slot = ProbeSlot(
-      addr, "dispatch " + std::to_string(stat_dispatches) + " cs " + Hex(addr));
+  const int probe_slot =
+      probe_buf && trace
+          ? ProbeSlot(addr, "dispatch " + std::to_string(stat_dispatches) +
+                                " cs " + Hex(addr))
+          : -1;
   if (probe_slot >= 0) {
     o.probe_pc = probe.pc;
     o.probe_x = probe.x;
@@ -3903,6 +3931,19 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
     static u64 frames = 0;
     ++frames;
     if (dt >= 1.0) {
+      // CPU time of the thread that records the draws (the graphics CP).
+      static double cp_cpu_last = 0;
+      double cp_cpu = 0;
+      thread_basic_info_data_t info{};
+      mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+      if (draw_thread && thread_info(draw_thread, THREAD_BASIC_INFO,
+                                     reinterpret_cast<thread_info_t>(&info), &n) == KERN_SUCCESS) {
+        cp_cpu = info.user_time.seconds + info.user_time.microseconds * 1e-6 +
+                 info.system_time.seconds + info.system_time.microseconds * 1e-6;
+      }
+      DC_INFO("gpu stats: CP thread %.1f ms CPU per frame",
+              (cp_cpu - cp_cpu_last) * 1e3 / frames);
+      cp_cpu_last = cp_cpu;
       DC_INFO(
           "gpu stats: %.1f fps, gpu busy %.0f%%, wait %.0f%%, per frame: %.0f "
           "draws %.0f dispatches %.1f commits %.1f waits %.1f MB hashed, "
@@ -4106,6 +4147,9 @@ MetalRenderer::~MetalRenderer() {
 
 void MetalRenderer::Draw(const RegFile &regs, const DrawCall &draw) {
   std::scoped_lock lk(impl->lock);
+  if (!impl->draw_thread) {
+    impl->draw_thread = pthread_mach_thread_np(pthread_self());
+  }
   @autoreleasepool {
     impl->NoteWork("  draw vs %#llx ps %#llx count %u x%u (idx %u)\n",
                    regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_VS),
