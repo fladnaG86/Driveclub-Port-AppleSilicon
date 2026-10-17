@@ -113,9 +113,10 @@ int StartModule(const char* name, u64 args, const void* argp) {
         return 0;
     }
     DC_INFO("starting module %s with args=%llu argp=%p", name, args, argp);
+    // The PRX init stub tail-calls its third argument when it is non-null, so
+    // passing the proc param here jumps into data (seen with libc of v1.28).
     using ModuleStart = int (*)(u64 args, const void* argp, void* param);
-    const int ret = reinterpret_cast<ModuleStart>(m->InitAddr())(
-        args, argp, reinterpret_cast<void*>(m->ProcParam()));
+    const int ret = reinterpret_cast<ModuleStart>(m->InitAddr())(args, argp, nullptr);
     DC_INFO("module %s started: %d", name, ret);
     return ret;
 }
