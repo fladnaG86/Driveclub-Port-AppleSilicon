@@ -1760,9 +1760,10 @@ std::string Emitter::Run() {
         }
         src += "};\nstruct PsOut {\n";
         for (u32 k = 0; k < 8; ++k) {
-            if ((p.mrt_mask & (1u << k)) && ((o.col_format >> (4 * k)) & 0xF)) {
+            const bool src1 = o.dual_source && k == 1;
+            if (((p.mrt_mask & (1u << k)) || src1) && ((o.col_format >> (4 * k)) & 0xF)) {
                 const char* t = o.mrt_type[k] == OutType::Float ? "float4" : o.mrt_type[k] == OutType::Uint ? "uint4" : "int4";
-                src += std::string("    ") + t + " c" + N(k) + " [[color(" + N(k) + ")]];\n";
+                src += std::string("    ") + t + " c" + N(k) + (src1 ? " [[color(0), index(1)]];\n" : " [[color(" + N(k) + ")]];\n");
             }
         }
         if (p.exports_depth && o.depth_target) {

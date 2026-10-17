@@ -2593,6 +2593,25 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   } else {
     col_format = 0;
   }
+  // Dual-source blending: CB blends MRT0 with the MRT1 export as Source1.
+  // Metal takes that second source as color(0) index(1), with no attachment 1.
+  const u32 blend0 = colors[0] ? r[Reg::CB_BLEND0_CONTROL] : 0;
+  auto source1 = [](u32 f) { return f >= 15 && f <= 18; };
+  const bool dual_source =
+      ((blend0 >> 30) & 1) &&
+      (source1(blend0 & 0x1F) || source1((blend0 >> 8) & 0x1F) ||
+       (((blend0 >> 29) & 1) &&
+        (source1((blend0 >> 16) & 0x1F) || source1((blend0 >> 24) & 0x1F))));
+  if (dual_source) {
+    u32 f1 = (r[Reg::SPI_SHADER_COL_FORMAT] >> 4) & 0xF;
+    if (!f1) {
+      f1 = col_format & 0xF;
+    }
+    col_format = (col_format & ~0xF0u) | (f1 << 4);
+    colors[1] = nullptr;
+    color_fmt[1] = MTLPixelFormatInvalid;
+    out_type[1] = out_type[0];
+  }
 
   RenderTarget *depth = nullptr;
   const u32 z_info = r[Reg::DB_Z_INFO];
@@ -2797,6 +2816,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     fo.vs_param_mask = vs->param_mask;
     fo.ps_input_addr = r[Reg::SPI_PS_INPUT_ADDR];
     fo.col_format = col_format;
+    fo.dual_source = dual_source;
     for (u32 k = 0; k < 8; ++k) {
       fo.mrt_type[k] = out_type[k];
       if (color_fmt[k] == MTLPixelFormatRG11B10Float) {
@@ -2819,6 +2839,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     ps_key = Hash(fo.vs_param_mask, ps_key);
     ps_key = Hash(fo.ps_input_addr, ps_key);
     ps_key = Hash(fo.col_format, ps_key);
+    ps_key = Hash(fo.dual_source, ps_key);
     ps_key = Fnv(fo.mrt_type.data(), sizeof(fo.mrt_type), ps_key);
     ps_key = Hash(fo.mrt_ufloat, ps_key);
     ps_key =
