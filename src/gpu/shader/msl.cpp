@@ -231,6 +231,36 @@ private:
     u32 cur = 0;                              // index of the instruction being emitted
     std::unordered_map<u32, u32> index_of;    // pc -> instruction index
     std::unordered_map<u32, u32> loop_end;    // loop header index -> index of its last back edge
+
+    // A guest wave is 64 lanes in lockstep: LDS one lane writes is there for the
+    // others at the next instruction, so shaders sized to one wave skip s_barrier.
+    // Metal runs the threadgroup as 32-wide SIMD groups that drift apart. Where the
+    // kind of LDS access changes (write -> read, read -> write, atomics) a barrier
+    // restores the order -- only where every thread passes (outside loops).
+    u32 lds_last = 0; // 0 none, 1 read, 2 write, 3 atomic
+    bool LdsBarrier(const Inst& i) {
+        if (p.stage != Stage::Compute) {
+            return false;
+        }
+        if (i.enc == Enc::SOPP && static_cast<Sopp>(i.op) == Sopp::S_BARRIER) {
+            lds_last = 0;
+            return false;
+        }
+        if (i.enc != Enc::DS) {
+            return false;
+        }
+        const char* n = OpName(i.enc, i.op);
+        const std::string name = n ? n : "";
+        const u32 kind = name.rfind("DS_READ", 0) == 0 ? 1u : name.rfind("DS_WRITE", 0) == 0 ? 2u : 3u;
+        const bool need = lds_last != 0 && lds_last != kind;
+        lds_last = kind;
+        for (const auto& [h, e] : loop_end) {
+            if (h <= cur && cur <= e) {
+                return false;
+            }
+        }
+        return need;
+    }
 };
 
 void Emitter::Emit(const Inst& i) {
@@ -454,7 +484,13 @@ void Emitter::EmitSopc(const Inst& i) {
 
 void Emitter::EmitSopp(const Inst& i) {
     switch (static_cast<Sopp>(i.op)) {
-    case Sopp::S_ENDPGM: End(); break;
+    case Sopp::S_ENDPGM:
+        if (structured && p.stage == Stage::Compute && cur + 1 < p.code.size()) {
+            Line("tgt_ = " + N(static_cast<u32>(p.code.size())) + "u;"); // to the end: later barriers see every thread
+            break;
+        }
+        End();
+        break;
     case Sopp::S_BRANCH: Jump(BranchTarget(i)); break;
     case Sopp::S_CBRANCH_SCC0: Line("if (!scc)"); Jump(BranchTarget(i)); break;
     case Sopp::S_CBRANCH_SCC1: Line("if (scc)"); Jump(BranchTarget(i)); break;
@@ -1460,6 +1496,8 @@ void Emitter::EmitStructured() {
         if (IsBranch(i)) {
             starts.insert(index_of.at(BranchTarget(i)));
             starts.insert(k + 1);
+        } else if (i.enc == Enc::SOPP && static_cast<Sopp>(i.op) == Sopp::S_ENDPGM) {
+            starts.insert(k + 1);
         }
     }
     bool open = false;
@@ -1476,6 +1514,14 @@ void Emitter::EmitStructured() {
         }
         if (cur == 0 || starts.count(cur)) {
             close();
+            body += "    if (tgt_ <= " + N(cur) + "u) {\n";
+            open = true;
+        }
+        if (LdsBarrier(p.code[cur])) {
+            // Jump targets are block starts, so a thread skipping this block has
+            // tgt_ past cur: splitting it here keeps the barrier uniform.
+            close();
+            body += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n";
             body += "    if (tgt_ <= " + N(cur) + "u) {\n";
             open = true;
         }
@@ -1499,6 +1545,9 @@ void Emitter::EmitSwitch() {
                 body += "    case " + Hex(i.pc) + ":\n";
             }
             ++label;
+        }
+        if (!p.has_branches && LdsBarrier(i)) {
+            Line("threadgroup_barrier(mem_flags::mem_threadgroup);");
         }
         Emit(i);
     }
