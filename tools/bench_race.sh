@@ -1,7 +1,9 @@
 #!/bin/bash
 # Race benchmark: tools/bench_race.sh <label> [VAR=value ...]
 # Starts an event (auto Cross), holds the throttle, runs 150 s, then prints
-# "<label> <fps median> <gpu busy median %> <errors>" over 90-140 s.
+# "<label> <fps median> <gpu busy median %> <errors> <GPU ms/frame median>"
+# over 90-140 s. fps snaps to vblank multiples (15, 20, 30), so GPU ms per
+# frame (busy / fps) is what shows a change in GPU work.
 # Output in ../bench/<label>/: run.log, frames/, shaders/.
 set -u
 cd "$(dirname "$0")/.."
@@ -27,7 +29,7 @@ wait $pid 2>/dev/null
 python3 - "$out/run.log" "$label" <<'PY'
 import re, statistics, sys
 log, label = sys.argv[1], sys.argv[2]
-fps, busy, errors, t = [], [], 0, 0
+fps, busy, gms, errors, t = [], [], [], 0, 0
 for line in open(log, errors='replace'):
     if line.startswith('[error]'):
         errors += 1
@@ -37,6 +39,8 @@ for line in open(log, errors='replace'):
         if 90 <= t <= 140:
             fps.append(float(m.group(1)))
             busy.append(int(m.group(2)))
+            if float(m.group(1)) > 0:
+                gms.append(int(m.group(2)) * 10.0 / float(m.group(1)))
 med = lambda v: statistics.median(v) if v else 0
-print(f'{label} {med(fps):.1f} {med(busy):.0f} {errors}')
+print(f'{label} {med(fps):.1f} {med(busy):.0f} {errors} {med(gms):.1f}')
 PY

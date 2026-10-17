@@ -118,5 +118,9 @@
 |---|---|---|---|
 | baseline | 15.0 | 76 % | 0 |
 | map_hoist | 15.0 | 71 % | 0 |
-| sbase_cache | | | |
-| ud_const | | | |
+| sbase_cache | 15.0 | 74 % | 0 — dropped: per-shader µs/call worse than map_hoist alone (top PS 319 → 524) |
+| ud_const | — | — | 0 — dropped: per-shader µs/call +9 % / +20 % on the two shaders it touches, others ±2 % |
+
+fps stays at 15.0 in every variant: frames are paced to 60 Hz vblanks, so a frame needing ~47–51 ms of GPU still takes 4 vblanks (66.7 ms). The comparisons above use `DC_GPU_PROFILE` µs per call of the same shaders, which does not depend on what the race shows.
+
+**Kept:** Task 1 (`map_hoist`), 3–19 % less GPU time per draw. **Dropped:** Tasks 2 and 3 — the Metal compiler already handles the repeated uniform translations well; caching them in variables or moving them to a constant buffer costs more than it saves. The next GPU lever is not scalar loads.
