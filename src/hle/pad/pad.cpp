@@ -18,6 +18,7 @@ namespace {
 
 constexpr s32 kPadHandle = 1;
 constexpr s32 kErrorInvalidPortType = -2137980926; // 0x80920002
+constexpr s32 kErrorInvalidHandle = static_cast<s32>(0x80920003);
 
 s32 scePadInit() {
     DC_INFO("scePadInit()");
@@ -59,7 +60,12 @@ static u64 PadTimestamp() {
     return duration_cast<microseconds>(steady_clock::now() - t0).count();
 }
 
+// Only the handle scePadOpen gave out is a pad: logiWheel.prx probes with -1
+// and, served data, reports a wheel the game then gives player 1.
 s32 scePadReadState(s32 handle, OrbisPadData* data) {
+    if (handle != kPadHandle) {
+        return kErrorInvalidHandle;
+    }
     if (data) {
         std::memset(data, 0, sizeof(*data));
         data->buttons = g_buttons.load();
@@ -75,6 +81,9 @@ s32 scePadReadState(s32 handle, OrbisPadData* data) {
 }
 
 s32 scePadRead(s32 handle, OrbisPadData* data, s32 count) {
+    if (handle != kPadHandle) {
+        return kErrorInvalidHandle;
+    }
     if (data && count > 0) {
         for (s32 i = 0; i < count; ++i) {
             std::memset(&data[i], 0, sizeof(OrbisPadData));
@@ -92,6 +101,9 @@ s32 scePadRead(s32 handle, OrbisPadData* data, s32 count) {
 }
 
 s32 scePadGetControllerInformation(s32 handle, OrbisPadControllerInformation* info) {
+    if (handle != kPadHandle) {
+        return kErrorInvalidHandle;
+    }
     if (info) {
         std::memset(info, 0, sizeof(*info));
         info->touchPadInfo.pixelDensity = 1.0f;
