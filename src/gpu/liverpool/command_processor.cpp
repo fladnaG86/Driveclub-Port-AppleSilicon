@@ -553,7 +553,13 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 const u64 dst_addr = dsel ? (body[3] & 0xFFFF) : u64(body[3]) | (u64(body[4]) << 32);
                 const u64 src_addr = ssel == 2 ? body[1]
                                    : ssel == 1 ? (body[1] & 0xFFFF) : u64(body[1]) | (u64(body[2]) << 32);
-                if (bytes && renderer->DmaData(dsel, dst_addr, ssel, src_addr, bytes)) {
+                // The game patches packets further down this very command buffer
+                // (e.g. DISPATCH_DIRECT sizes): we parse it now, so such a copy
+                // cannot wait on the host GPU queue.
+                const u64 ib_lo = reinterpret_cast<u64>(cmds.data());
+                const u64 ib_hi = reinterpret_cast<u64>(end);
+                const bool patches_ib = !dsel && dst_addr < ib_hi && dst_addr + bytes > ib_lo;
+                if (bytes && !patches_ib && renderer->DmaData(dsel, dst_addr, ssel, src_addr, bytes)) {
                     break;
                 }
             }
