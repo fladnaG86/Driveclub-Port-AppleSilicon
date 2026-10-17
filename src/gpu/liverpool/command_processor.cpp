@@ -346,7 +346,9 @@ void CommandProcessor::RunConstantEngine(const std::function<bool()>& done) {
             ++ce.ce_counter;
             break;
         case Op::WaitOnDeCounterDiff:
-            if (ce.ce_counter - ce.de_counter >= body[0]) {
+            // Signed: a DE that is ahead (it can count a draw before the CE starts)
+            // leaves the CE free to run, not blocked on an underflowed difference.
+            if (static_cast<s64>(ce.ce_counter - ce.de_counter) >= static_cast<s64>(body[0])) {
                 return; // blocked until the DE catches up; retried later
             }
             break;
