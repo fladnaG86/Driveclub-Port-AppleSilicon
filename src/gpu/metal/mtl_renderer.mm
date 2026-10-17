@@ -3039,8 +3039,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   consts.vte = vte;
 
   // ---- bindings ----
-  if (std::getenv("DC_DEBUG_MEMTEST")) {
-    MemTest(vs_addr);
+  if (const char *mt = std::getenv("DC_DEBUG_MEMTEST")) {
+    const u64 a = std::strtoull(mt, nullptr, 16);
+    MemTest(a ? a : vs_addr);
   }
   u32 vud[16], pud[16];
   std::memcpy(vud, vs_ud, sizeof(vud));
