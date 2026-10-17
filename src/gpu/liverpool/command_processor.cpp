@@ -624,6 +624,12 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 }
                 u32 iters = 0;
                 while (!Compare(func, *addr & mask, ref)) {
+                    // Another queue (async compute) may record the write meanwhile:
+                    // all queues share one host command stream, so recorded work
+                    // runs before anything this queue records after the wait.
+                    if (PendingFence(reinterpret_cast<u64>(addr), &pending) && Compare(func, pending & mask, ref)) {
+                        break;
+                    }
                     if (++iters > 1000000) {
                         DC_WARN("gpu: WaitRegMem timeout (addr=%p val=%#x ref=%#x mask=%#x func=%u)",
                                 addr, *addr, ref, mask, func);
