@@ -267,6 +267,8 @@ struct MetalRenderer::Impl {
   id<MTLSharedEvent> signal_event = nil;
   MTLSharedEventListener *signal_listener = nil;
   u64 signal_value = 0;
+  u64 signal_pending = 0; // value of callbacks waiting for FlushSignal, 0: none
+  bool signal_batch = true;
   std::mutex signal_lock;
   std::deque<std::pair<u64, std::function<void()>>> signal_queue;
 
@@ -608,6 +610,7 @@ struct MetalRenderer::Impl {
     tex_cache = std::getenv("DC_NO_TEX_CACHE") == nullptr;
     tex_cache_check = std::getenv("DC_TEX_CACHE_CHECK") != nullptr;
     map_hoist = std::getenv("DC_NO_MAP_HOIST") == nullptr;
+    signal_batch = std::getenv("DC_NO_SIGNAL_BATCH") == nullptr;
     profile = std::getenv("DC_GPU_PROFILE") != nullptr;
     if (std::getenv("DC_PASS_TIMING") &&
         [device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
@@ -857,12 +860,19 @@ struct MetalRenderer::Impl {
   }
 
   // DC_GPU_STATS: why passes over the same targets get split.
+  // Compute encoder kept open across back-to-back dispatches: an encoder per
+  // dispatch costs the host GPU a flush each. Its dispatches stay serial.
+  id<MTLComputeCommandEncoder> cenc = nil;
   PassState last_pass;
   void *last_end_ra = nullptr;
   std::unordered_map<void *, u64> split_by;
   u64 stat_passes = 0, stat_split = 0;
 
   void EndPass() {
+    if (cenc) {
+      [cenc endEncoding];
+      cenc = nil;
+    }
     if (enc && stats) {
       last_pass = pass;
       last_end_ra = __builtin_return_address(0);
@@ -987,6 +997,7 @@ struct MetalRenderer::Impl {
       }
       return;
     }
+    FlushSignal();
     if (!chunks.empty() || chunk) {
       // Keep upload memory alive until the GPU is done with it.
       __block std::vector<id<MTLBuffer>> keep = std::move(chunks);
@@ -1256,14 +1267,36 @@ struct MetalRenderer::Impl {
 
   // Command buffers on one queue complete in order, and their completion
   // handlers run in order on Metal's serial completion queue.
+  //
+  // Callbacks share one event signal, encoded when the command buffer is
+  // committed: a signal per callback (async compute releases one after every
+  // dispatch) ends the open encoder each time. Nothing on the GPU waits on
+  // the event, so the callbacks only run a little later, still in order.
+  // DC_NO_SIGNAL_BATCH: one signal per callback, right where it is recorded.
   void Signal(std::function<void()> done) {
-    EndPass();
+    if (!signal_batch) {
+      EndPass();
+    }
     EnsureCommandBuffer();
-    const u64 v = ++signal_value;
+    if (!signal_pending) {
+      signal_pending = ++signal_value;
+    }
     {
       std::scoped_lock lk(signal_lock);
-      signal_queue.emplace_back(v, std::move(done));
+      signal_queue.emplace_back(signal_pending, std::move(done));
     }
+    if (!signal_batch) {
+      FlushSignal();
+    }
+  }
+
+  // Encodes the pending signal; no encoder may be open.
+  void FlushSignal() {
+    if (!signal_pending) {
+      return;
+    }
+    const u64 v = signal_pending;
+    signal_pending = 0;
     [cmd encodeSignalEvent:signal_event value:v];
     [signal_event notifyListener:signal_listener
                          atValue:v
@@ -3752,7 +3785,11 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     return;
   }
 
-  EndPass();
+  // One encoder per dispatch while timing them or dumping a traced frame.
+  const bool batch = !pass_timing && !trace;
+  if (!batch || enc) {
+    EndPass();
+  }
   if (++work_since_commit >= kCommitEvery) {
     Commit(false);
   }
@@ -3769,6 +3806,11 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     cp.sampleBufferAttachments[0].startOfEncoderSampleIndex = sample % kTsPerBuf;
     cp.sampleBufferAttachments[0].endOfEncoderSampleIndex = sample % kTsPerBuf + 1;
     e = [cmd computeCommandEncoderWithDescriptor:cp];
+  } else if (batch) {
+    if (!cenc) {
+      cenc = [cmd computeCommandEncoder];
+    }
+    e = cenc;
   } else {
     e = [cmd computeCommandEncoder];
   }
@@ -3802,7 +3844,9 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     [e dispatchThreadgroups:MTLSizeMake(gx, gy, gz)
         threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
   }
-  [e endEncoding];
+  if (!batch) {
+    [e endEncoding];
+  }
   if (dump_passes && trace && dump_frames) {
     u32 n = 0;
     for (u32 k = 0; k < res.tex.size() && n < 8; ++k) {
