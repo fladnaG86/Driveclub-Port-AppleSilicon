@@ -17,6 +17,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -890,6 +891,40 @@ struct MetalRenderer::Impl {
         gpu_ns += static_cast<u64>((c.GPUEndTime - c.GPUStartTime) * 1e9);
       }];
     }
+    // A command buffer that hogs the GPU for seconds starves WindowServer
+    // until its watchdog reboots the Mac: bail out before that happens.
+    // DC_GPU_WATCHDOG=<seconds>, 0 disables.
+    static const double watchdog_s = [] {
+      const char *v = std::getenv("DC_GPU_WATCHDOG");
+      return v ? std::atof(v) : 1.0;
+    }();
+    if (watchdog_s > 0) {
+      StartWatchdog(watchdog_s);
+      const u64 seq = wd_committed.load(std::memory_order_relaxed) + 1;
+      wd_commit_ns[seq % kWdRing].store(NowNs(), std::memory_order_relaxed);
+      {
+        std::scoped_lock lk(wd_lock);
+        wd_desc[seq % kWdRing] = std::move(wd_work);
+      }
+      wd_work.clear();
+      wd_committed.store(seq, std::memory_order_release);
+      [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        wd_done.store(seq, std::memory_order_release);
+        const double s = c.GPUEndTime - c.GPUStartTime;
+        if (c.status == MTLCommandBufferStatusError || s > watchdog_s) {
+          std::string work;
+          {
+            std::scoped_lock lk(wd_lock);
+            work = wd_desc[seq % kWdRing];
+          }
+          DC_ERROR("gpu watchdog: command buffer took %.2f s (%s), exiting; "
+                   "it holds:\n%s",
+                   s, c.error ? c.error.localizedDescription.UTF8String : "ok",
+                   work.c_str());
+          std::_Exit(3);
+        }
+      }];
+    }
     [cmd commit];
     last_committed = cmd;
     cmd = nil;
@@ -1056,6 +1091,59 @@ struct MetalRenderer::Impl {
       }
       fn();
     }
+  }
+
+  // GPU watchdog: a hung command buffer never completes, so a thread also
+  // checks how long the oldest pending one has been waiting.
+  static constexpr u64 kWdRing = 4096;
+  std::atomic<u64> wd_committed{0}, wd_done{0};
+  std::atomic<s64> wd_commit_ns[kWdRing] = {};
+  std::string wd_work; // draws/dispatches recorded into `cmd`
+  std::mutex wd_lock;
+  std::string wd_desc[kWdRing];
+
+  template <typename... Args> void NoteWork(const char *fmt, Args... args) {
+    if (wd_work.size() > 8192) {
+      wd_work.erase(0, 4096);
+    }
+    char line[96];
+    std::snprintf(line, sizeof(line), fmt, args...);
+    wd_work += line;
+  }
+
+  static s64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  void StartWatchdog(double limit_s) {
+    static std::once_flag once;
+    std::call_once(once, [this, limit_s] {
+      std::thread([this, limit_s] {
+        const s64 limit_ns = static_cast<s64>(limit_s * 3e9);
+        for (;;) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+          const u64 done = wd_done.load(std::memory_order_acquire);
+          if (done >= wd_committed.load(std::memory_order_acquire)) {
+            continue;
+          }
+          const s64 t = wd_commit_ns[(done + 1) % kWdRing].load(
+              std::memory_order_relaxed);
+          if (NowNs() - t > limit_ns) {
+            std::string work;
+            {
+              std::scoped_lock lk(wd_lock);
+              work = wd_desc[(done + 1) % kWdRing];
+            }
+            DC_ERROR("gpu watchdog: command buffer pending for %.2f s, "
+                     "exiting; it holds:\n%s",
+                     (NowNs() - t) / 1e9, work.c_str());
+            std::_Exit(3);
+          }
+        }
+      }).detach();
+    });
   }
 
   // Command buffers on one queue complete in order: the last one is enough.
@@ -3570,6 +3658,10 @@ MetalRenderer::~MetalRenderer() {
 void MetalRenderer::Draw(const RegFile &regs, const DrawCall &draw) {
   std::scoped_lock lk(impl->lock);
   @autoreleasepool {
+    impl->NoteWork("  draw vs %#llx ps %#llx count %u x%u (idx %u)\n",
+                   regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_VS),
+                   regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_PS),
+                   draw.count, draw.instances, draw.indexed);
     impl->Draw(regs, draw);
     if (impl->profile) {
       char what[64];
@@ -3585,6 +3677,8 @@ void MetalRenderer::Dispatch(const RegFile &regs, std::uint32_t x,
                              std::uint32_t y, std::uint32_t z) {
   std::scoped_lock lk(impl->lock);
   @autoreleasepool {
+    impl->NoteWork("  dispatch cs %#llx %ux%ux%u\n",
+                   regs.ProgramAddr(Liverpool::Reg::COMPUTE_PGM_LO), x, y, z);
     impl->Dispatch(regs, x, y, z);
     if (impl->profile) {
       char what[64];

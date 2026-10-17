@@ -384,6 +384,10 @@ void CommandProcessor::Draw(bool indexed, u32 count, u32 index_offset, u32 first
     renderer->Draw(CurRegs(), dc);
 }
 
+// Sanity limits for indirect args (a 1080p frame never needs more).
+constexpr u32 kMaxIndirectCount = 1u << 24;
+constexpr u64 kMaxIndirectGroups = 1ull << 20;
+
 // Indirect draw/dispatch arguments live at the SET_BASE address + offset.
 const u32* CommandProcessor::IndirectArgs(u32 offset, u32 dwords) {
     const Ring* ring = t_ring;
@@ -658,6 +662,12 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             if (start_inst_loc) {
                 regs[kShRegBase + start_inst_loc] = indexed ? a[4] : a[3];
             }
+            // The args may be GPU-written and not landed yet; garbage counts
+            // would make a draw that hangs the GPU.
+            if (a[0] > kMaxIndirectCount || a[1] > kMaxIndirectCount) {
+                DC_WARN("gpu: skipping indirect draw with count=%u instances=%u", a[0], a[1]);
+                break;
+            }
             if (indexed) {
                 Draw(true, a[0], a[2], 0, a[1]);
             } else {
@@ -675,6 +685,10 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
         case Op::DispatchIndirect: {
             ++stats.dispatches;
             const u32* a = IndirectArgs(body[0], 3);
+            if (a && u64(a[0]) * a[1] * a[2] > kMaxIndirectGroups) {
+                DC_WARN("gpu: skipping indirect dispatch %ux%ux%u", a[0], a[1], a[2]);
+                break;
+            }
             if (renderer && a) {
                 renderer->Dispatch(regs, a[0], a[1], a[2]);
             }

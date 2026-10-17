@@ -15,6 +15,9 @@ using namespace Gcn;
 
 namespace {
 
+// Back edges one invocation may take before it gives up (see LoopGuard).
+constexpr u32 kLoopBudget = 1u << 20;
+
 std::string Hex(u32 v) {
     char b[16];
     std::snprintf(b, sizeof(b), "0x%xu", v);
@@ -195,13 +198,21 @@ private:
             Line("}");
         }
     }
+    // A loop the emulation cannot finish (e.g. a spin on memory another
+    // wave never writes) would hang the GPU and, on macOS, WindowServer with
+    // it: back edges spend a budget and the invocation gives up when it runs out.
+    std::string LoopGuard() const {
+        return std::string("if (++guard_ > ") + N(kLoopBudget) + "u) { " +
+               (p.stage == Stage::Fragment ? "discard_fragment(); " : "") +
+               (p.stage == Stage::Compute ? "return; " : "return out; ") + "} ";
+    }
     void Jump(u32 target) {
         if (!structured) {
-            Line("{ pc_ = " + Hex(target) + "; continue; }");
+            Line("{ " + LoopGuard() + "pc_ = " + Hex(target) + "; continue; }");
             return;
         }
         const u32 t = index_of.at(target);
-        Line(t <= cur ? "{ tgt_ = " + N(t) + "u; continue; }" : "tgt_ = " + N(t) + "u;");
+        Line(t <= cur ? "{ " + LoopGuard() + "tgt_ = " + N(t) + "u; continue; }" : "tgt_ = " + N(t) + "u;");
     }
     void End() {
         if (p.stage == Stage::Fragment) {
@@ -1667,9 +1678,9 @@ std::string Emitter::Run() {
 
     std::string wrapped;
     if (structured) {
-        wrapped = "    uint tgt_ = 0u;\n" + body;
+        wrapped = "    uint tgt_ = 0u;\n    uint guard_ = 0u;\n" + body;
     } else if (p.has_branches) {
-        wrapped = "    uint pc_ = 0u;\n    while (true) {\n    switch (pc_) {\n    case 0u:\n" + body +
+        wrapped = "    uint pc_ = 0u;\n    uint guard_ = 0u;\n    while (true) {\n    switch (pc_) {\n    case 0u:\n" + body +
                   "    default:\n        " + (p.stage == Stage::Fragment ? "if (!dc_exported) discard_fragment(); " : "") +
                   (p.stage == Stage::Compute ? "return;" : "return out;") + "\n    }\n    }\n";
     } else {
