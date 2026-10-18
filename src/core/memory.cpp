@@ -1,7 +1,5 @@
 #include "core/memory.h"
 
-#include "core/write_track.h"
-
 #include <cerrno>
 #include <atomic>
 #include <cstdio>
@@ -235,7 +233,6 @@ int MapDirect(VAddr* addr, u64 size, int prot, int flags, u64 phys, u64 align, c
         return ENOMEM;
     }
     g_vmas[*addr] = {*addr, size, prot, VmaType::Direct, phys, name ? name : ""};
-    WriteTrack::Invalidate(*addr, size);
     return 0;
 }
 
@@ -251,7 +248,6 @@ int MapFlexible(VAddr* addr, u64 size, int prot, int flags, const char* name) {
         return ENOMEM;
     }
     g_vmas[*addr] = {*addr, size, prot, VmaType::Flexible, 0, name ? name : ""};
-    WriteTrack::Invalidate(*addr, size);
     return 0;
 }
 
@@ -271,7 +267,6 @@ int Unmap(VAddr addr, u64 size) {
     std::scoped_lock lk(g_lock);
     g_generation.fetch_add(1, std::memory_order_release);
     size = AlignUp(size, kPage);
-    WriteTrack::Invalidate(addr, size);
     Carve(addr, size);
     AddressSpace::Unmap(addr, size);
     return 0;
@@ -280,7 +275,6 @@ int Unmap(VAddr addr, u64 size) {
 int Protect(VAddr addr, u64 size, int prot) {
     std::scoped_lock lk(g_lock);
     size = AlignUp(size, kPage);
-    WriteTrack::Invalidate(addr, size);
     if (mprotect(reinterpret_cast<void*>(addr), size, HostProt(prot)) != 0) {
         return errno;
     }
@@ -316,10 +310,6 @@ bool Query(VAddr addr, bool find_next, Vma* out) {
         return true;
     }
     return false;
-}
-
-int HostProtection(int prot) {
-    return HostProt(prot);
 }
 
 void* DirectHostView() {

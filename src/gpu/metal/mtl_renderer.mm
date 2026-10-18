@@ -25,7 +25,6 @@
 
 #include "common/log.h"
 #include "core/memory.h"
-#include "core/write_track.h"
 #include "gpu/liverpool/pm4.h"
 #include "gpu/liverpool/registers.h"
 #include "gpu/liverpool/tiling.h"
@@ -537,11 +536,6 @@ struct MetalRenderer::Impl {
     std::vector<u64> chunks;
     u32 next_chunk = 0;
     bool hot = false;
-    // Write-tracked (Core::WriteTrack): changed when the write counts of its
-    // pages moved past `version`; no chunk hashes then.
-    bool tracked = false;
-    u64 version = 0;
-    u32 changes = 0; // re-uploads after a change: frequent writers go back to hashing
     u64 frame = 0;
     u64 addr = 0;
     u64 size = 0;
@@ -1913,10 +1907,6 @@ struct MetalRenderer::Impl {
 
   // True if the texture memory differs from what was uploaded.
   bool TextureChanged(TextureEntry &e, u64 addr, u64 size) {
-    if (e.tracked) {
-      const auto v = Core::WriteTrack::Version(addr, size);
-      return !v || *v != e.version;
-    }
     const u32 n = static_cast<u32>(e.chunks.size());
     if (e.hot) {
       for (u32 c = 0; c < n; ++c) {
@@ -2257,7 +2247,6 @@ struct MetalRenderer::Impl {
         return view();
       }
       e.hot = true;
-      ++e.changes;
     }
 
     if (!e.tex) {
@@ -2283,14 +2272,6 @@ struct MetalRenderer::Impl {
       if (!e.tex) {
         return Dummy(tt);
       }
-    }
-    // Watch for CPU writes before reading the memory, so a write racing the
-    // upload counts as a change. A texture that keeps changing (CPU-animated)
-    // would fault on every frame: it is hashed instead.
-    static constexpr u32 kTrackedChanges = 4;
-    std::optional<u64> watched;
-    if (e.changes < kTrackedChanges && Core::WriteTrack::Watch(addr, size)) {
-      watched = Core::WriteTrack::Version(addr, size);
     }
     const auto *src = reinterpret_cast<const u8 *>(addr);
     std::vector<u8> linear;
@@ -2332,15 +2313,9 @@ struct MetalRenderer::Impl {
     }
     (void)thick;
     }
-    e.tracked = watched.has_value();
-    if (e.tracked) {
-      e.version = *watched;
-      e.chunks.clear();
-    } else {
-      e.chunks.resize((size + kChunk - 1) / kChunk);
-      for (u32 c = 0; c < e.chunks.size(); ++c) {
-        e.chunks[c] = ChunkHash(addr, size, c);
-      }
+    e.chunks.resize((size + kChunk - 1) / kChunk);
+    for (u32 c = 0; c < e.chunks.size(); ++c) {
+      e.chunks[c] = ChunkHash(addr, size, c);
     }
     e.frame = frame_count;
     e.addr = addr;

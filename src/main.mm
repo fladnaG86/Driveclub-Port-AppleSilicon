@@ -23,7 +23,6 @@
 #include "core/memory.h"
 #include "core/runtime.h"
 #include "core/signals.h"
-#include "core/write_track.h"
 #include "hle/hle.h"
 #include "hle/kernel/kernel.h"
 #include "hle/pad/pad.h"
@@ -71,7 +70,6 @@ int Run(int argc, char** argv) {
 
     Core::Signals::Install(
         [](u64 address) { return Core::Loader::Linker::Instance()->Describe(address); });
-    Core::WriteTrack::Init();
     Core::Runtime::StartGame(linker);
 
     SDL_Window* window =
