@@ -1020,6 +1020,27 @@ void Emitter::EmitDs(const Inst& i) {
 }
 
 void Emitter::EmitBuffer(const Inst& i) {
+    if (p.stage == Stage::Vertex) {
+        for (size_t k = 0; k < o.vertex_attrs.size(); ++k) {
+            const auto& a = o.vertex_attrs[k];
+            if (a.pc != i.pc) {
+                continue;
+            }
+            using K = MslOptions::VertexAttr;
+            const std::string in = "in_.a" + N(static_cast<u32>(k));
+            const std::string raw = a.kind == K::Uint      ? in
+                                    : a.kind == K::Uscaled ? "as_type<uint4>(float4(" + in + "))"
+                                    : a.kind == K::Sscaled ? "as_type<uint4>(float4(" + in + "))"
+                                                           : "as_type<uint4>(" + in + ")";
+            Line("{ uint4 f_ = " + (a.swizzle ? "dc_swizzle(" + raw + ", " + N(a.swizzle) + "u)" : raw) + ";");
+            const u32 n = i.enc == Enc::MTBUF ? i.op + 1u : i.op + 1u;
+            for (u32 c = 0; c < n; ++c) {
+                SetV(i.vdata + c, "f_[" + N(c) + "]");
+            }
+            Line("}");
+            return;
+        }
+    }
     const u16 r = i.srsrc;
     const std::string r0 = SName(r), r1 = SName(r + 1u), r2 = SName(r + 2u), r3 = SName(r + 3u);
     std::string idx = "0u", voff = "0u";
@@ -1719,10 +1740,23 @@ std::string Emitter::Run() {
             }
         }
         src += "};\n\n";
-        src += "static VsOut dc_run(uint vid, uint iid, constant uint* ud, thread const DcMem& mem" + TexParams(false) +
+        const bool stage_in = !o.vertex_attrs.empty();
+        if (stage_in) {
+            using K = MslOptions::VertexAttr;
+            src += "struct VsIn {\n";
+            for (size_t k = 0; k < o.vertex_attrs.size(); ++k) {
+                const K::Kind kind = o.vertex_attrs[k].kind;
+                const char* ty = kind == K::Uint || kind == K::Uscaled ? "uint4" : kind == K::Sint || kind == K::Sscaled ? "int4" : "float4";
+                src += "    " + std::string(ty) + " a" + N(static_cast<u32>(k)) + " [[attribute(" + N(static_cast<u32>(k)) + ")]];\n";
+            }
+            src += "};\n\n";
+        }
+        src += "static VsOut dc_run(uint vid, uint iid, constant uint* ud, thread const DcMem& mem" +
+               std::string(stage_in ? ", thread const VsIn& in_" : "") + TexParams(false) +
                ") {\n    VsOut out = {};\n" + (o.points ? "    out.psize = 1.0f;\n" : "") + decl + wrapped + "}\n\n";
-        const std::string args = "ud, mem" + TexArgs();
-        src += "vertex VsOut main0(uint vid [[vertex_id]], uint iid [[instance_id]], " + mem_params +
+        const std::string args = "ud, mem" + std::string(stage_in ? ", in_" : "") + TexArgs();
+        src += "vertex VsOut main0(uint vid [[vertex_id]], uint iid [[instance_id]], " +
+               std::string(stage_in ? "VsIn in_ [[stage_in]], " : "") + mem_params +
                ", constant DcDraw& draw [[buffer(4)]]" + (o.debug_capture ? ", device float4* dbg [[buffer(6)]]" : "") +
                TexParams(true) + ") {\n";
         src += "    " + MemInit() + "\n    VsOut o;\n";

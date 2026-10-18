@@ -36,6 +36,17 @@ struct SgprSource {
     bool operator==(const SgprSource&) const = default;
 };
 
+// A fetch-subroutine buffer load indexed by the vertex index (v0): the host
+// can fetch it with a Metal vertex descriptor instead of the shader.
+struct VertexInput {
+    u32 pc = 0;
+    std::array<SgprSource, 4> vsharp{};
+    u32 offset = 0;    // the instruction's immediate offset (bytes)
+    u8 count = 4;      // components loaded
+    bool typed = false; // MTBUF: dfmt/nfmt come from the instruction
+    u8 dfmt = 0, nfmt = 0;
+};
+
 struct ImageResource {
     std::array<SgprSource, 8> tsharp{};
     std::array<SgprSource, 4> ssharp{};
@@ -70,6 +81,9 @@ struct Program {
     std::vector<std::pair<u32, u32>> image_slot_by_pc;
     std::vector<ImageResource> images;
     std::vector<std::array<SgprSource, 4>> samplers;
+
+    // VS: fetch loads the host may do (see VertexInput).
+    std::vector<VertexInput> vertex_inputs;
 
     // VS exports.
     u32 param_mask = 0;

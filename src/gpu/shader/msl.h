@@ -85,6 +85,16 @@ struct MslOptions {
     bool debug_capture = false; // write positions to buffer(6) (debugging)
     bool points = false;          // point list: VsOut carries [[point_size]]
     bool vtx_point_size = false;  // PA_CL_VS_OUT_CNTL.USE_VTX_POINT_SIZE: POS1.x is the size
+    // Fetch loads the host does with a vertex descriptor: attribute k is the
+    // load at vertex_attrs[k].pc (Program::vertex_inputs), read from
+    // [[attribute(k)]] instead of guest memory.
+    struct VertexAttr {
+        enum Kind : u8 { Float, Uint, Sint, Uscaled, Sscaled };
+        u32 pc = 0;
+        Kind kind = Float;
+        u32 swizzle = 0; // V# word 3 for dst_sel (MUBUF), 0 = none (MTBUF)
+    };
+    std::vector<VertexAttr> vertex_attrs;
     // Fragment.
     std::array<u32, 32> ps_input_cntl{}; // SPI_PS_INPUT_CNTL_n
     u32 vs_param_mask = 0;               // params the paired VS exports

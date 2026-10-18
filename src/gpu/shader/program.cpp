@@ -272,7 +272,35 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
     }
 
     Provenance prov(in.num_user_sgprs);
+    bool v0_written = false; // the vertex index is still in v0
     for (const Inst& i : p->code) {
+        if (in.stage == Stage::Vertex && !v0_written && i.pc >= kFetchPcBase &&
+            (i.enc == Enc::MUBUF || i.enc == Enc::MTBUF) && i.idxen && !i.offen && i.vaddr == 0 &&
+            i.soffset == 128 && !i.addr64 && !i.lds && !i.tfe &&
+            (i.enc == Enc::MTBUF ? i.op <= static_cast<u16>(Mtbuf::TBUFFER_LOAD_FORMAT_XYZW)
+                                 : i.op <= static_cast<u16>(Mubuf::BUFFER_LOAD_FORMAT_XYZW))) {
+            VertexInput v;
+            v.pc = i.pc;
+            for (u32 k = 0; k < 4; ++k) {
+                v.vsharp[k] = prov.Get(i.srsrc + k);
+            }
+            v.offset = i.offset;
+            v.count = static_cast<u8>(i.op + 1);
+            v.typed = i.enc == Enc::MTBUF;
+            v.dfmt = i.dfmt;
+            v.nfmt = i.nfmt;
+            if (std::all_of(v.vsharp.begin(), v.vsharp.end(),
+                            [](const SgprSource& s) { return s.kind != SgprSource::Unknown; })) {
+                p->vertex_inputs.push_back(v);
+            }
+        }
+        // Anything that may write v0 ends the inputs we can hand to the host.
+        if (((i.enc == Enc::VOP1 || i.enc == Enc::VOP2 || i.enc == Enc::VOP3) && i.dst == 0) ||
+            ((i.enc == Enc::MUBUF || i.enc == Enc::MTBUF || i.enc == Enc::MIMG || i.enc == Enc::DS) &&
+             i.vdata == 0) ||
+            i.enc == Enc::VINTRP) {
+            v0_written = true;
+        }
         if (IsBranch(i)) {
             p->has_branches = true;
             p->labels.push_back(BranchTarget(i));

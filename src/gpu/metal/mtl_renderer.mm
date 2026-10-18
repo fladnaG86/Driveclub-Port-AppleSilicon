@@ -2474,6 +2474,9 @@ struct MetalRenderer::Impl {
   // Levels [base, base + count) and, for arrays, slices [sbase, sbase + scount)
   // of `rt` (the texture itself when that is all of it).
   static constexpr u32 kIdentitySwizzle = 0xFAC; // T# DST_SEL x=R y=G z=B w=A
+  // Vertex buffers of Metal-fetched attributes: buffer(16 + k).
+  static constexpr u32 kVertexBufferBase = 16;
+  static constexpr u32 kMaxVertexBuffers = 14;
 
   id<MTLTexture> TargetView(RenderTarget &rt, u32 base, u32 count,
                             MTLPixelFormat fmt = MTLPixelFormatInvalid,
@@ -3476,8 +3479,60 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   vo.debug_capture = capture;
   vo.textures = vs_types; // borrowed: lives until the end of this draw
   vo.map_hoist = map_hoist;
+  // Vertex fetch by Metal for the fetch loads it can do (all or none): the
+  // V# words resolved here give each one a vertex buffer and a format.
+  // DC_SW_FETCH keeps every load in the shader.
+  static const bool sw_fetch = std::getenv("DC_SW_FETCH") != nullptr;
+  struct VertexBuffer {
+    id<MTLBuffer> buf;
+    u64 off;
+    MTLVertexFormat format;
+    u32 stride, bytes;
+  };
+  VertexBuffer vbufs[kMaxVertexBuffers];
+  u32 nvbufs = 0;
+  u64 vlayout = 0;
+  if (!sw_fetch && !rect && !vs->vertex_inputs.empty() &&
+      vs->vertex_inputs.size() <= kMaxVertexBuffers) {
+    Shader::SgprReadCache rc;
+    bool ok = true;
+    for (u32 k = 0; k < vs->vertex_inputs.size(); ++k) {
+      const Shader::VertexInput &in = vs->vertex_inputs[k];
+      u32 v[4];
+      for (u32 j = 0; j < 4; ++j) {
+        v[j] = Shader::ResolveSgpr(in.vsharp[j], vs_ud, &rc);
+      }
+      const u64 base = (u64(v[0]) | (u64(v[1] & 0xFFF) << 32)) + in.offset;
+      const u32 stride = (v[1] >> 16) & 0x3FFF;
+      const u32 dfmt = in.typed ? in.dfmt : (v[3] >> 15) & 15;
+      const u32 nfmt = in.typed ? in.nfmt : (v[3] >> 12) & 7;
+      Shader::MslOptions::VertexAttr a;
+      a.pc = in.pc;
+      a.swizzle = in.typed || (v[3] & 0xFFF) == kIdentitySwizzle ? 0 : (v[3] & 0x7FFF);
+      u32 bytes = 0;
+      const MTLVertexFormat f = VertexFormat(dfmt, nfmt, &a.kind, &bytes);
+      id<MTLBuffer> buf = nil;
+      u64 off = 0;
+      if (f == MTLVertexFormatInvalid || (base & 3) || (stride & 3) || !v[2] ||
+          !Locate(base, stride ? u64(stride) * v[2] : bytes, &buf, &off) || (off & 3)) {
+        ok = false;
+        break;
+      }
+      vo.vertex_attrs.push_back(a);
+      vbufs[nvbufs++] = {buf, off, f, stride, bytes};
+      vlayout = Hash(u64(f) | (u64(stride) << 32), vlayout + 1);
+    }
+    if (!ok) {
+      vo.vertex_attrs.clear();
+      nvbufs = 0;
+      vlayout = 0;
+    }
+  }
   u64 vs_key = Hash(vs->hash);
   vs_key = Hash(vo.map_hoist, vs_key);
+  for (const auto &a : vo.vertex_attrs) {
+    vs_key = Hash(u64(a.pc) | (u64(a.kind) << 32) | (u64(a.swizzle) << 40), vs_key);
+  }
   vs_key = Hash(rect, vs_key);
   vs_key = Hash(u32(vo.points) | (u32(vo.vtx_point_size) << 1), vs_key);
   vs_key = Hash(capture, vs_key);
@@ -3525,7 +3580,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
 
   // ---- pipeline ----
   PipelineKey pk;
-  pk.vs = vs_key;
+  pk.vs = vlayout ? Hash(vlayout, vs_key) : vs_key; // formats and strides live in the pipeline
   pk.ps = ps_key;
   for (u32 k = 0; k < 8; ++k) {
     pk.color_fmt[k] = static_cast<u32>(color_fmt[k]);
@@ -3540,6 +3595,21 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   if (pit == pipelines.end()) {
     if (!pending.count(pkey)) {
       MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+      if (nvbufs) {
+        MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+        for (u32 k = 0; k < nvbufs; ++k) {
+          const VertexBuffer &vb = vbufs[k];
+          vd.attributes[k].format = vb.format;
+          vd.attributes[k].offset = 0;
+          vd.attributes[k].bufferIndex = kVertexBufferBase + k;
+          MTLVertexBufferLayoutDescriptor *l = vd.layouts[kVertexBufferBase + k];
+          l.stride = vb.stride ? vb.stride : (vb.bytes + 3) & ~3u;
+          l.stepFunction = vb.stride ? MTLVertexStepFunctionPerVertex
+                                     : MTLVertexStepFunctionConstant;
+          l.stepRate = vb.stride ? 1 : 0;
+        }
+        d.vertexDescriptor = vd;
+      }
       for (u32 k = 0; k < 8; ++k) {
         if (!colors[k]) {
           continue;
@@ -3753,6 +3823,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   [enc setVertexBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
   [enc setVertexBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
   [enc setVertexBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
+  for (u32 k = 0; k < nvbufs; ++k) {
+    [enc setVertexBuffer:vbufs[k].buf offset:vbufs[k].off atIndex:kVertexBufferBase + k];
+  }
   [enc setVertexBytes:&consts
                length:sizeof(consts)
               atIndex:Shader::Binding::Draw];

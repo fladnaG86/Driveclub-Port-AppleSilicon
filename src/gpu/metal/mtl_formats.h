@@ -305,6 +305,45 @@ inline MTLStencilOperation StencilOp(u32 op) {
     }
 }
 
+// Metal vertex format for a buffer DATA_FORMAT / NUM_FORMAT, and how the
+// shader turns the attribute into register bits. Invalid when Metal has no
+// such format (the shader then fetches it itself). `bytes`: element size.
+inline MTLVertexFormat VertexFormat(u32 dfmt, u32 nfmt, Shader::MslOptions::VertexAttr::Kind* kind,
+                                    u32* bytes) {
+    using K = Shader::MslOptions::VertexAttr;
+    const bool unorm = nfmt == 0, snorm = nfmt == 1 || nfmt == 6, uint = nfmt == 2 || nfmt == 4,
+               sint = nfmt == 3 || nfmt == 5, flt = nfmt == 7;
+    *kind = nfmt == 4 ? K::Uint : nfmt == 5 ? K::Sint : nfmt == 2 ? K::Uscaled : nfmt == 3 ? K::Sscaled : K::Float;
+    static constexpr u32 kBytes[15] = {0, 1, 2, 2, 4, 4, 4, 4, 4, 4, 4, 8, 8, 12, 16};
+    *bytes = dfmt < 15 ? kBytes[dfmt] : 0;
+    auto pick = [&](MTLVertexFormat un, MTLVertexFormat sn, MTLVertexFormat u, MTLVertexFormat s,
+                    MTLVertexFormat f) {
+        return unorm ? un : snorm ? sn : uint ? u : sint ? s : flt ? f : MTLVertexFormatInvalid;
+    };
+    constexpr MTLVertexFormat X = MTLVertexFormatInvalid;
+    switch (dfmt) {
+    case 1: return pick(MTLVertexFormatUCharNormalized, MTLVertexFormatCharNormalized, MTLVertexFormatUChar,
+                        MTLVertexFormatChar, X);
+    case 2: return pick(MTLVertexFormatUShortNormalized, MTLVertexFormatShortNormalized, MTLVertexFormatUShort,
+                        MTLVertexFormatShort, MTLVertexFormatHalf);
+    case 3: return pick(MTLVertexFormatUChar2Normalized, MTLVertexFormatChar2Normalized, MTLVertexFormatUChar2,
+                        MTLVertexFormatChar2, X);
+    case 4: return pick(X, X, MTLVertexFormatUInt, MTLVertexFormatInt, MTLVertexFormatFloat);
+    case 5: return pick(MTLVertexFormatUShort2Normalized, MTLVertexFormatShort2Normalized, MTLVertexFormatUShort2,
+                        MTLVertexFormatShort2, MTLVertexFormatHalf2);
+    case 6: return flt ? MTLVertexFormatFloatRG11B10 : X; // X 11, Y 11, Z 10 bits
+    case 9: return pick(MTLVertexFormatUInt1010102Normalized, MTLVertexFormatInt1010102Normalized, X, X, X);
+    case 10: return pick(MTLVertexFormatUChar4Normalized, MTLVertexFormatChar4Normalized, MTLVertexFormatUChar4,
+                         MTLVertexFormatChar4, X);
+    case 11: return pick(X, X, MTLVertexFormatUInt2, MTLVertexFormatInt2, MTLVertexFormatFloat2);
+    case 12: return pick(MTLVertexFormatUShort4Normalized, MTLVertexFormatShort4Normalized, MTLVertexFormatUShort4,
+                         MTLVertexFormatShort4, MTLVertexFormatHalf4);
+    case 13: return pick(X, X, MTLVertexFormatUInt3, MTLVertexFormatInt3, MTLVertexFormatFloat3);
+    case 14: return pick(X, X, MTLVertexFormatUInt4, MTLVertexFormatInt4, MTLVertexFormatFloat4);
+    default: return X;
+    }
+}
+
 inline MTLSamplerAddressMode AddressMode(u32 m) {
     switch (m & 7) {
     case 0: return MTLSamplerAddressModeRepeat;
