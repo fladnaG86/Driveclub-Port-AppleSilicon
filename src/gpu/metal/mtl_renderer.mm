@@ -1795,14 +1795,26 @@ struct MetalRenderer::Impl {
     for (const auto &u : unsupported) {
       ReportOnce("shader op not translated: " + u);
     }
+    const char *stage = p.stage == Stage::Vertex     ? "vs"
+                        : p.stage == Stage::Fragment ? "ps"
+                                                     : "cs";
     if (dump_dir) {
       char path[512];
       std::snprintf(path, sizeof(path), "%s/%s_%016llx_%016llx.metal", dump_dir,
-                    p.stage == Stage::Vertex     ? "vs"
-                    : p.stage == Stage::Fragment ? "ps"
-                                                 : "cs",
-                    p.hash, key);
+                    stage, p.hash, key);
       std::ofstream(path) << src;
+    }
+    // DC_MSL_OVERRIDE=<dir>: <dir>/<stage>_<program hash>.metal replaces the
+    // generated source (hand-edited experiments)
+    static const char *override_dir = std::getenv("DC_MSL_OVERRIDE");
+    if (override_dir) {
+      char path[512];
+      std::snprintf(path, sizeof(path), "%s/%s_%016llx.metal", override_dir,
+                    stage, p.hash);
+      if (std::ifstream in{path}) {
+        src.assign(std::istreambuf_iterator<char>(in), {});
+        DC_INFO("gpu: MSL override %s", path);
+      }
     }
     return src;
   }
@@ -4167,6 +4179,13 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
             ud[13], ud[14], ud[15]);
   }
   if (!addr || !gx || !gy || !gz) {
+    return;
+  }
+  static const u64 skip_cs =
+      std::getenv("DC_SKIP_CS")
+          ? std::strtoull(std::getenv("DC_SKIP_CS"), nullptr, 16)
+          : 0;
+  if (skip_cs && addr == skip_cs) { // debug: drop one compute shader's dispatches
     return;
   }
   ++stat_dispatches;
