@@ -31,10 +31,66 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
 | Performance | ~24-25 fps in a race at 1920x1080 (M1 Max); was ~12 fps at the start of this work |
 | Stability | Races of several minutes without crashes; a GPU watchdog exits cleanly if a shader hangs |
 
+## How to play
+
+### Start the game, step by step
+
+1. **Check the requirements.** A Mac with Apple Silicon and **your own copy of
+   Driveclub v1.28 (CUSA00003)**, decrypted and extracted to a folder. That
+   folder contains `eboot.bin` and `sce_sys/`. Other game versions do not start.
+2. **Get the program.** Either download `driveclub-apple-silicon-v0.1.0.zip`
+   from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) and unzip it, or build it yourself (next section).
+3. **Open Terminal in the program's folder.** For example `cd ~/Downloads/driveclub-apple-silicon-v0.1.0`.
+4. **First time only: remove the download quarantine.** The program is not
+   notarized by Apple, so macOS blocks it otherwise:
+   ```bash
+   xattr -dr com.apple.quarantine .
+   ```
+   If macOS asks to install **Rosetta**, accept. Or run `softwareupdate --install-rosetta` beforehand.
+5. **Start it with the path of your extracted game:**
+   ```bash
+   ./driveclub /path/to/your/extracted/game
+   ```
+   (Tip: type `./driveclub ` with a trailing space, then drag the game folder from Finder into Terminal.)
+6. **Wait about 40 seconds** for loading. A window opens; the title shows the frame rate.
+7. **In the game:** at the *Start Event* screen press **Cross** (`Enter`). At the
+   *Controls* screen press **Cross** again. The race starts.
+8. **To quit**, close the window or press `Cmd+Q`. If it does not respond, press `Ctrl+C` in Terminal.
+
+Saves are stored in `~/Library/Application Support/DriveclubNative`.
+The game's online services are gone; if a menu waits for the network, start
+with `DC_OFFLINE=1 ./driveclub /path/to/game`.
+
+### Controls
+
+A PS4 controller (DualShock 4 or DualSense, USB or Bluetooth) works like on the
+console and can be connected at any time. The keyboard can replace it:
+
+| PS4 button | Keyboard | In the game |
+| --- | --- | --- |
+| R2 | `W` | Accelerate (keyboard: full throttle) |
+| L2 | `S` | Brake / reverse |
+| Left stick left/right | `A` / `D` | Steer (keyboard: full lock) |
+| Cross ✕ | `Enter`, `Space` or `K` | Confirm in menus |
+| Circle ○ | `L` | Back in menus |
+| Square □ | `J` | Game action (see the in-game *Controls* screen) |
+| Triangle △ | `I` | Game action (see the in-game *Controls* screen) |
+| L1 / R1 | `Q` / `E` | Game action (see the in-game *Controls* screen) |
+| D-pad | Arrow keys | Move in menus |
+| Options | `Esc` or `Tab` | Pause menu |
+| Right stick, L3, R3, touchpad | controller only | As on PS4 |
+
+Keys of the port itself:
+
+| Key | Function |
+| --- | --- |
+| `V` | Vsync on/off |
+| `F12` | Debug: record a trace of the next frame into `../bench/f12_<frame>` |
+| `F11` | Debug: Xcode GPU capture of two frames (needs `MTL_CAPTURE_ENABLED=1`; very large) |
+
 ## Build and run
 
-**Prebuilt:** download the zip from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) (no build tools needed),
-then follow its README. To build it yourself:
+You can skip this section if you use the prebuilt zip (see *How to play*). To build it yourself:
 
 Requirements: Apple Silicon Mac with Rosetta 2, Xcode (command line tools),
 CMake >= 3.24, Ninja, and **an x86_64 build of SDL3** (Homebrew's SDL3 on Apple
@@ -58,11 +114,6 @@ cd Driveclub-Port && ./build/driveclub /path/to/your/extracted/CUSA00003/Image0
 
 You need **your own copy of the game** as a decrypted, extracted package
 (this fork was tested with v1.28). No game files are included in this repository.
-
-Controls: gamepad as on PS4. Keyboard: `W`/`S` throttle/brake (R2/L2),
-`A`/`D` steer, arrows = D-pad, `Enter`/`Space`/`K` = Cross, `L` = Circle,
-`J` = Square, `I` = Triangle, `Q`/`E` = L1/R1, `Esc`/`Tab` = Options,
-`V` toggles vsync, `F12` traces one frame, `F11` records a GPU capture (see tools).
 
 ## What was done
 

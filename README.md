@@ -17,6 +17,34 @@
 
 *Gameplay on a MacBook Pro M1 Max under Rosetta 2. Click the image to play the video (MP4, 2:32). The "FPS" in the window title of this recording counted window presents, not game frames (fixed since); the game runs at ~25 fps.*
 
+## How to play on Apple Silicon
+
+*Italiano: [docs/APPLE_SILICON.it.md — Come giocare](docs/APPLE_SILICON.it.md#come-giocare)*
+
+You need a Mac with Apple Silicon and **your own copy of Driveclub v1.28 (CUSA00003)**,
+decrypted and extracted to a folder (the one with `eboot.bin`). No game files are included.
+
+1. Download `driveclub-apple-silicon-v0.1.0.zip` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) and unzip it.
+2. Open Terminal in the unzipped folder.
+3. First time only (the program is not notarized): `xattr -dr com.apple.quarantine .`
+   Accept if macOS offers to install Rosetta.
+4. Start it: `./driveclub /path/to/your/extracted/game` and wait ~40 s.
+5. Press **Cross** (`Enter`) at *Start Event*, then again at *Controls*: the race starts.
+6. Quit with `Cmd+Q`. If a menu waits for the (closed) online service, start with `DC_OFFLINE=1 ./driveclub ...`.
+
+| PS4 button | Keyboard | In the game |
+| --- | --- | --- |
+| R2 / L2 | `W` / `S` | Accelerate / brake, reverse |
+| Left stick | `A` / `D` | Steer |
+| Cross ✕ / Circle ○ | `Enter` (or `Space`, `K`) / `L` | Confirm / back |
+| Square □ / Triangle △ | `J` / `I` | Game actions (in-game *Controls* screen) |
+| L1 / R1 | `Q` / `E` | Game actions (in-game *Controls* screen) |
+| D-pad | Arrow keys | Menus |
+| Options | `Esc` or `Tab` | Pause |
+
+A PS4 controller (DualShock 4 / DualSense) works as on the console. `V` toggles vsync.
+Full guide, building from source and known issues: [docs/APPLE_SILICON.md](docs/APPLE_SILICON.md#how-to-play).
+
 [![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtube.com/@blacklineinteractive)
 
 ![LOGO](media/logo.png)

@@ -32,10 +32,66 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
 | Prestazioni | ~24-25 fps in gara a 1920x1080 (M1 Max); erano ~12 fps all'inizio del lavoro |
 | Stabilità | Gare di diversi minuti senza crash; un watchdog GPU chiude il processo in modo pulito se uno shader si blocca |
 
+## Come giocare
+
+### Avviare il gioco, passo per passo
+
+1. **Controlla i requisiti.** Un Mac Apple Silicon e **la tua copia di Driveclub
+   v1.28 (CUSA00003)**, decrittata ed estratta in una cartella. Quella cartella
+   contiene `eboot.bin` e `sce_sys/`. Altre versioni del gioco non partono.
+2. **Procurati il programma.** Scarica `driveclub-apple-silicon-v0.1.0.zip`
+   dalle [Release](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) e scompattalo, oppure compilalo (sezione successiva).
+3. **Apri il Terminale nella cartella del programma.** Per esempio `cd ~/Downloads/driveclub-apple-silicon-v0.1.0`.
+4. **Solo la prima volta: togli la quarantena del download.** Il programma non è
+   notarizzato da Apple, e senza questo passaggio macOS lo blocca:
+   ```bash
+   xattr -dr com.apple.quarantine .
+   ```
+   Se macOS chiede di installare **Rosetta**, accetta. Oppure esegui prima `softwareupdate --install-rosetta`.
+5. **Avvialo indicando il percorso del gioco estratto:**
+   ```bash
+   ./driveclub /percorso/del/gioco/estratto
+   ```
+   (Trucco: scrivi `./driveclub ` con uno spazio finale, poi trascina la cartella del gioco dal Finder nel Terminale.)
+6. **Aspetta circa 40 secondi** per il caricamento. Si apre una finestra; il titolo mostra gli fps.
+7. **Nel gioco:** nella schermata *Start Event* premi **Croce** (`Invio`). Nella
+   schermata *Controls* premi di nuovo **Croce**. La gara parte.
+8. **Per uscire** chiudi la finestra o premi `Cmd+Q`. Se non risponde, premi `Ctrl+C` nel Terminale.
+
+I salvataggi vanno in `~/Library/Application Support/DriveclubNative`.
+I servizi online del gioco non esistono più; se un menu resta in attesa della
+rete, avvia con `DC_OFFLINE=1 ./driveclub /percorso/del/gioco`.
+
+### Comandi
+
+Un controller PS4 (DualShock 4 o DualSense, USB o Bluetooth) funziona come su
+console e si può collegare in qualsiasi momento. La tastiera può sostituirlo:
+
+| Tasto PS4 | Tastiera | Nel gioco |
+| --- | --- | --- |
+| R2 | `W` | Accelera (tastiera: acceleratore a fondo) |
+| L2 | `S` | Frena / retromarcia |
+| Stick sinistro sinistra/destra | `A` / `D` | Sterza (tastiera: sterzata piena) |
+| Croce ✕ | `Invio`, `Spazio` o `K` | Conferma nei menu |
+| Cerchio ○ | `L` | Indietro nei menu |
+| Quadrato □ | `J` | Azione di gioco (vedi la schermata *Controls* del gioco) |
+| Triangolo △ | `I` | Azione di gioco (vedi la schermata *Controls* del gioco) |
+| L1 / R1 | `Q` / `E` | Azione di gioco (vedi la schermata *Controls* del gioco) |
+| Croce direzionale | Frecce | Muoversi nei menu |
+| Options | `Esc` o `Tab` | Menu di pausa |
+| Stick destro, L3, R3, touchpad | solo controller | Come su PS4 |
+
+Tasti del port:
+
+| Tasto | Funzione |
+| --- | --- |
+| `V` | Vsync sì/no |
+| `F12` | Debug: salva il trace del frame successivo in `../bench/f12_<frame>` |
+| `F11` | Debug: cattura GPU Xcode di due frame (serve `MTL_CAPTURE_ENABLED=1`; molto grande) |
+
 ## Compilare e avviare
 
-**Build pronta:** scarica lo zip dalle [Release](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) (non servono strumenti di
-sviluppo) e segui il suo README. Per compilarlo da sé:
+Questa sezione non serve se usi lo zip pronto (vedi *Come giocare*). Per compilarlo da sé:
 
 Servono: Mac Apple Silicon con Rosetta 2, Xcode (command line tools),
 CMake >= 3.24, Ninja e **SDL3 compilato per x86_64** (l'SDL3 di Homebrew su
@@ -59,12 +115,6 @@ cd Driveclub-Port && ./build/driveclub /percorso/del/gioco/estratto/CUSA00003/Im
 
 Serve **una propria copia del gioco**, come pacchetto decrittato ed estratto
 (il fork è stato provato con la v1.28). Il repository non contiene file del gioco.
-
-Comandi: controller come su PS4. Tastiera: `W`/`S` acceleratore/freno (R2/L2),
-`A`/`D` sterzo, frecce = croce direzionale, `Invio`/`Spazio`/`K` = Croce,
-`L` = Cerchio, `J` = Quadrato, `I` = Triangolo, `Q`/`E` = L1/R1,
-`Esc`/`Tab` = Options, `V` attiva/disattiva il vsync, `F12` registra il trace
-di un frame, `F11` una cattura GPU (vedi strumenti).
 
 ## Cosa è stato fatto
 
