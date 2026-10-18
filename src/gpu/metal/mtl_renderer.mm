@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <filesystem>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -46,6 +47,7 @@ using Shader::TexSample;
 using Shader::TextureType;
 
 namespace {
+std::atomic<bool> g_trace_request{false};
 
 constexpr u64 kUploadChunk = 4ull << 20;
 constexpr u64 kGpuAddrMask =
@@ -560,6 +562,7 @@ struct MetalRenderer::Impl {
   struct Snapshot {
     u64 gen = 0;
     u64 va = 0;
+    u64 start = 0; // arena_head where the copy begins
   };
   std::unordered_map<u64, Snapshot>
       snapshots; // dump address -> its latest copy
@@ -582,6 +585,8 @@ struct MetalRenderer::Impl {
   const char *dump_dir = nullptr;
   const char *dump_frames = nullptr; // DC_DUMP_FRAMES=dir: flips as PPMs
   u64 dump_every = 1;                // DC_DUMP_EVERY=n: only every n-th flip
+  bool key_trace_only = false;       // F12 picked the dump directory: dump the traced frame only
+  std::string key_trace_dir;
   bool debug_clear = false; // DC_DEBUG_CLEAR: new targets start dark blue
   u64 dump_texture =
       0; // DC_DUMP_TEXTURE=<addr>: write its uploads next to the frame dumps
@@ -1453,11 +1458,15 @@ struct MetalRenderer::Impl {
         continue;
       }
       Snapshot &snap = snapshots[it->first];
-      if (snap.gen != it->second.gen || !snap.va) {
+      // A copy from an earlier command buffer may already be reused by the
+      // arena (only the open command buffer's copies are kept alive), so it
+      // is taken again; within one command buffer it is shared.
+      if (snap.gen != it->second.gen || !snap.va || snap.start < arena_commit_head) {
         snap.va = ArenaAlloc(it->second.bytes);
         if (!snap.va) {
           return;
         }
+        snap.start = arena_head - ((it->second.bytes + 255) & ~255ull);
         std::memcpy(reinterpret_cast<void *>(snap.va),
                     reinterpret_cast<const void *>(it->first),
                     it->second.bytes);
@@ -4426,6 +4435,17 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
 void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   CpuTimer t(cpu_profile ? &cpu_flip_s : nullptr);
   ++frame_count;
+  if (g_trace_request.exchange(false)) {
+    trace_frame = frame_count + 1;
+    dump_passes = true;
+    if (!dump_frames || key_trace_only) {
+      key_trace_dir = "../bench/f12_" + std::to_string(trace_frame);
+      std::filesystem::create_directories(key_trace_dir);
+      dump_frames = key_trace_dir.c_str();
+      key_trace_only = true;
+    }
+    DC_INFO("gpu: F12: tracing flip %llu into %s", (unsigned long long)trace_frame, dump_frames);
+  }
   if (trace_frame) {
     trace = frame_count == trace_frame;
   }
@@ -4594,7 +4614,7 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
     }
     debug_vsout = 0;
   }
-  if (src && dump_frames && frame_count % dump_every == 0) {
+  if (src && dump_frames && (key_trace_only ? trace : frame_count % dump_every == 0)) {
     DumpFrame(dst);
   }
   if (!pass_dumps.empty()) {
@@ -4644,6 +4664,10 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
             f.address, f.width, f.height, rt ? "gpu target" : "cpu memory",
             draw_count);
   }
+}
+
+void RequestFrameTrace() {
+  g_trace_request.store(true, std::memory_order_release);
 }
 
 MetalRenderer::MetalRenderer(Device &device) : impl(std::make_unique<Impl>()) {

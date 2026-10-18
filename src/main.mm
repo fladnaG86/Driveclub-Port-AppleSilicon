@@ -114,6 +114,11 @@ int Run(int argc, char** argv) {
             case SDL_EVENT_KEY_UP: {
                 const bool pressed = (ev.type == SDL_EVENT_KEY_DOWN);
                 switch (ev.key.key) {
+                case SDLK_F12:
+                    if (pressed) {
+                        Gpu::Metal::RequestFrameTrace(); // GPU trace + pass dumps of the next frame
+                    }
+                    break;
                 case SDLK_V:
                     if (pressed) {
                         config.vsync = !config.vsync;

@@ -11,6 +11,10 @@ namespace Gpu::Metal {
 
 class Device;
 
+// Any thread (F12): the next flip's frame is traced (DC_GPU_TRACE), with its
+// passes and the frame dumped to DC_DUMP_FRAMES, or ../bench/f12_<frame>.
+void RequestFrameTrace();
+
 class MetalRenderer : public Gpu::Renderer {
 public:
     explicit MetalRenderer(Device& device);
