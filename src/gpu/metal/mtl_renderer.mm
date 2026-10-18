@@ -3640,6 +3640,22 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         fo.mrt_ufloat |= 1u << k;
       }
     }
+    // Only what the shader reads goes into its key: inputs and MRTs it does
+    // not use keep values from earlier draws, which made new keys (and
+    // pipeline compiles, during which draws are skipped) for the same shader.
+    for (u32 k = 0; k < 32; ++k) {
+      if (!((ps->attr_mask >> k) & 1)) {
+        fo.ps_input_cntl[k] = 0;
+      }
+    }
+    const u32 used_mrt = ps->mrt_mask | (dual_source ? 2u : 0u);
+    for (u32 k = 0; k < 8; ++k) {
+      if (!((used_mrt >> k) & 1)) {
+        fo.col_format &= ~(0xFu << (4 * k));
+        fo.mrt_type[k] = Shader::OutType::Float;
+        fo.mrt_ufloat &= ~(1u << k);
+      }
+    }
     fo.textures = ps_types; // borrowed, like vo.textures
     fo.depth_target = depth != nullptr;
     fo.depth_bounds = depth_bounds;
