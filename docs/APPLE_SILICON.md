@@ -8,6 +8,10 @@ x86-64 and runs natively there. This fork makes the same backend run on
 **Apple Silicon** by running the whole x86-64 process under **Rosetta 2**, and
 then fixes the GPU bugs and performance problems that showed up along the way.
 
+*Not affiliated with or endorsed by Sony Interactive Entertainment. "Driveclub" and
+"PlayStation" are trademarks of their owners. This repository and its releases
+contain no game code or data and no keys: you need your own legitimate copy of the game.*
+
 Everything here was developed and measured on **one machine: MacBook Pro M1 Max,
 macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been tested.
 

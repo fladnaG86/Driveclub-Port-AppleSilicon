@@ -8,6 +8,11 @@ gioco PS4 è x86-64 e lì gira nativamente. Questo fork fa girare lo stesso
 backend su **Apple Silicon**, eseguendo l'intero processo x86-64 sotto
 **Rosetta 2**, e corregge i bug grafici e i problemi di prestazioni emersi strada facendo.
 
+*Progetto non affiliato né approvato da Sony Interactive Entertainment. "Driveclub" e
+"PlayStation" sono marchi dei rispettivi proprietari. Questo repository e le sue
+release non contengono codice, dati del gioco né chiavi: serve una propria copia
+legittima del gioco.*
+
 Tutto è stato sviluppato e misurato su **una sola macchina: MacBook Pro M1 Max,
 macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati provati.
 

@@ -8,6 +8,10 @@
 > **[docs/APPLE_SILICON.md](docs/APPLE_SILICON.md)** · in italiano:
 > **[docs/APPLE_SILICON.it.md](docs/APPLE_SILICON.it.md)**.
 > The rest of this README is upstream's.
+>
+> *Not affiliated with or endorsed by Sony Interactive Entertainment. "Driveclub" and
+> "PlayStation" are trademarks of their owners. No game files are included: you need
+> your own legitimate copy of the game.*
 
 [![Driveclub racing on an M1 Max under Rosetta 2 (click to play the video)](media/apple-silicon-race.jpg)](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/apple-silicon-video/driveclub-apple-silicon.mp4)
 
