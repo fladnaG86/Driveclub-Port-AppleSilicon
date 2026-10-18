@@ -55,11 +55,19 @@ constexpr u64 kGpuAddrMask =
     (1ull << 40) - 1; // Liverpool virtual addresses are 40 bits
 constexpr u32 kNopSizeHint = 0xC0001000; // one-dword NOP carrying a target size
 
+// Key hash for caches: eight bytes per step (keys are mostly descriptor and
+// register arrays; a byte loop was a visible share of the CP thread).
 u64 Fnv(const void *data, size_t size, u64 h = 0xcbf29ce484222325ull) {
   const auto *p = static_cast<const u8 *>(data);
-  for (size_t i = 0; i < size; ++i) {
-    h ^= p[i];
-    h *= 0x100000001b3ull;
+  size_t i = 0;
+  for (; i + 8 <= size; i += 8) {
+    u64 v;
+    std::memcpy(&v, p + i, 8);
+    h = (h ^ v) * 0x100000001b3ull;
+    h ^= h >> 32;
+  }
+  for (; i < size; ++i) {
+    h = (h ^ p[i]) * 0x100000001b3ull;
   }
   return h;
 }
@@ -596,6 +604,7 @@ struct MetalRenderer::Impl {
   bool key_trace_only = false;       // F12 picked the dump directory: dump the traced frame only
   std::string key_trace_dir;
   u64 capture_end = 0; // F11: flip that stops the running GPU capture
+  u64 commits = 0;     // command buffers committed (user data patches go stale)
   bool debug_clear = false; // DC_DEBUG_CLEAR: new targets start dark blue
   u64 dump_texture =
       0; // DC_DUMP_TEXTURE=<addr>: write its uploads next to the frame dumps
@@ -699,6 +708,9 @@ struct MetalRenderer::Impl {
   double cpu_sgpr_s = 0;    // part of resolve spent resolving S#/T# dwords
   u64 cpu_gettex_calls = 0, cpu_gettex_hits = 0;
   double cpu_flip_s = 0, cpu_commit_s = 0, cpu_dma_s = 0;
+  double cpu_linear_s = 0; // LinearTable
+  u64 cpu_resolve_calls = 0, cpu_resolve_hits = 0;
+  u64 cpu_linear_calls = 0, cpu_linear_bases = 0;
   double cpu_notework_s = 0;
   // Times a scope into `slot` (no-op unless DC_CPU_PROFILE).
   struct CpuTimer {
@@ -1300,6 +1312,7 @@ struct MetalRenderer::Impl {
       }
       return;
     }
+    ++commits;
     FlushSignal();
     if (!chunks.empty() || chunk) {
       // Keep upload memory alive until the GPU is done with it.
@@ -1483,6 +1496,11 @@ struct MetalRenderer::Impl {
     static const bool off = std::getenv("DC_NO_LINEAR") != nullptr;
     if (off) {
       return 0;
+    }
+    CpuTimer t_(cpu_profile ? &cpu_linear_s : nullptr);
+    if (cpu_profile) {
+      ++cpu_linear_calls;
+      cpu_linear_bases += p.linear_bases.size();
     }
     u32 mask = 0;
     Shader::SgprReadCache cache;
@@ -2015,8 +2033,10 @@ struct MetalRenderer::Impl {
   }
 
   // Decodes a T# and returns a Metal texture for it.
+  // NS_RETURNS_RETAINED (here and below): hot getters hand back +1, so ARC
+  // needs no autorelease per call.
   id<MTLTexture> GetTexture(const u32 t[8], TextureType *type_out,
-                            bool storage = false) {
+                            bool storage = false) NS_RETURNS_RETAINED {
     // Writable images mark their target written and are rare: never cached.
     // A texture dump asks for the raw bytes on every upload: also uncached.
     if (storage || dump_texture || !tex_cache) {
@@ -2075,7 +2095,7 @@ struct MetalRenderer::Impl {
   }
 
   id<MTLTexture> GetTextureUncached(const u32 t[8], TextureType *type_out,
-                                    bool storage) {
+                                    bool storage) NS_RETURNS_RETAINED {
     const u64 addr =
         ((u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8) & kGpuAddrMask;
     const u32 dfmt = (t[1] >> 20) & 0x3F;
@@ -2417,7 +2437,7 @@ struct MetalRenderer::Impl {
     return view();
   }
 
-  id<MTLSamplerState> GetSampler(const u32 s[4]) {
+  id<MTLSamplerState> GetSampler(const u32 s[4]) NS_RETURNS_RETAINED {
     const u64 key = Fnv(s, 16);
     auto it = samplers.find(key);
     if (it != samplers.end()) {
@@ -2977,14 +2997,23 @@ struct MetalRenderer::Impl {
   std::vector<TextureType> draw_vs_types, draw_ps_types;
   Resources draw_vs_res, draw_ps_res;
   // Evaluates each image instruction's descriptors against the user data.
-  // `ssharps_` is a member so a draw does not allocate it again.
+  // `ssharps_`/`tsharps_` are members so a draw does not allocate them again.
   std::vector<std::array<u32, 4>> ssharps_;
+  std::vector<std::array<u32, 8>> tsharps_;
+  struct ResolveEntry {
+    u64 epoch;
+    std::vector<TextureType> types;
+    Resources res;
+  };
+  std::unordered_map<u64, ResolveEntry> resolve_cache; // this frame's Resolve results
+  u64 resolve_cache_frame = 0;
   void Resolve(const Program &p, const u32 *ud, std::vector<TextureType> &types,
                Resources &out) {
     types.clear();
     out.tex.clear();
     out.smp.clear();
     ssharps_.clear();
+    tsharps_.clear();
     Shader::SgprReadCache rc;
     for (const auto &ss : p.samplers) {
       std::array<u32, 4> s{};
@@ -2993,11 +3022,43 @@ struct MetalRenderer::Impl {
       }
       ssharps_.push_back(s);
     }
+    bool cacheable = tex_cache && !tex_cache_check && !dump_texture && !trace;
     for (const auto &img : p.images) {
-      u32 t[8];
+      std::array<u32, 8> t{};
       for (u32 k = 0; k < 8; ++k) {
         t[k] = Shader::ResolveSgpr(img.tsharp[k], ud, &rc);
       }
+      tsharps_.push_back(t);
+      cacheable &= !img.storage;
+    }
+    // Draws in a frame often repeat a program with the same descriptors:
+    // the whole result is reused while no texture changed (texture_epoch).
+    u64 key = 0;
+    if (cacheable) {
+      if (resolve_cache_frame != frame_count) {
+        resolve_cache.clear();
+        resolve_cache_frame = frame_count;
+      }
+      key = Hash(&p);
+      key = Fnv(ssharps_.data(), ssharps_.size() * sizeof(ssharps_[0]), key);
+      key = Fnv(tsharps_.data(), tsharps_.size() * sizeof(tsharps_[0]), key);
+      if (cpu_profile) {
+        ++cpu_resolve_calls;
+      }
+      if (auto it = resolve_cache.find(key);
+          it != resolve_cache.end() && it->second.epoch == texture_epoch) {
+        if (cpu_profile) {
+          ++cpu_resolve_hits;
+        }
+        types = it->second.types;
+        out.tex = it->second.res.tex;
+        out.smp = it->second.res.smp;
+        return;
+      }
+    }
+    for (size_t i = 0; i < p.images.size(); ++i) {
+      const auto &img = p.images[i];
+      const u32 *t = tsharps_[i].data();
       TextureType tt;
       id<MTLTexture> tex = GetTexture(t, &tt, img.storage);
       if (trace && (t[0] == 0 || std::getenv("DC_TRACE_TSHARP"))) {
@@ -3050,6 +3111,9 @@ struct MetalRenderer::Impl {
     for (const auto &s : ssharps_) {
       CpuTimer t(cpu_profile ? &cpu_sampler_s : nullptr);
       out.smp.push_back(GetSampler(s.data()));
+    }
+    if (cacheable) {
+      resolve_cache[key] = ResolveEntry{texture_epoch, types, out};
     }
   }
 
@@ -3671,10 +3735,19 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   vo.debug_capture = capture;
   vo.textures = vs_types; // borrowed: lives until the end of this draw
   vo.map_hoist = map_hoist;
-  // Linear bases picked on the raw user data; the table is rebuilt from the
-  // patched user data when binding (same descriptors: snapshots are copies).
+  // User data as bound (pointers into CE dumps moved to their snapshots),
+  // and the linear bases translated from it once. A commit before binding
+  // retires the snapshots, so binding patches again if one happened.
+  u32 vud[16], pud[16];
+  std::memcpy(vud, vs_ud, sizeof(vud));
+  std::memcpy(pud, ps_ud, sizeof(pud));
+  PatchUserData(vud);
+  if (ps) {
+    PatchUserData(pud);
+  }
+  const u64 patched_at = commits;
   u32 vlin[Shader::kMaxLinearBases], plin[Shader::kMaxLinearBases];
-  vo.linear_mask = LinearTable(*vs, vs_ud, vlin);
+  vo.linear_mask = LinearTable(*vs, vud, vlin);
   // Vertex fetch by Metal for the fetch loads it can do (all or none): the
   // V# words resolved here give each one a vertex buffer and a format.
   // DC_SW_FETCH keeps every load in the shader.
@@ -3747,7 +3820,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     fo.col_format = col_format;
     fo.dual_source = dual_source;
     fo.map_hoist = map_hoist;
-    fo.linear_mask = LinearTable(*ps, ps_ud, plin);
+    fo.linear_mask = LinearTable(*ps, pud, plin);
     for (u32 k = 0; k < 8; ++k) {
       fo.mrt_type[k] = out_type[k];
       if (color_fmt[k] == MTLPixelFormatRG11B10Float) {
@@ -4032,22 +4105,21 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     const u64 a = std::strtoull(memtest, nullptr, 16);
     MemTest(a ? a : vs_addr);
   }
-  u32 vud[16], pud[16];
-  std::memcpy(vud, vs_ud, sizeof(vud));
-  std::memcpy(pud, ps_ud, sizeof(pud));
-  PatchUserData(vud);
-  if (ps) {
-    PatchUserData(pud);
+  if (commits != patched_at) {
+    std::memcpy(vud, vs_ud, sizeof(vud));
+    std::memcpy(pud, ps_ud, sizeof(pud));
+    PatchUserData(vud);
+    if (ps) {
+      PatchUserData(pud);
+    }
+    if ((vo.linear_mask && (LinearTable(*vs, vud, vlin) & vo.linear_mask) != vo.linear_mask) ||
+        (ps && fo.linear_mask &&
+         (LinearTable(*ps, pud, plin) & fo.linear_mask) != fo.linear_mask)) {
+      ReportOnce("draw skipped: a linear base moved between key and bind");
+      return;
+    }
   }
   UpdateMemMap();
-  // Only user data PatchUserData changed can move a base.
-  if ((vo.linear_mask && std::memcmp(vud, vs_ud, sizeof(vud)) &&
-       (LinearTable(*vs, vud, vlin) & vo.linear_mask) != vo.linear_mask) ||
-      (ps && fo.linear_mask && std::memcmp(pud, ps_ud, sizeof(pud)) &&
-       (LinearTable(*ps, pud, plin) & fo.linear_mask) != fo.linear_mask)) {
-    ReportOnce("draw skipped: a linear base moved between key and bind");
-    return;
-  }
   static_assert(sizeof(consts) <= 64);
   BindBytes(0, 0, vud, 64, Shader::Binding::UserData);
   BindBuffer(0, mem[0], 0, Shader::Binding::Mem0);
@@ -4705,6 +4777,15 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
                 "rest (sgpr+alloc) %.1f",
                 cpu_gettex_s * 1e3 / frames, cpu_sampler_s * 1e3 / frames,
                 (cpu_resolve_s - cpu_gettex_s - cpu_sampler_s) * 1e3 / frames);
+        DC_INFO("cpu profile:   LinearTable %.2f ms/frame, %.0f calls/frame, %.0f bases/frame",
+                cpu_linear_s * 1e3 / frames, cpu_linear_calls / double(frames),
+                cpu_linear_bases / double(frames));
+        cpu_linear_s = 0;
+        cpu_linear_calls = cpu_linear_bases = 0;
+        DC_INFO("cpu profile:   Resolve cache: %.0f lookups/frame, %.0f%% hits",
+                cpu_resolve_calls / double(frames),
+                cpu_resolve_calls ? 100.0 * cpu_resolve_hits / cpu_resolve_calls : 0.0);
+        cpu_resolve_calls = cpu_resolve_hits = 0;
         DC_INFO("cpu profile:   outside draws: flip %.1f, commit %.1f, "
                 "NoteWork %.1f, rest %.1f",
                 cpu_flip_s * 1e3 / frames, cpu_commit_s * 1e3 / frames,
