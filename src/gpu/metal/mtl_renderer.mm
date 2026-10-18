@@ -420,6 +420,7 @@ struct MetalRenderer::Impl {
     std::unique_ptr<Program> prog;
     std::vector<u32> code;
     std::vector<u32> fetch;
+    u64 checked_frame = ~0ull; // frame in which code and fetch last matched memory
   };
   std::unordered_map<u64, std::vector<ShaderEntry>> shaders;
   std::unordered_map<u64, id<MTLRenderPipelineState>> pipelines;
@@ -557,6 +558,9 @@ struct MetalRenderer::Impl {
     u32 bytes = 0;
     u64 gen = 0;
   };
+  // const_dumps and dump_gen have their own lock: the CE notes dumps without
+  // waiting for `lock`, which the compute queues hold while they record.
+  std::mutex dump_lock;
   std::map<u64, ConstDump> const_dumps; // by guest address
   u64 dump_gen = 0;
   struct Snapshot {
@@ -1442,6 +1446,7 @@ struct MetalRenderer::Impl {
 
   // Points user-data pointers that land in a CE dump at a snapshot of it.
   void PatchUserData(u32 *ud) {
+    std::scoped_lock dl(dump_lock);
     if (const_dumps.empty()) {
       return;
     }
@@ -1722,6 +1727,15 @@ struct MetalRenderer::Impl {
     const u32 *code = reinterpret_cast<const u32 *>(addr);
     auto &list = shaders[addr ^ (static_cast<u64>(stage) << 60)];
     for (auto &e : list) {
+      // Code is compared with memory once per frame: shaders are not rewritten
+      // while a frame is being drawn.
+      if (e.checked_frame == frame_count) {
+        const Program &p = *e.prog;
+        if (p.fetch_ud < 0 ||
+            (u64(ud[p.fetch_ud]) | (u64(ud[p.fetch_ud + 1]) << 32)) == p.fetch_address) {
+          return e.prog.get();
+        }
+      }
       if (!Readable(addr, e.code.size() * 4) ||
           std::memcmp(e.code.data(), code, e.code.size() * 4) != 0) {
         continue;
@@ -1735,6 +1749,7 @@ struct MetalRenderer::Impl {
           continue;
         }
       }
+      e.checked_frame = frame_count;
       return e.prog.get();
     }
     Shader::BuildInput in{stage, addr, ud, num_user_sgprs, vgpr_comp_cnt};
@@ -4810,7 +4825,7 @@ void MetalRenderer::OnContextRegs(const std::uint32_t *body,
 }
 
 void MetalRenderer::NoteConstDump(std::uint64_t addr, std::uint32_t bytes) {
-  std::scoped_lock lk(impl->lock);
+  std::scoped_lock lk(impl->dump_lock);
   impl->NoteConstDump(addr, bytes);
 }
 
