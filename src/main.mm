@@ -98,6 +98,8 @@ int Run(int argc, char** argv) {
     const auto start = Clock::now();
     auto fps_window = start;
     std::uint64_t flips_seen = 0;
+    std::uint64_t presented_flip = 0;
+    bool present_again = false;
 
     bool running = true;
     while (running) {
@@ -109,6 +111,10 @@ int Run(int argc, char** argv) {
                 break;
             case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
                 presenter->Resize(ev.window.data1, ev.window.data2);
+                present_again = true;
+                break;
+            case SDL_EVENT_WINDOW_EXPOSED:
+                present_again = true;
                 break;
             case SDL_EVENT_KEY_DOWN:
             case SDL_EVENT_KEY_UP: {
@@ -268,8 +274,18 @@ int Run(int argc, char** argv) {
             }
         }
 
+        // Present only frames the game has produced (and after a resize), so
+        // the window's present rate - what the Metal HUD counts - is the
+        // game's frame rate.
         if (void* tex = renderer->LatestFrame()) {
-            presenter->PresentTexture(tex);
+            const std::uint64_t flip = renderer->FlipCount();
+            if (flip != presented_flip || present_again) {
+                presenter->PresentTexture(tex);
+                presented_flip = flip;
+                present_again = false;
+            } else {
+                SDL_Delay(1);
+            }
         } else {
             const float t = std::chrono::duration<float>(Clock::now() - start).count();
             presenter->PresentClear(0.5f + 0.5f * std::sin(t), 0.2f, 0.3f);

@@ -14,6 +14,8 @@
 #include <chrono>
 #include <mutex>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -49,7 +51,16 @@ struct Port {
     // Diagnostics: peak level, logged every few seconds while there is sound.
     float peak = 0.0f;
     u64 meter_buffers = 0;
+    // DC_AUDIO_DUMP=<dir>: what this port plays, as raw PCM in real time
+    // (silence where the guest fell behind), for recording videos.
+    FILE* dump = nullptr;
+    bool dump_started = false;
 };
+
+const char* DumpDir() {
+    static const char* dir = std::getenv("DC_AUDIO_DUMP");
+    return dir;
+}
 
 std::mutex g_lock; // open/close and handle lookup
 std::array<Port, 16> g_ports; // handle = index + 1
@@ -76,10 +87,27 @@ void SDLCALL Feed(void* user, SDL_AudioStream* stream, int additional, int /*tot
     }
     const u64 size = p.ring.size();
     u64 want = std::min<u64>(static_cast<u64>(additional), p.write - p.read);
+    if (p.dump && !p.dump_started) {
+        p.dump_started = true;
+        const double now =
+            std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        DC_INFO("audio: dump of port %td starts at %.3f (unix time)", &p - g_ports.data() + 1, now);
+    }
+    if (p.dump && want < static_cast<u64>(additional)) {
+        static const std::vector<u8> zeros(1 << 16, 0);
+        for (u64 gap = static_cast<u64>(additional) - want; gap > 0;) {
+            const u64 n = std::min<u64>(gap, zeros.size());
+            std::fwrite(zeros.data(), 1, n, p.dump);
+            gap -= n;
+        }
+    }
     while (want > 0) {
         const u64 off = p.read % size;
         const u64 n = std::min(want, size - off);
         SDL_PutAudioStreamData(stream, p.ring.data() + off, static_cast<int>(n));
+        if (p.dump) {
+            std::fwrite(p.ring.data() + off, 1, n, p.dump);
+        }
         p.read += n;
         want -= n;
     }
@@ -173,6 +201,13 @@ s32 sceAudioOutOpen(s32 user_id, s32 port_type, s32 index, u32 len, u32 freq, u3
             return kErrorPortFull;
         }
         p.open = true;
+        if (const char* dir = DumpDir()) {
+            char path[1024];
+            std::snprintf(path, sizeof(path), "%s/port%zu_%dhz_%uch_%s.raw", dir, i + 1, spec.freq, channels,
+                          is_float ? "f32le" : "s16le");
+            p.dump = std::fopen(path, "wb");
+            p.dump_started = false;
+        }
         SDL_ResumeAudioStreamDevice(p.stream);
         DC_INFO("audio: port %zu type %d: %d Hz, %u ch, %s, %u samples per buffer", i + 1, port_type, spec.freq,
                 channels, is_float ? "float" : "s16", len);
@@ -189,6 +224,10 @@ s32 sceAudioOutClose(s32 handle) {
     }
     SDL_DestroyAudioStream(p->stream); // stops the callback first
     p->stream = nullptr;
+    if (p->dump) {
+        std::fclose(p->dump);
+        p->dump = nullptr;
+    }
     p->open = false;
     return 0;
 }
