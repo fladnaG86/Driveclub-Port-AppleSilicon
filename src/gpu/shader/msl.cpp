@@ -223,8 +223,14 @@ private:
 
     std::string MemInit() const {
         return o.map_hoist ? "DcMem mem = {gm0, gm1, &gmap, {gmap.base, gmap.pages, gmap.split, gmap.limit, "
-                             "gmap.shift, (device const int*)(&gmap + 1), gmap.fva, gmap.fsize, gmap.foff, gmap.fhi}};"
-                           : "DcMem mem = {gm0, gm1, &gmap};";
+                             "gmap.shift, (device const int*)(&gmap + 1), gmap.fva, gmap.fsize, gmap.foff, gmap.fhi}, dc_lt};"
+                           : "DcMem mem = {gm0, gm1, &gmap, {}, dc_lt};";
+    }
+
+    // The memory instruction at `pc` uses a linear base the host translated.
+    bool Linear(u32 pc) const {
+        const u32 k = p.LinearBaseOf(pc);
+        return k < kMaxLinearBases && ((o.linear_mask >> k) & 1u);
     }
 
     bool Structure();
@@ -550,8 +556,10 @@ void Emitter::EmitSmrd(const Inst& i) {
                                     : "((ulong(" + b0 + ") | (ulong(" + b1 + ") << 32)) & 0xfffffffffffful)";
     const std::string off = i.imm ? Hex(i.smrd_offset * 4) : SName(static_cast<u16>(i.smrd_offset));
     // Scalar loads ignore the low address bits: one translation for all dwords.
-    std::string s = "{ device uint* p_ = dc_ptr_n(mem, (" + base + " + ulong(" + off + ")) & ~3ul, " +
-                    N(count * 4) + "u);";
+    std::string s = Linear(i.pc) ? "{ device uint* p_ = dc_ptr(dc_lin(mem, " + N(p.LinearBaseOf(i.pc)) + "u, " + base +
+                                       "), (" + base + " + ulong(" + off + ")) & ~3ul);"
+                                 : "{ device uint* p_ = dc_ptr_n(mem, (" + base + " + ulong(" + off + ")) & ~3ul, " +
+                                       N(count * 4) + "u);";
     for (u32 k = 0; k < count; ++k) {
         s += " " + SName(static_cast<u16>(i.dst + k)) + " = p_ ? p_[" + N(k) + "] : 0u;";
     }
@@ -1073,6 +1081,11 @@ void Emitter::EmitBuffer(const Inst& i) {
     Line("  uint idx_ = " + idx + "; uint off_ = " + Src(i.soffset, 0) + " + " + N(i.offset) + "u + " + voff + ";");
     Line(std::string("  bool oob_ = ") + (i.idxen ? "idx_ >= " + r2 : "(stride_ == 0u && off_ >= " + r2 + ")") + ";");
     Line("  ulong a_ = base_ + ulong(idx_) * ulong(stride_) + ulong(off_);");
+    // A base the host translated: the access needs no page-table walk.
+    const std::string M = Linear(i.pc) ? "lm_" : "mem";
+    if (M != "mem") {
+        Line("  DcLin lm_ = dc_lin(mem, " + N(p.LinearBaseOf(i.pc)) + "u, base_);");
+    }
 
     auto store_guard = [&]() { return std::string(p.writes_exec ? "if (!oob_ && exec_lo != 0u) " : "if (!oob_) "); };
     auto load_fmt = [&](u32 n, const std::string& fetch) {
@@ -1083,13 +1096,13 @@ void Emitter::EmitBuffer(const Inst& i) {
     };
     if (i.enc == Enc::MTBUF) {
         const u32 op = i.op;
-        const std::string fetch = "dc_load_fmt(mem, a_, " + N(i.dfmt) + "u, " + N(i.nfmt) + "u)";
+        const std::string fetch = "dc_load_fmt(" + M + ", a_, " + N(i.dfmt) + "u, " + N(i.nfmt) + "u)";
         if (op <= static_cast<u32>(Mtbuf::TBUFFER_LOAD_FORMAT_XYZW)) {
             load_fmt(op + 1, fetch);
         } else if (i.dfmt == 4 || i.dfmt == 11 || i.dfmt == 13 || i.dfmt == 14) { // 32-bit stores
             const u32 n = op - static_cast<u32>(Mtbuf::TBUFFER_STORE_FORMAT_X) + 1;
             for (u32 k = 0; k < n; ++k) {
-                Line("  " + store_guard() + "dc_st(mem, a_ + " + N(4 * k) + "ul, " + VName(i.vdata + k) + ");");
+                Line("  " + store_guard() + "dc_st(" + M + ", a_ + " + N(4 * k) + "ul, " + VName(i.vdata + k) + ");");
             }
         } else {
             Unsupported(i);
@@ -1098,12 +1111,12 @@ void Emitter::EmitBuffer(const Inst& i) {
         return;
     }
 
-    const std::string vfmt = "dc_swizzle(dc_load_fmt(mem, a_, (" + r3 + " >> 15) & 15u, (" + r3 +
+    const std::string vfmt = "dc_swizzle(dc_load_fmt(" + M + ", a_, (" + r3 + " >> 15) & 15u, (" + r3 +
                              " >> 12) & 7u), " + r3 + ")";
     auto atomic = [&](const char* fn, bool sign) {
         const std::string ty = sign ? "atomic_int" : "atomic_uint";
         const std::string val = sign ? "int(" + VName(i.vdata) + ")" : VName(i.vdata);
-        Line("  device uint* p_ = oob_ ? nullptr : dc_ptr(mem, a_);");
+        Line("  device uint* p_ = oob_ ? nullptr : dc_ptr(" + M + ", a_);");
         Line("  uint r_ = 0u; " + std::string(p.writes_exec ? "if (p_ && exec_lo != 0u) " : "if (p_) ") +
              "r_ = uint(" + fn + "((device " + ty + "*)p_, " + val + ", memory_order_relaxed));");
         if (i.glc) {
@@ -1115,10 +1128,10 @@ void Emitter::EmitBuffer(const Inst& i) {
     case Mubuf::BUFFER_LOAD_FORMAT_XY: load_fmt(2, vfmt); break;
     case Mubuf::BUFFER_LOAD_FORMAT_XYZ: load_fmt(3, vfmt); break;
     case Mubuf::BUFFER_LOAD_FORMAT_XYZW: load_fmt(4, vfmt); break;
-    case Mubuf::BUFFER_LOAD_UBYTE: SetV(i.vdata, "oob_ ? 0u : (dc_ld(mem, a_) & 0xffu)"); break;
-    case Mubuf::BUFFER_LOAD_SBYTE: SetV(i.vdata, "oob_ ? 0u : uint(int(dc_ld(mem, a_) << 24) >> 24)"); break;
-    case Mubuf::BUFFER_LOAD_USHORT: SetV(i.vdata, "oob_ ? 0u : (dc_ld(mem, a_) & 0xffffu)"); break;
-    case Mubuf::BUFFER_LOAD_SSHORT: SetV(i.vdata, "oob_ ? 0u : uint(int(dc_ld(mem, a_) << 16) >> 16)"); break;
+    case Mubuf::BUFFER_LOAD_UBYTE: SetV(i.vdata, "oob_ ? 0u : (dc_ld(" + M + ", a_) & 0xffu)"); break;
+    case Mubuf::BUFFER_LOAD_SBYTE: SetV(i.vdata, "oob_ ? 0u : uint(int(dc_ld(" + M + ", a_) << 24) >> 24)"); break;
+    case Mubuf::BUFFER_LOAD_USHORT: SetV(i.vdata, "oob_ ? 0u : (dc_ld(" + M + ", a_) & 0xffffu)"); break;
+    case Mubuf::BUFFER_LOAD_SSHORT: SetV(i.vdata, "oob_ ? 0u : uint(int(dc_ld(" + M + ", a_) << 16) >> 16)"); break;
     case Mubuf::BUFFER_LOAD_DWORD:
     case Mubuf::BUFFER_LOAD_DWORDX2:
     case Mubuf::BUFFER_LOAD_DWORDX3:
@@ -1127,12 +1140,12 @@ void Emitter::EmitBuffer(const Inst& i) {
                     : i.op == static_cast<u16>(Mubuf::BUFFER_LOAD_DWORDX2) ? 2
                     : i.op == static_cast<u16>(Mubuf::BUFFER_LOAD_DWORDX3) ? 3 : 4;
         if (n == 1) {
-            SetV(i.vdata, "oob_ ? 0u : dc_ld(mem, a_)");
+            SetV(i.vdata, "oob_ ? 0u : dc_ld(" + M + ", a_)");
             break;
         }
-        Line("{ device uint* p_ = oob_ || (a_ & 3ul) ? nullptr : dc_ptr_n(mem, a_, " + N(4 * n) + "u);");
+        Line("{ device uint* p_ = oob_ || (a_ & 3ul) ? nullptr : dc_ptr_n(" + M + ", a_, " + N(4 * n) + "u);");
         for (u32 k = 0; k < n; ++k) {
-            SetV(i.vdata + k, "p_ ? p_[" + N(k) + "] : (oob_ ? 0u : dc_ld(mem, a_ + " + N(4 * k) + "ul))");
+            SetV(i.vdata + k, "p_ ? p_[" + N(k) + "] : (oob_ ? 0u : dc_ld(" + M + ", a_ + " + N(4 * k) + "ul))");
         }
         Line("}");
         break;
@@ -1146,12 +1159,12 @@ void Emitter::EmitBuffer(const Inst& i) {
         for (u32 k = 0; k < 4; ++k) {
             v += (k ? ", " : "") + (k < n ? VName(i.vdata + k) : std::string("0u"));
         }
-        Line("  " + store_guard() + "dc_store_fmt(mem, a_, " + v + "), (" + r3 + " >> 15) & 15u, (" + r3 +
+        Line("  " + store_guard() + "dc_store_fmt(" + M + ", a_, " + v + "), (" + r3 + " >> 15) & 15u, (" + r3 +
              " >> 12) & 7u);");
         break;
     }
-    case Mubuf::BUFFER_STORE_BYTE: Line("  " + store_guard() + "dc_st_part(mem, a_, " + VName(i.vdata) + ", 1u);"); break;
-    case Mubuf::BUFFER_STORE_SHORT: Line("  " + store_guard() + "dc_st_part(mem, a_, " + VName(i.vdata) + ", 2u);"); break;
+    case Mubuf::BUFFER_STORE_BYTE: Line("  " + store_guard() + "dc_st_part(" + M + ", a_, " + VName(i.vdata) + ", 1u);"); break;
+    case Mubuf::BUFFER_STORE_SHORT: Line("  " + store_guard() + "dc_st_part(" + M + ", a_, " + VName(i.vdata) + ", 2u);"); break;
     case Mubuf::BUFFER_STORE_DWORD:
     case Mubuf::BUFFER_STORE_DWORDX2:
     case Mubuf::BUFFER_STORE_DWORDX3:
@@ -1160,7 +1173,7 @@ void Emitter::EmitBuffer(const Inst& i) {
                     : i.op == static_cast<u16>(Mubuf::BUFFER_STORE_DWORDX2) ? 2
                     : i.op == static_cast<u16>(Mubuf::BUFFER_STORE_DWORDX3) ? 3 : 4;
         for (u32 k = 0; k < n; ++k) {
-            Line("  " + store_guard() + "dc_st(mem, a_ + " + N(4 * k) + "ul, " + VName(i.vdata + k) + ");");
+            Line("  " + store_guard() + "dc_st(" + M + ", a_ + " + N(4 * k) + "ul, " + VName(i.vdata + k) + ");");
         }
         break;
     }
@@ -1745,7 +1758,7 @@ std::string Emitter::Run() {
     src += "\n";
     const std::string mem_params =
         "constant uint* ud [[buffer(0)]], device uint* gm0 [[buffer(1)]], device uint* gm1 [[buffer(2)]], "
-        "device const DcMap& gmap [[buffer(3)]]";
+        "device const DcMap& gmap [[buffer(3)]], constant uint* dc_lt [[buffer(" + N(Binding::Linear) + ")]]";
     if (p.stage == Stage::Vertex) {
         src += "struct VsOut {\n    float4 pos [[position]];\n";
         if (o.points) {

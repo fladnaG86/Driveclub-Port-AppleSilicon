@@ -32,6 +32,10 @@ static bool SetOption(Gpu::Shader::MslOptions& o, const std::string& key, unsign
         o.map_hoist = v != 0;
         return true;
     }
+    if (key == "linear_mask") {
+        o.linear_mask = static_cast<u32>(v);
+        return true;
+    }
     return false;
 }
 
@@ -75,6 +79,16 @@ int main(int argc, char** argv) {
     }
     for (const auto& i : prog->code) {
         std::printf("%s\n", Gcn::Disassemble(i).c_str());
+    }
+    static const char* kKinds[] = {"pointer", "vbase", "vbuffer"};
+    for (size_t k = 0; k < prog->linear_bases.size(); ++k) {
+        const LinearBase& b = prog->linear_bases[k];
+        u32 uses = 0;
+        for (const auto& [pc, slot] : prog->linear_base_by_pc) {
+            uses += slot == k;
+        }
+        std::printf("linear base %zu: %s, %u uses, extent %u%s%s\n", k, kKinds[b.kind], uses, b.extent,
+                    b.stride0 ? ", stride 0 only" : "", b.unbounded ? ", unbounded" : "");
     }
 
     o.vs_param_mask = 0xFFFFFFFF;

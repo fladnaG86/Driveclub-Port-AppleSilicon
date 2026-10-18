@@ -150,6 +150,220 @@ private:
     std::array<SgprSource, 104> state{};
 };
 
+// Calls f(first, count) for the SGPRs an instruction writes, as
+// Provenance::Step sees writes.
+template <typename F>
+void ForEachSgprWrite(const Inst& i, F f) {
+    auto width = [](const Inst& in) {
+        const char* name = OpName(in.enc, in.op);
+        return name && std::strstr(name, "64") ? 2u : 1u;
+    };
+    switch (i.enc) {
+    case Enc::SMRD: {
+        const auto op = static_cast<Smrd>(i.op);
+        const u32 count = op == Smrd::S_LOAD_DWORD || op == Smrd::S_BUFFER_LOAD_DWORD       ? 1
+                          : op == Smrd::S_LOAD_DWORDX4 || op == Smrd::S_BUFFER_LOAD_DWORDX4 ? 4
+                          : op == Smrd::S_LOAD_DWORDX8 || op == Smrd::S_BUFFER_LOAD_DWORDX8 ? 8
+                          : op == Smrd::S_LOAD_DWORDX16 || op == Smrd::S_BUFFER_LOAD_DWORDX16 ? 16
+                                                                                                : 2;
+        f(i.dst, count);
+        break;
+    }
+    case Enc::SOP1:
+    case Enc::SOP2:
+        f(i.dst, width(i));
+        break;
+    case Enc::SOPK:
+        if (i.op < static_cast<u16>(Sopk::S_CMPK_EQ_I32) || i.op > static_cast<u16>(Sopk::S_CMPK_LE_U32)) {
+            f(i.dst, 1);
+        }
+        break;
+    case Enc::VOPC:
+    case Enc::VOP2:
+    case Enc::VOP1:
+    case Enc::VOP3:
+        if ((i.op < 256 || i.vop3) && i.sdst <= Operand::SgprMax) {
+            f(i.sdst, 2);
+        }
+        if (static_cast<Vop>(i.op) == Vop::V_READFIRSTLANE_B32 || static_cast<Vop>(i.op) == Vop::V_READLANE_B32) {
+            f(i.dst, 1);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+// Which SGPRs hold a value whose provenance, as tracked in program order,
+// is the value on every path. Without loops, the last write before a read
+// (in program order) reaches it on every path when it dominates the read:
+// each branch region (the instructions a forward branch can skip) holding
+// the write also holds the read. The write's own sources must have been
+// exact. With loops only user SGPRs nothing writes are exact.
+class Exactness {
+public:
+    explicit Exactness(const std::vector<Inst>& code) {
+        def.fill(-1);
+        exact.fill(true);
+        for (size_t k = 0; k < code.size(); ++k) {
+            if (!IsBranch(code[k])) {
+                continue;
+            }
+            const u32 target = BranchTarget(code[k]);
+            if (target <= code[k].pc) {
+                loops = true;
+                continue;
+            }
+            size_t t = k + 1;
+            while (t < code.size() && code[t].pc < target) {
+                ++t;
+            }
+            regions.emplace_back(k, t); // instructions k+1 .. t-1 may be skipped
+        }
+        if (loops) {
+            for (const Inst& i : code) {
+                ForEachSgprWrite(i, [&](u32 reg, u32 count) {
+                    for (u32 r = reg; r < reg + count && r < exact.size(); ++r) {
+                        exact[r] = false;
+                    }
+                });
+            }
+        }
+    }
+
+    // Reads from here on are at instruction `index`.
+    void At(size_t index) { cur = static_cast<s64>(index); }
+
+    bool Exact(u32 reg) const {
+        if (reg >= exact.size() || !exact[reg]) {
+            return false;
+        }
+        return loops || Dominates(def[reg], cur);
+    }
+
+    // Instruction `index` (the current one) writes its SGPRs; `sources_exact`:
+    // the registers its provenance came from were exact.
+    void Step(const Inst& i, bool sources_exact) {
+        if (loops) {
+            return;
+        }
+        ForEachSgprWrite(i, [&](u32 reg, u32 count) {
+            for (u32 r = reg; r < reg + count && r < exact.size(); ++r) {
+                exact[r] = sources_exact;
+                def[r] = cur;
+            }
+        });
+    }
+
+private:
+    bool Dominates(s64 d, s64 r) const {
+        if (d < 0) {
+            return true; // the value at entry
+        }
+        for (const auto& [k, t] : regions) {
+            const bool in_d = s64(k) < d && d < s64(t);
+            const bool in_r = s64(k) < r && r < s64(t);
+            if (in_d && !in_r) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::vector<std::pair<size_t, size_t>> regions;
+    std::array<s64, 104> def{};
+    std::array<bool, 104> exact{};
+    s64 cur = 0;
+    bool loops = false;
+};
+
+// Whether the SGPRs an instruction's provenance result depends on are exact:
+// a scalar load's base, a move's source. Other writes have no provenance.
+bool SourcesExact(const Inst& i, const Exactness& exact) {
+    if (i.enc == Enc::SMRD) {
+        return exact.Exact(i.sbase) && exact.Exact(i.sbase + 1u);
+    }
+    if (i.enc == Enc::SOP1 && IsSgpr(i.src[0])) {
+        const auto op = static_cast<Sop1>(i.op);
+        if (op == Sop1::S_MOV_B32) {
+            return exact.Exact(i.src[0]);
+        }
+        if (op == Sop1::S_MOV_B64) {
+            return exact.Exact(i.src[0]) && exact.Exact(i.src[0] + 1u);
+        }
+    }
+    return true;
+}
+
+// Records the base of a scalar or buffer memory instruction when its
+// registers hold the same value wherever they are read.
+void CollectLinearBase(Program& p, const Provenance& prov, const Exactness& exact, const Inst& i) {
+    auto stable = [&](u32 reg, const SgprSource& s) {
+        return exact.Exact(reg) && (s.kind == SgprSource::UserData || s.kind == SgprSource::PointerLoad);
+    };
+    LinearBase b;
+    if (i.enc == Enc::SMRD) {
+        const auto op = static_cast<Smrd>(i.op);
+        if (op == Smrd::S_MEMTIME || op == Smrd::S_DCACHE_INV || op == Smrd::S_DCACHE_INV_VOL || !i.imm) {
+            return;
+        }
+        const bool buffer = op >= Smrd::S_BUFFER_LOAD_DWORD;
+        const u32 count = op == Smrd::S_LOAD_DWORDX2 || op == Smrd::S_BUFFER_LOAD_DWORDX2   ? 2
+                          : op == Smrd::S_LOAD_DWORDX4 || op == Smrd::S_BUFFER_LOAD_DWORDX4 ? 4
+                          : op == Smrd::S_LOAD_DWORDX8 || op == Smrd::S_BUFFER_LOAD_DWORDX8 ? 8
+                          : op == Smrd::S_LOAD_DWORDX16 || op == Smrd::S_BUFFER_LOAD_DWORDX16 ? 16
+                                                                                                : 1;
+        b.kind = buffer ? LinearBase::VBase : LinearBase::Pointer;
+        for (u32 k = 0; k < 2; ++k) {
+            b.words[k] = prov.Get(i.sbase + k);
+            if (!stable(i.sbase + k, b.words[k])) {
+                return;
+            }
+        }
+        b.extent = i.smrd_offset * 4 + count * 4;
+    } else if (i.enc == Enc::MUBUF || i.enc == Enc::MTBUF) {
+        if (i.addr64 || i.lds || i.soffset < 128 || i.soffset > 192) {
+            return; // only inline non-negative constant soffsets have a known bound
+        }
+        b.kind = LinearBase::VBuffer;
+        for (u32 k = 0; k < 4; ++k) {
+            b.words[k] = prov.Get(i.srsrc + k);
+            if (k < 3 && !stable(i.srsrc + k, b.words[k])) {
+                return;
+            }
+        }
+        const u32 off = i.offset + (i.soffset - 128u) + 16;
+        if (i.idxen && i.offen) {
+            b.unbounded = true;
+        } else if (i.offen) {
+            b.stride0 = true; // bounded by num_records only when the stride is 0
+            b.extent = 16;
+        } else {
+            b.extent = off;
+        }
+    } else {
+        return;
+    }
+    u32 slot = 0;
+    for (; slot < p.linear_bases.size(); ++slot) {
+        if (p.linear_bases[slot] == b) {
+            break;
+        }
+    }
+    if (slot == p.linear_bases.size()) {
+        if (slot >= kMaxLinearBases) {
+            return;
+        }
+        p.linear_bases.push_back(b);
+    } else {
+        LinearBase& e = p.linear_bases[slot];
+        e.extent = std::max(e.extent, b.extent);
+        e.stride0 |= b.stride0;
+        e.unbounded |= b.unbounded;
+    }
+    p.linear_base_by_pc.emplace_back(i.pc, slot);
+}
+
 bool WritesExec(const Inst& i) {
     auto is_exec = [](u16 code) { return code == Operand::ExecLo || code == Operand::ExecHi; };
     switch (i.enc) {
@@ -241,6 +455,15 @@ bool InlineFetch(Program& p, const BuildInput& in) {
 
 } // namespace
 
+u32 Program::LinearBaseOf(u32 pc) const {
+    for (const auto& [lpc, slot] : linear_base_by_pc) {
+        if (lpc == pc) {
+            return slot;
+        }
+    }
+    return ~0u;
+}
+
 u32 Program::ImageSlot(u32 pc) const {
     for (const auto& [ipc, slot] : image_slot_by_pc) {
         if (ipc == pc) {
@@ -271,6 +494,7 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
         return nullptr;
     }
 
+    Exactness exact(p->code);
     Provenance prov(in.num_user_sgprs);
     bool v0_written = false; // the vertex index is still in v0
     for (const Inst& i : p->code) {
@@ -381,6 +605,9 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
         default:
             break;
         }
+        exact.At(static_cast<size_t>(&i - p->code.data()));
+        CollectLinearBase(*p, prov, exact, i);
+        exact.Step(i, SourcesExact(i, exact));
         prov.Step(i);
     }
     std::sort(p->labels.begin(), p->labels.end());
@@ -435,6 +662,32 @@ u32 ResolveSgpr(const SgprSource& src, const u32* ud, SgprReadCache* cache) {
     default:
         return 0;
     }
+}
+
+bool LinearBaseRange(const LinearBase& b, const u32* ud, SgprReadCache* cache, u64* va, u64* bytes) {
+    const u32 w0 = ResolveSgpr(b.words[0], ud, cache);
+    const u32 w1 = ResolveSgpr(b.words[1], ud, cache);
+    switch (b.kind) {
+    case LinearBase::Pointer:
+        *va = (u64(w0) | (u64(w1) << 32)) & 0xFFFFFFFFFFFFull;
+        *bytes = b.extent;
+        break;
+    case LinearBase::VBase:
+        *va = u64(w0) | (u64(w1 & 0xFFF) << 32);
+        *bytes = b.extent;
+        break;
+    case LinearBase::VBuffer: {
+        const u32 stride = (w1 >> 16) & 0x3FFF;
+        if (b.unbounded || (b.stride0 && stride != 0)) {
+            return false;
+        }
+        const u32 records = ResolveSgpr(b.words[2], ud, cache);
+        *va = u64(w0) | (u64(w1 & 0xFFF) << 32);
+        *bytes = (stride ? u64(records) * stride : u64(records)) + b.extent;
+        break;
+    }
+    }
+    return *va != 0 && (*va & 3) == 0;
 }
 
 } // namespace Gpu::Shader

@@ -333,8 +333,9 @@ struct MetalRenderer::Impl {
     u64 off[2][31] = {};
     __unsafe_unretained id<MTLTexture> tex[2][32] = {};
     __unsafe_unretained id<MTLSamplerState> smp[2][16] = {};
-    u8 bytes[2][2][64] = {}; // user data, then the draw constants (vertex) per stage
-    bool has_bytes[2][2] = {};
+    u8 bytes[2][3][64] = {}; // user data, draw constants (vertex), linear bases per stage
+    bool has_bytes[2][3] = {};
+    u32 bytes_len[2][3] = {};
   } bound;
   // stage 0 = vertex, 1 = fragment
   void BindBuffer(u32 st, id<MTLBuffer> b, u64 off, u32 idx) {
@@ -375,13 +376,15 @@ struct MetalRenderer::Impl {
   }
   // Bytes slot `which` (0 user data, 1 draw constants) at buffer index idx.
   void BindBytes(u32 st, u32 which, const void *data, u32 len, u32 idx) {
-    if (len <= 64 && bound.has_bytes[st][which] && !std::memcmp(bound.bytes[st][which], data, len)) {
+    if (len <= 64 && bound.has_bytes[st][which] && bound.bytes_len[st][which] == len &&
+        !std::memcmp(bound.bytes[st][which], data, len)) {
       return;
     }
     if (len <= 64) {
       std::memcpy(bound.bytes[st][which], data, len);
-      bound.has_bytes[st][which] = true;
     }
+    bound.has_bytes[st][which] = len <= 64;
+    bound.bytes_len[st][which] = len;
     bound.buf[st][idx] = nil; // bytes replace any buffer there
     if (st) {
       [enc setFragmentBytes:data length:len atIndex:idx];
@@ -975,6 +978,32 @@ struct MetalRenderer::Impl {
                                  options:MTLResourceStorageModeShared];
   }
 
+  // Guest range [va, va + size) as byte `off` of mem buffer `hi` (no ObjC
+  // objects: cheap enough per draw). The caller ran UpdateMemMap.
+  bool LocatePhys(u64 va, u64 size, u64 *off, bool *hi) const {
+    auto it =
+        std::upper_bound(mem_ranges.begin(), mem_ranges.end(), va,
+                         [](u64 a, const auto &r) { return a < r.start; });
+    if (it == mem_ranges.begin()) {
+      return false;
+    }
+    --it;
+    if (va + size > it->start + it->size) {
+      return false;
+    }
+    const u64 phys = it->phys + (va - it->start);
+    if (phys + size <= mem_split) {
+      *off = phys;
+      *hi = false;
+    } else if (phys >= mem_split) {
+      *off = phys - mem_split;
+      *hi = true;
+    } else {
+      return false;
+    }
+    return true;
+  }
+
   // Guest range [va, va + size) as a range of one of the `mem` buffers.
   bool Locate(u64 va, u64 size, id<MTLBuffer> *buf, u64 *off) {
     UpdateMemMap();
@@ -1444,6 +1473,33 @@ struct MetalRenderer::Impl {
     }
     arena_head += bytes;
     return arena_va + off;
+  }
+
+  // Translates `p`'s linear bases against the draw's (patched) user data:
+  // entry k = dword offset << 1 | upper buffer. Returns the bases that map
+  // to one contiguous memory range (MslOptions::linear_mask). DC_NO_LINEAR:
+  // none, every access walks the page table.
+  u32 LinearTable(const Shader::Program &p, const u32 *ud, u32 *out) {
+    static const bool off = std::getenv("DC_NO_LINEAR") != nullptr;
+    if (off) {
+      return 0;
+    }
+    u32 mask = 0;
+    Shader::SgprReadCache cache;
+    UpdateMemMap();
+    for (u32 k = 0; k < p.linear_bases.size(); ++k) {
+      out[k] = 0;
+      u64 va = 0, bytes = 0, moff = 0;
+      bool hi = false;
+      if (!Shader::LinearBaseRange(p.linear_bases[k], ud, &cache, &va, &bytes) ||
+          !LocatePhys(va, std::max<u64>(bytes, 4), &moff, &hi) || (moff & 3) ||
+          (moff >> 2) >= (1ull << 31)) {
+        continue;
+      }
+      out[k] = (static_cast<u32>(moff >> 2) << 1) | (hi ? 1u : 0u);
+      mask |= 1u << k;
+    }
+    return mask;
   }
 
   // Points user-data pointers that land in a CE dump at a snapshot of it.
@@ -3615,6 +3671,10 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   vo.debug_capture = capture;
   vo.textures = vs_types; // borrowed: lives until the end of this draw
   vo.map_hoist = map_hoist;
+  // Linear bases picked on the raw user data; the table is rebuilt from the
+  // patched user data when binding (same descriptors: snapshots are copies).
+  u32 vlin[Shader::kMaxLinearBases], plin[Shader::kMaxLinearBases];
+  vo.linear_mask = LinearTable(*vs, vs_ud, vlin);
   // Vertex fetch by Metal for the fetch loads it can do (all or none): the
   // V# words resolved here give each one a vertex buffer and a format.
   // DC_SW_FETCH keeps every load in the shader.
@@ -3668,6 +3728,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   }
   u64 vs_key = Hash(vs->hash);
   vs_key = Hash(vo.map_hoist, vs_key);
+  vs_key = Hash(vo.linear_mask, vs_key);
   for (const auto &a : vo.vertex_attrs) {
     vs_key = Hash(u64(a.pc) | (u64(a.kind) << 32) | (u64(a.swizzle) << 40), vs_key);
   }
@@ -3686,6 +3747,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     fo.col_format = col_format;
     fo.dual_source = dual_source;
     fo.map_hoist = map_hoist;
+    fo.linear_mask = LinearTable(*ps, ps_ud, plin);
     for (u32 k = 0; k < 8; ++k) {
       fo.mrt_type[k] = out_type[k];
       if (color_fmt[k] == MTLPixelFormatRG11B10Float) {
@@ -3726,6 +3788,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     ps_key = Hash(fo.col_format, ps_key);
     ps_key = Hash(fo.dual_source, ps_key);
     ps_key = Hash(fo.map_hoist, ps_key);
+    ps_key = Hash(fo.linear_mask, ps_key);
     ps_key = Fnv(fo.mrt_type.data(), sizeof(fo.mrt_type), ps_key);
     ps_key = Hash(fo.mrt_ufloat, ps_key);
     ps_key =
@@ -3977,11 +4040,22 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     PatchUserData(pud);
   }
   UpdateMemMap();
+  // Only user data PatchUserData changed can move a base.
+  if ((vo.linear_mask && std::memcmp(vud, vs_ud, sizeof(vud)) &&
+       (LinearTable(*vs, vud, vlin) & vo.linear_mask) != vo.linear_mask) ||
+      (ps && fo.linear_mask && std::memcmp(pud, ps_ud, sizeof(pud)) &&
+       (LinearTable(*ps, pud, plin) & fo.linear_mask) != fo.linear_mask)) {
+    ReportOnce("draw skipped: a linear base moved between key and bind");
+    return;
+  }
   static_assert(sizeof(consts) <= 64);
   BindBytes(0, 0, vud, 64, Shader::Binding::UserData);
   BindBuffer(0, mem[0], 0, Shader::Binding::Mem0);
   BindBuffer(0, mem[1], 0, Shader::Binding::Mem1);
   BindBuffer(0, mem_map, 0, Shader::Binding::MemMap);
+  if (vo.linear_mask) {
+    BindBytes(0, 2, vlin, 4 * (32 - std::countl_zero(vo.linear_mask)), Shader::Binding::Linear);
+  }
   for (u32 k = 0; k < nvbufs; ++k) {
     BindBuffer(0, vbufs[k].buf, vbufs[k].off, kVertexBufferBase + k);
   }
@@ -3997,6 +4071,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     BindBuffer(1, mem[0], 0, Shader::Binding::Mem0);
     BindBuffer(1, mem[1], 0, Shader::Binding::Mem1);
     BindBuffer(1, mem_map, 0, Shader::Binding::MemMap);
+    if (fo.linear_mask) {
+      BindBytes(1, 2, plin, 4 * (32 - std::countl_zero(fo.linear_mask)), Shader::Binding::Linear);
+    }
     for (u32 k = 0; k < ps_res.tex.size(); ++k) {
       BindTexture(1, ps_res.tex[k], k);
     }
@@ -4297,9 +4374,41 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   resolving_shader = addr;
   Resolve(*cs, ud, types, res);
 
+  // One encoder per dispatch while timing them or dumping a traced frame.
+  const bool batch = !pass_timing && !trace;
+  if (!batch || enc) {
+    EndPass();
+  }
+  if (++work_since_commit >= kCommitEvery) {
+    Commit(false);
+  }
+  // DC_CAPTURE_CS=<cs>[:<flip>]: a command buffer holding only that dispatch
+  // goes into ../bench/capture_cs_<cs>.gputrace for Xcode's shader profiler
+  // (needs MTL_CAPTURE_ENABLED=1).
+  static const char *capture_cs_env = std::getenv("DC_CAPTURE_CS");
+  static const u64 capture_cs =
+      capture_cs_env ? std::strtoull(capture_cs_env, nullptr, 16) : 0;
+  static const u64 capture_cs_flip =
+      capture_cs_env && std::strchr(capture_cs_env, ':')
+          ? std::strtoull(std::strchr(capture_cs_env, ':') + 1, nullptr, 10)
+          : 0;
+  static bool capture_cs_done = false;
+  bool capturing = false;
+  if (capture_cs == addr && !capture_cs_done && frame_count >= capture_cs_flip) {
+    capture_cs_done = true;
+    Commit(false);
+    capturing = BeginCapture("../bench/capture_cs_" + Hex(addr) + ".gputrace");
+  }
+  EnsureCommandBuffer();
+  u32 cud[16];
+  std::memcpy(cud, ud, sizeof(cud));
+  PatchUserData(cud);
+  UpdateMemMap();
   Shader::MslOptions o;
   o.textures = types; // borrowed: `types` lives until the key is hashed
   o.map_hoist = map_hoist;
+  u32 lin[Shader::kMaxLinearBases];
+  o.linear_mask = LinearTable(*cs, cud, lin);
   const int probe_slot =
       probe_buf && trace
           ? ProbeSlot(addr, "dispatch " + std::to_string(stat_dispatches) +
@@ -4314,6 +4423,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   key = Hash(o.probe_pc, key);
   key = Hash(rsrc2, key);
   key = Hash(o.map_hoist, key);
+  key = Hash(o.linear_mask, key);
   key = Fnv(types.data(), types.size() * sizeof(TextureType), key);
   const u32 group = tx * ty * tz;
   const u64 pkey = Hash(group, key);
@@ -4363,39 +4473,12 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   }
   id<MTLComputePipelineState> pso = it->second;
   if (!pso) {
+    if (capturing) {
+      [[MTLCaptureManager sharedCaptureManager] stopCapture];
+    }
     return;
   }
 
-  // One encoder per dispatch while timing them or dumping a traced frame.
-  const bool batch = !pass_timing && !trace;
-  if (!batch || enc) {
-    EndPass();
-  }
-  if (++work_since_commit >= kCommitEvery) {
-    Commit(false);
-  }
-  // DC_CAPTURE_CS=<cs>[:<flip>]: a command buffer holding only that dispatch
-  // goes into ../bench/capture_cs_<cs>.gputrace for Xcode's shader profiler
-  // (needs MTL_CAPTURE_ENABLED=1).
-  static const char *capture_cs_env = std::getenv("DC_CAPTURE_CS");
-  static const u64 capture_cs =
-      capture_cs_env ? std::strtoull(capture_cs_env, nullptr, 16) : 0;
-  static const u64 capture_cs_flip =
-      capture_cs_env && std::strchr(capture_cs_env, ':')
-          ? std::strtoull(std::strchr(capture_cs_env, ':') + 1, nullptr, 10)
-          : 0;
-  static bool capture_cs_done = false;
-  bool capturing = false;
-  if (capture_cs == addr && !capture_cs_done && frame_count >= capture_cs_flip) {
-    capture_cs_done = true;
-    Commit(false);
-    capturing = BeginCapture("../bench/capture_cs_" + Hex(addr) + ".gputrace");
-  }
-  EnsureCommandBuffer();
-  u32 cud[16];
-  std::memcpy(cud, ud, sizeof(cud));
-  PatchUserData(cud);
-  UpdateMemMap();
   id<MTLComputeCommandEncoder> e = nil;
   if (pass_timing) {
     const u32 sample = TsBegin(addr, gx, gy, true);
@@ -4418,6 +4501,11 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   [e setBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
   [e setBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
   [e setBuffer:gds offset:0 atIndex:Shader::Binding::Gds];
+  if (o.linear_mask) {
+    [e setBytes:lin
+         length:4 * (32 - std::countl_zero(o.linear_mask))
+        atIndex:Shader::Binding::Linear];
+  }
   for (u32 k = 0; k < res.tex.size(); ++k) {
     [e setTexture:res.tex[k] atIndex:k];
   }

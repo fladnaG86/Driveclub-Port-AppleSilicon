@@ -15,7 +15,10 @@ struct DcDraw { float4 vp_scale; float4 vp_offset; float2 rt_scale; uint vte; ui
 // DcMap's header copied into registers once per invocation (MslOptions::map_hoist).
 struct DcMapL { ulong base; ulong pages; ulong split; ulong limit; uint shift; device const int* entries;
                 ulong fva; ulong fsize; ulong foff; uint fhi; };
-struct DcMem { device uint* lo; device uint* hi; device const DcMap* map; DcMapL mapl; };
+struct DcMem { device uint* lo; device uint* hi; device const DcMap* map; DcMapL mapl; constant uint* lin; };
+// A base the host translated (MslOptions::linear_mask): guest `va` maps to `p`
+// and the access stays inside the range the host checked.
+struct DcLin { device uint* p; ulong va; };
 
 // ---- guest memory ----
 static inline device uint* dc_ptr(thread const DcMem& m, ulong va) {
@@ -37,7 +40,15 @@ static inline device uint* dc_ptr_n(thread const DcMem& m, ulong va, uint bytes)
     if (((va ^ last) >> m.map->shift) != 0ul && dc_ptr(m, last) != p + ((bytes - 4u) >> 2)) return nullptr;
     return p;
 }
-static inline uint dc_ld(thread const DcMem& m, ulong va) {
+static inline device uint* dc_ptr(thread const DcLin& m, ulong va) { return m.p + ((va - m.va) >> 2); }
+static inline device uint* dc_ptr_n(thread const DcLin& m, ulong va, uint bytes) { return dc_ptr(m, va); }
+// Linear base `k`: entry = dword offset << 1 | upper memory buffer.
+static inline DcLin dc_lin(thread const DcMem& m, uint k, ulong va) {
+    uint e = m.lin[k];
+    return DcLin{((e & 1u) ? m.hi : m.lo) + (e >> 1), va};
+}
+template <typename M>
+static inline uint dc_ld(thread const M& m, ulong va) {
     device uint* p = dc_ptr(m, va & ~3ul);
     uint lo = p ? *p : 0u;
     uint sh = uint(va & 3ul) * 8u;
@@ -46,14 +57,16 @@ static inline uint dc_ld(thread const DcMem& m, ulong va) {
     uint hi = q ? *q : 0u;
     return (lo >> sh) | (hi << (32u - sh));
 }
-static inline void dc_st(thread const DcMem& m, ulong va, uint v) {
+template <typename M>
+static inline void dc_st(thread const M& m, ulong va, uint v) {
     device uint* p = dc_ptr(m, va & ~3ul);
     if (p) *p = v;
 }
 // Byte / short stores: atomic and+or, since neighbouring lanes may write the
 // other bytes of the same dword (a plain read-modify-write also trips the
 // AMD Metal compiler).
-static inline void dc_st_part(thread const DcMem& m, ulong va, uint v, uint bytes) {
+template <typename M>
+static inline void dc_st_part(thread const M& m, ulong va, uint v, uint bytes) {
     device uint* p = dc_ptr(m, va & ~3ul);
     if (!p) return;
     uint sh = uint(va & 3ul) * 8u;
@@ -101,7 +114,8 @@ static inline uint4 dc_fmt_convert(uint4 r, uint4 bits, uint nfmt, uint n) {
     }
     return o;
 }
-static inline uint4 dc_load_fmt(thread const DcMem& m, ulong a, uint dfmt, uint nfmt) {
+template <typename M>
+static inline uint4 dc_load_fmt(thread const M& m, ulong a, uint dfmt, uint nfmt) {
     uint words = dfmt == 14u ? 4u : dfmt == 13u ? 3u : (dfmt == 11u || dfmt == 12u) ? 2u : 1u;
     uint4 w = uint4(0u);
     if ((a & 3ul) == 0ul) {
@@ -147,7 +161,8 @@ static inline uint dc_pack(uint v, uint bits, uint nfmt) {
     default: return bits == 32u ? v : bits == 16u ? uint(as_type<ushort>(half(f))) : 0u;
     }
 }
-static inline void dc_store_fmt(thread const DcMem& m, ulong a, uint4 v, uint dfmt, uint nfmt) {
+template <typename M>
+static inline void dc_store_fmt(thread const M& m, ulong a, uint4 v, uint dfmt, uint nfmt) {
     switch (dfmt) {
     case 1u: dc_st_part(m, a, dc_pack(v.x, 8u, nfmt), 1u); break;
     case 2u: dc_st_part(m, a, dc_pack(v.x, 16u, nfmt), 2u); break;

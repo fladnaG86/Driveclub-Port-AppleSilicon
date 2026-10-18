@@ -28,6 +28,7 @@ constexpr u32 Mem1 = 2;     // device uint*: direct memory [split, end)
 constexpr u32 MemMap = 3;   // constant DcMap
 constexpr u32 Draw = 4;     // constant DcDraw (vertex stage)
 constexpr u32 Gds = 5;      // device uint[16K]: global data share (compute stage)
+constexpr u32 Linear = 8;   // constant uint[]: translated linear bases (MslOptions::linear_mask)
 } // namespace Binding
 
 // Host-side mirrors of the MSL structs in the prelude.
@@ -109,6 +110,10 @@ struct MslOptions {
     // Guest memory helpers read the page-table header from registers filled
     // once at entry instead of from the buffer on every access.
     bool map_hoist = false;
+    // Program::linear_bases the host translated for this draw (bit k = base k):
+    // their accesses index memory directly. Entry k of the buffer at
+    // Binding::Linear is the base's dword offset << 1 | 1 for the upper buffer.
+    u32 linear_mask = 0;
     // DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE: discard where the stored depth (a copy at
     // texture(kDepthBoundsTexture)) is outside [min, max] (buffer(kDepthBoundsBuffer)).
     bool depth_bounds = false;

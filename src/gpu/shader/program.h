@@ -57,6 +57,28 @@ struct ImageResource {
     u32 sampler_index = 0;
 };
 
+// A guest memory base the host can translate per draw: memory instructions
+// on it then index the memory buffer directly instead of walking the page
+// table (MslOptions::linear_mask). Its registers are written at most once in
+// the program, so their provenance holds wherever they are read.
+struct LinearBase {
+    enum Kind : u8 {
+        Pointer, // 64-bit pointer (scalar loads)
+        VBase,   // V# base, words 0-1 (scalar buffer loads)
+        VBuffer, // V# base, words 0-1, bounded by words 1-2 (vector buffer access)
+    };
+    Kind kind = Pointer;
+    std::array<SgprSource, 4> words{}; // pointer lo/hi, or V# words 0-3
+    u32 extent = 0;        // bytes read past the base (VBuffer: past the records)
+    bool stride0 = false;  // VBuffer: some access is bounded only when the stride is 0
+    bool unbounded = false; // VBuffer: some access has no bound at all
+
+    bool operator==(const LinearBase& b) const {
+        return kind == b.kind && words == b.words;
+    }
+};
+constexpr u32 kMaxLinearBases = 32;
+
 // Fetch-subroutine instructions get pcs in their own range so they never
 // collide with branch targets of the main program.
 constexpr u32 kFetchPcBase = 0x100000;
@@ -85,6 +107,10 @@ struct Program {
     // VS: fetch loads the host may do (see VertexInput).
     std::vector<VertexInput> vertex_inputs;
 
+    // Memory instruction pc -> index into `linear_bases`.
+    std::vector<std::pair<u32, u32>> linear_base_by_pc;
+    std::vector<LinearBase> linear_bases;
+
     // VS exports.
     u32 param_mask = 0;
     bool exports_position = false;
@@ -98,6 +124,7 @@ struct Program {
     std::vector<std::string> unsupported; // opcodes we could not translate
 
     u32 ImageSlot(u32 pc) const;
+    u32 LinearBaseOf(u32 pc) const; // ~0u: none
 };
 
 struct BuildInput {
@@ -122,5 +149,9 @@ struct SgprReadCache {
 // Evaluates a descriptor dword at draw time. `cache` (optional) must not
 // outlive the draw: a mapping may go away between draws.
 u32 ResolveSgpr(const SgprSource& src, const u32* user_data, SgprReadCache* cache = nullptr);
+
+// Guest range [va, va + bytes) a linear base covers at draw time, or false
+// when its access is not bounded with these descriptor values.
+bool LinearBaseRange(const LinearBase& b, const u32* user_data, SgprReadCache* cache, u64* va, u64* bytes);
 
 } // namespace Gpu::Shader
