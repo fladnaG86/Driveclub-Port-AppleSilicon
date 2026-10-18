@@ -41,6 +41,9 @@ struct Vma {
 };
 
 void Init();
+// Host mprotect flags for PS4 protection bits (GPU-visible memory stays
+// CPU-writable for us).
+int HostProtection(int prot);
 
 // Records a range the loader owns (module images, patch areas) so guest
 // mappings never land on it.

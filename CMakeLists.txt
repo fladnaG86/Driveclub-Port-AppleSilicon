@@ -48,6 +48,7 @@ set(DC_CORE_SOURCES
     src/core/runtime.cpp
     src/core/runtime.h
     src/core/signals.cpp
+    src/core/write_track.cpp
     src/core/signals.h
     src/core/tls.cpp
     src/core/tls.h
