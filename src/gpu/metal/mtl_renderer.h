@@ -3,6 +3,7 @@
 // Metal backend for the guest GPU: translates guest shaders to MSL, keeps
 // render targets and textures as Metal textures, and records draws.
 
+#include <atomic>
 #include <memory>
 
 #include "gpu/renderer.h"
@@ -42,9 +43,14 @@ public:
     // It stays valid until two more flips have happened.
     void* LatestFrame() const;
 
+    // Any thread: frames the game has flipped so far (its real frame rate,
+    // unlike how often the window presents).
+    std::uint64_t FlipCount() const { return flips.load(std::memory_order_relaxed); }
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
+    std::atomic<std::uint64_t> flips{0};
 };
 
 } // namespace Gpu::Metal

@@ -97,7 +97,7 @@ int Run(int argc, char** argv) {
     using Clock = std::chrono::steady_clock;
     const auto start = Clock::now();
     auto fps_window = start;
-    int frames = 0;
+    std::uint64_t flips_seen = 0;
 
     bool running = true;
     while (running) {
@@ -275,16 +275,18 @@ int Run(int argc, char** argv) {
             presenter->PresentClear(0.5f + 0.5f * std::sin(t), 0.2f, 0.3f);
         }
 
-        ++frames;
+        // Game frames (flips), not window presents: the loop presents the
+        // latest frame at the display rate whether or not it is new.
         const auto now = Clock::now();
         if (now - fps_window >= std::chrono::seconds(1)) {
             const double secs = std::chrono::duration<double>(now - fps_window).count();
-            const double fps = frames / secs;
+            const std::uint64_t flips = renderer->FlipCount();
+            const double fps = double(flips - flips_seen) / secs;
+            flips_seen = flips;
             char title[96];
             std::snprintf(title, sizeof(title), "Driveclub Native | %s | %.0f FPS",
                           gpu_name.c_str(), fps);
             SDL_SetWindowTitle(window, title);
-            frames = 0;
             fps_window = now;
         }
     }

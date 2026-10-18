@@ -4974,6 +4974,7 @@ void MetalRenderer::Signal(std::function<void()> done) {
 }
 
 void MetalRenderer::Flip(const FlipInfo &flip) {
+  flips.fetch_add(1, std::memory_order_relaxed);
   std::scoped_lock lk(impl->lock);
   @autoreleasepool {
     impl->Flip(flip);
