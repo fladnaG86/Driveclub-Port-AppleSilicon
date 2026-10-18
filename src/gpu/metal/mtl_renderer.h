@@ -15,6 +15,10 @@ class Device;
 // passes and the frame dumped to DC_DUMP_FRAMES, or ../bench/f12_<frame>.
 void RequestFrameTrace();
 
+// Any thread (F11): the next two frames go into ../bench/capture_<flip>.gputrace
+// (launch with MTL_CAPTURE_ENABLED=1).
+void RequestGpuCapture();
+
 class MetalRenderer : public Gpu::Renderer {
 public:
     explicit MetalRenderer(Device& device);

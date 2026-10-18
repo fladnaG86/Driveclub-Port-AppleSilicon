@@ -48,6 +48,7 @@ using Shader::TextureType;
 
 namespace {
 std::atomic<bool> g_trace_request{false};
+std::atomic<bool> g_capture_request{false};
 
 constexpr u64 kUploadChunk = 4ull << 20;
 constexpr u64 kGpuAddrMask =
@@ -591,6 +592,7 @@ struct MetalRenderer::Impl {
   u64 dump_every = 1;                // DC_DUMP_EVERY=n: only every n-th flip
   bool key_trace_only = false;       // F12 picked the dump directory: dump the traced frame only
   std::string key_trace_dir;
+  u64 capture_end = 0; // F11: flip that stops the running GPU capture
   bool debug_clear = false; // DC_DEBUG_CLEAR: new targets start dark blue
   u64 dump_texture =
       0; // DC_DUMP_TEXTURE=<addr>: write its uploads next to the frame dumps
@@ -3223,6 +3225,8 @@ struct MetalRenderer::Impl {
   void Draw(const RegFile &r, const DrawCall &dc);
   void Dispatch(const RegFile &r, u32 x, u32 y, u32 z);
   u64 indirect_args = 0; // guest address of the group counts (DispatchIndirect)
+  void StartCapture();
+  bool BeginCapture(const std::string &path);
   void Flip(const FlipInfo &f);
   std::unordered_map<u64, id<MTLComputePipelineState>> compute_pipelines;
 
@@ -4324,6 +4328,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
         if (id<MTLFunction> fn = compiler->Function(key, src, addr)) {
           MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new];
           d.computeFunction = fn;
+          d.label = [NSString stringWithFormat:@"cs %#llx", addr]; // GPU captures
           d.maxTotalThreadsPerThreadgroup =
               group; // the guest's group size must fit as is
           NSError *err = nil;
@@ -4368,6 +4373,23 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   }
   if (++work_since_commit >= kCommitEvery) {
     Commit(false);
+  }
+  // DC_CAPTURE_CS=<cs>[:<flip>]: a command buffer holding only that dispatch
+  // goes into ../bench/capture_cs_<cs>.gputrace for Xcode's shader profiler
+  // (needs MTL_CAPTURE_ENABLED=1).
+  static const char *capture_cs_env = std::getenv("DC_CAPTURE_CS");
+  static const u64 capture_cs =
+      capture_cs_env ? std::strtoull(capture_cs_env, nullptr, 16) : 0;
+  static const u64 capture_cs_flip =
+      capture_cs_env && std::strchr(capture_cs_env, ':')
+          ? std::strtoull(std::strchr(capture_cs_env, ':') + 1, nullptr, 10)
+          : 0;
+  static bool capture_cs_done = false;
+  bool capturing = false;
+  if (capture_cs == addr && !capture_cs_done && frame_count >= capture_cs_flip) {
+    capture_cs_done = true;
+    Commit(false);
+    capturing = BeginCapture("../bench/capture_cs_" + Hex(addr) + ".gputrace");
   }
   EnsureCommandBuffer();
   u32 cud[16];
@@ -4423,6 +4445,11 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   if (!batch) {
     [e endEncoding];
   }
+  if (capturing) {
+    Commit(false);
+    [[MTLCaptureManager sharedCaptureManager] stopCapture];
+    DC_INFO("gpu: captured dispatch cs %#llx", addr);
+  }
   if (dump_passes && trace && dump_frames) {
     u32 n = 0;
     for (u32 k = 0; k < res.tex.size() && n < 8; ++k) {
@@ -4466,9 +4493,53 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   }
 }
 
+// F11: records the next two frames into ../bench/capture_<flip>.gputrace for
+// Xcode (needs MTL_CAPTURE_ENABLED=1 in the environment at launch).
+void MetalRenderer::Impl::StartCapture() {
+  Commit(false); // the capture starts at a command buffer boundary
+  if (BeginCapture("../bench/capture_" + std::to_string(frame_count) + ".gputrace")) {
+    capture_end = frame_count + 2;
+  }
+}
+
+// Starts a GPU capture of everything committed from now on into `path`.
+bool MetalRenderer::Impl::BeginCapture(const std::string &path) {
+  MTLCaptureManager *m = [MTLCaptureManager sharedCaptureManager];
+  if (![m supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+    DC_ERROR("gpu: GPU capture needs MTL_CAPTURE_ENABLED=1 at launch");
+    return false;
+  }
+  MTLCaptureDescriptor *d = [MTLCaptureDescriptor new];
+  d.captureObject = device;
+  d.destination = MTLCaptureDestinationGPUTraceDocument;
+  d.outputURL = [NSURL fileURLWithPath:@(path.c_str())];
+  NSError *err = nil;
+  if (![m startCaptureWithDescriptor:d error:&err]) {
+    DC_ERROR("gpu: capture failed: %s",
+             err ? err.localizedDescription.UTF8String : "?");
+    return false;
+  }
+  DC_INFO("gpu: capturing into %s", path.c_str());
+  return true;
+}
+
 void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   CpuTimer t(cpu_profile ? &cpu_flip_s : nullptr);
   ++frame_count;
+  if (capture_end && frame_count >= capture_end) {
+    Commit(false);
+    [[MTLCaptureManager sharedCaptureManager] stopCapture];
+    capture_end = 0;
+    DC_INFO("gpu: capture done");
+  }
+  static const u64 capture_at = // DC_CAPTURE_AT=<flip>: F11 at that flip
+      std::getenv("DC_CAPTURE_AT") ? std::strtoull(std::getenv("DC_CAPTURE_AT"), nullptr, 10) : 0;
+  if (capture_at && frame_count == capture_at) {
+    g_capture_request.store(true);
+  }
+  if (g_capture_request.exchange(false) && !capture_end) {
+    StartCapture();
+  }
   if (g_trace_request.exchange(false)) {
     trace_frame = frame_count + 1;
     dump_passes = true;
@@ -4702,6 +4773,10 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
 
 void RequestFrameTrace() {
   g_trace_request.store(true, std::memory_order_release);
+}
+
+void RequestGpuCapture() {
+  g_capture_request.store(true, std::memory_order_release);
 }
 
 MetalRenderer::MetalRenderer(Device &device) : impl(std::make_unique<Impl>()) {
