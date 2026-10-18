@@ -94,7 +94,7 @@ struct MslOptions {
         Kind kind = Float;
         u32 swizzle = 0; // V# word 3 for dst_sel (MUBUF), 0 = none (MTBUF)
     };
-    std::vector<VertexAttr> vertex_attrs;
+    std::span<const VertexAttr> vertex_attrs; // borrowed, like `textures`
     // Fragment.
     std::array<u32, 32> ps_input_cntl{}; // SPI_PS_INPUT_CNTL_n
     u32 vs_param_mask = 0;               // params the paired VS exports

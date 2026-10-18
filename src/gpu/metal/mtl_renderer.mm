@@ -321,6 +321,8 @@ struct MetalRenderer::Impl {
   id<MTLCommandBuffer> cmd = nil;
   id<MTLCommandBuffer> last_committed = nil;
   id<MTLRenderCommandEncoder> enc = nil;
+  // Per-draw scratch reused across draws (no allocation per draw).
+  std::vector<Shader::MslOptions::VertexAttr> draw_vattrs;
   // What `enc` has bound, so draws skip Objective-C calls (slow under
   // Rosetta) that would not change anything. Reset with each encoder.
   struct BoundState {
@@ -1374,8 +1376,16 @@ struct MetalRenderer::Impl {
   }
 
   void NoteConstDump(u64 addr, u32 bytes) {
-    // A new dump replaces whatever older dumps it overlaps.
+    // A new dump replaces whatever older dumps it overlaps. The same range
+    // dumped again (the common case) just gets the new generation.
     auto it = const_dumps.lower_bound(addr);
+    if (it != const_dumps.end() && it->first == addr && it->second.bytes == bytes &&
+        (std::next(it) == const_dumps.end() || std::next(it)->first >= addr + bytes) &&
+        (it == const_dumps.begin() ||
+         std::prev(it)->first + std::prev(it)->second.bytes <= addr)) {
+      it->second.gen = ++dump_gen;
+      return;
+    }
     if (it != const_dumps.begin() &&
         std::prev(it)->first + std::prev(it)->second.bytes > addr) {
       --it;
@@ -3582,6 +3592,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       vs->vertex_inputs.size() <= kMaxVertexBuffers) {
     Shader::SgprReadCache rc;
     bool ok = true;
+    draw_vattrs.clear();
     for (u32 k = 0; k < vs->vertex_inputs.size(); ++k) {
       const Shader::VertexInput &in = vs->vertex_inputs[k];
       u32 v[4];
@@ -3604,15 +3615,16 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
         ok = false;
         break;
       }
-      vo.vertex_attrs.push_back(a);
+      draw_vattrs.push_back(a);
       vbufs[nvbufs++] = {buf, off, f, stride, bytes};
       vlayout = Hash(u64(f) | (u64(stride) << 32), vlayout + 1);
     }
     if (!ok) {
-      vo.vertex_attrs.clear();
+      draw_vattrs.clear();
       nvbufs = 0;
       vlayout = 0;
     }
+    vo.vertex_attrs = draw_vattrs;
   }
   u64 vs_key = Hash(vs->hash);
   vs_key = Hash(vo.map_hoist, vs_key);
