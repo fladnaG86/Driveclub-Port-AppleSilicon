@@ -111,6 +111,10 @@ int main(int argc, char** argv) {
         if (cs) {
             id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:fn error:&err];
             std::printf("compute pipeline: %s\n", pso ? "OK" : err.localizedDescription.UTF8String);
+            if (pso) {
+                // Drops below 1024 as the shader needs more registers per thread.
+                std::printf("max threads per group: %lu\n", (unsigned long)pso.maxTotalThreadsPerThreadgroup);
+            }
         }
     }
     return 0;

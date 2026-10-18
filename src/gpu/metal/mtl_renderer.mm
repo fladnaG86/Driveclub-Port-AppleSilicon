@@ -484,6 +484,7 @@ struct MetalRenderer::Impl {
   struct ProfileEntry {
     double seconds = 0;
     u64 calls = 0;
+    u64 verts = 0; // pass timing: vertices (indices) x instances drawn
   };
   std::mutex profile_lock;
   std::unordered_map<std::string, ProfileEntry> profile_data;
@@ -499,6 +500,7 @@ struct MetalRenderer::Impl {
     u32 sample;
     u64 shader; // first pixel shader of a render pass, or the compute shader
     u32 draws;
+    u64 verts;
     u32 w, h;
     bool compute;
   };
@@ -512,7 +514,7 @@ struct MetalRenderer::Impl {
   u32 TsBegin(u64 shader, u32 w, u32 h, bool compute) {
     const u32 sample = ts_next;
     ts_next = (ts_next + 4) % (kTsPerBuf * kTsBufs);
-    ts_cmd.push_back({sample, shader, 0, w, h, compute});
+    ts_cmd.push_back({sample, shader, 0, 0, w, h, compute});
     return sample;
   }
   std::atomic<u64> gpu_ns{0};
@@ -1075,6 +1077,7 @@ struct MetalRenderer::Impl {
           const double sec = t.compute ? span(0) : span(2);
           e.seconds += sec;
           e.calls += t.compute ? 1 : t.draws;
+          e.verts += t.verts;
           (t.compute ? ts_cs_s : ts_fs_s) += sec;
           if (!t.compute) {
             const double vsec = span(0);
@@ -1082,6 +1085,7 @@ struct MetalRenderer::Impl {
             auto &ve = ts_data[std::string("vertex ") + what];
             ve.seconds += vsec;
             ve.calls += t.draws;
+            ve.verts += t.verts;
           }
         }
       }];
@@ -1263,8 +1267,9 @@ struct MetalRenderer::Impl {
             "compute %.1f (%.3f ns/tick); per pass: fragment (or compute) span",
             fs * 1e3 / f, vs * 1e3 / f, cs * 1e3 / f, ts_ns_per_tick);
     for (size_t k = 0; k < v.size() && k < 30; ++k) {
-      DC_INFO("pass timing: %6.2f ms/frame %6.1f calls/frame  %s",
-              v[k].second.seconds * 1e3 / f, v[k].second.calls / f, v[k].first.c_str());
+      DC_INFO("pass timing: %6.2f ms/frame %6.1f calls/frame %7.0fk verts/frame  %s",
+              v[k].second.seconds * 1e3 / f, v[k].second.calls / f,
+              v[k].second.verts / f / 1e3, v[k].first.c_str());
     }
   }
 
@@ -4179,6 +4184,7 @@ void MetalRenderer::Draw(const RegFile &regs, const DrawCall &draw) {
     if (impl->pass_timing && impl->enc && !impl->ts_cmd.empty() &&
         !impl->ts_cmd.back().compute) {
       Impl::TsPass &t = impl->ts_cmd.back();
+      t.verts += u64(draw.count) * draw.instances;
       if (!t.draws++) {
         t.shader = regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_PS);
       }
