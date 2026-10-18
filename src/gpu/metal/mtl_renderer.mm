@@ -321,6 +321,69 @@ struct MetalRenderer::Impl {
   id<MTLCommandBuffer> cmd = nil;
   id<MTLCommandBuffer> last_committed = nil;
   id<MTLRenderCommandEncoder> enc = nil;
+  // What `enc` has bound, so draws skip Objective-C calls (slow under
+  // Rosetta) that would not change anything. Reset with each encoder.
+  struct BoundState {
+    __unsafe_unretained id<MTLBuffer> buf[2][31] = {};
+    u64 off[2][31] = {};
+    __unsafe_unretained id<MTLTexture> tex[2][32] = {};
+    __unsafe_unretained id<MTLSamplerState> smp[2][16] = {};
+    u8 bytes[2][2][64] = {}; // user data, then the draw constants (vertex) per stage
+    bool has_bytes[2][2] = {};
+  } bound;
+  // stage 0 = vertex, 1 = fragment
+  void BindBuffer(u32 st, id<MTLBuffer> b, u64 off, u32 idx) {
+    if (bound.buf[st][idx] == b && bound.off[st][idx] == off) {
+      return;
+    }
+    bound.buf[st][idx] = b;
+    bound.off[st][idx] = off;
+    if (st) {
+      [enc setFragmentBuffer:b offset:off atIndex:idx];
+    } else {
+      [enc setVertexBuffer:b offset:off atIndex:idx];
+    }
+  }
+  void BindTexture(u32 st, id<MTLTexture> t, u32 idx) {
+    if (idx < 32 && bound.tex[st][idx] == t && t) {
+      return;
+    }
+    if (idx < 32) {
+      bound.tex[st][idx] = t;
+    }
+    if (st) {
+      [enc setFragmentTexture:t atIndex:idx];
+    } else {
+      [enc setVertexTexture:t atIndex:idx];
+    }
+  }
+  void BindSampler(u32 st, id<MTLSamplerState> sm, u32 idx) {
+    if (bound.smp[st][idx] == sm && sm) {
+      return;
+    }
+    bound.smp[st][idx] = sm;
+    if (st) {
+      [enc setFragmentSamplerState:sm atIndex:idx];
+    } else {
+      [enc setVertexSamplerState:sm atIndex:idx];
+    }
+  }
+  // Bytes slot `which` (0 user data, 1 draw constants) at buffer index idx.
+  void BindBytes(u32 st, u32 which, const void *data, u32 len, u32 idx) {
+    if (len <= 64 && bound.has_bytes[st][which] && !std::memcmp(bound.bytes[st][which], data, len)) {
+      return;
+    }
+    if (len <= 64) {
+      std::memcpy(bound.bytes[st][which], data, len);
+      bound.has_bytes[st][which] = true;
+    }
+    bound.buf[st][idx] = nil; // bytes replace any buffer there
+    if (st) {
+      [enc setFragmentBytes:data length:len atIndex:idx];
+    } else {
+      [enc setVertexBytes:data length:len atIndex:idx];
+    }
+  }
   struct PassState {
     u64 color[8] = {};
     u32 slice[8] = {};
@@ -597,6 +660,23 @@ struct MetalRenderer::Impl {
   // DC_CPU_PROFILE: where the CPU time of a frame goes.
   bool cpu_profile = false;
   double cpu_draw_s = 0, cpu_resolve_s = 0, cpu_hash_s = 0, cpu_upload_s = 0;
+  // DC_CPU_PROFILE: time of each section of Draw (see DrawLap).
+  static constexpr const char *kDrawSections[] = {"entry", "attachments", "shaders", "resources",
+                                                 "functions", "pipeline", "fixed", "bindings"};
+  double cpu_section_s[8] = {};
+  std::chrono::steady_clock::time_point draw_lap;
+  u32 draw_section = 0;
+  void DrawLap(u32 next) {
+    if (!cpu_profile) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (next) {
+      cpu_section_s[draw_section] += std::chrono::duration<double>(now - draw_lap).count();
+    }
+    draw_lap = now;
+    draw_section = next;
+  }
   double cpu_other_s = 0; // CPU time outside draws (CP parsing, submits, flips)
   double cpu_gettex_s = 0; // part of resolve spent in GetTexture
   double cpu_sampler_s = 0; // part of resolve spent in GetSampler
@@ -2703,6 +2783,7 @@ struct MetalRenderer::Impl {
       a.endOfFragmentSampleIndex = sample % kTsPerBuf + 3;
     }
     enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    bound = {};
     if (stats) {
       ++stat_passes;
       if (ps == last_pass && last_end_ra) {
@@ -3188,6 +3269,7 @@ struct MetalRenderer::Impl {
 
 void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   CpuTimer draw_timer(cpu_profile ? &cpu_draw_s : nullptr);
+  DrawLap(0);
   ++draw_count;
   ++stat_draws;
   ++work_since_commit;
@@ -3235,6 +3317,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   }
 
   // ---- attachments ----
+  DrawLap(1);
   if (cb_mode == 2 || cb_mode == 5) { // fast-clear eliminate / FMASK decompress
     EliminateFastClear(r);
     return;
@@ -3345,6 +3428,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     return;
   }
   // ---- shaders ----
+  DrawLap(2);
   const u32 *vs_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_VS_0);
   const u32 *ps_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_PS_0);
   Program *vs = GetProgram(Stage::Vertex, vs_addr, vs_ud,
@@ -3394,6 +3478,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     }
   }
   // ---- resources ----
+  DrawLap(3);
   std::vector<TextureType> &vs_types = draw_vs_types;
   std::vector<TextureType> &ps_types = draw_ps_types;
   Resources &vs_res = draw_vs_res, &ps_res = draw_ps_res;
@@ -3456,6 +3541,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   }
 
   // ---- functions ----
+  DrawLap(4);
   // DC_PROBE_CB=<addr>: with DC_PROBE=*:nan, only draws into that color target.
   static const u64 probe_cb =
       std::getenv("DC_PROBE_CB")
@@ -3579,6 +3665,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   }
 
   // ---- pipeline ----
+  DrawLap(5);
   PipelineKey pk;
   pk.vs = vlayout ? Hash(vlayout, vs_key) : vs_key; // formats and strides live in the pipeline
   pk.ps = ps_key;
@@ -3699,6 +3786,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   }
 
   // ---- fixed function ----
+  DrawLap(6);
   Rect sc{0, 0, static_cast<s32>(pass_width), static_cast<s32>(pass_height)};
   sc = Intersect(sc, ScissorReg(r[Reg::PA_SC_SCREEN_SCISSOR_TL],
                                 r[Reg::PA_SC_SCREEN_SCISSOR_BR]));
@@ -3807,8 +3895,10 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   consts.vte = vte;
 
   // ---- bindings ----
-  if (const char *mt = std::getenv("DC_DEBUG_MEMTEST")) {
-    const u64 a = std::strtoull(mt, nullptr, 16);
+  DrawLap(7);
+  static const char *memtest = std::getenv("DC_DEBUG_MEMTEST");
+  if (memtest) {
+    const u64 a = std::strtoull(memtest, nullptr, 16);
     MemTest(a ? a : vs_addr);
   }
   u32 vud[16], pud[16];
@@ -3819,32 +3909,31 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     PatchUserData(pud);
   }
   UpdateMemMap();
-  [enc setVertexBytes:vud length:64 atIndex:Shader::Binding::UserData];
-  [enc setVertexBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
-  [enc setVertexBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
-  [enc setVertexBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
+  static_assert(sizeof(consts) <= 64);
+  BindBytes(0, 0, vud, 64, Shader::Binding::UserData);
+  BindBuffer(0, mem[0], 0, Shader::Binding::Mem0);
+  BindBuffer(0, mem[1], 0, Shader::Binding::Mem1);
+  BindBuffer(0, mem_map, 0, Shader::Binding::MemMap);
   for (u32 k = 0; k < nvbufs; ++k) {
-    [enc setVertexBuffer:vbufs[k].buf offset:vbufs[k].off atIndex:kVertexBufferBase + k];
+    BindBuffer(0, vbufs[k].buf, vbufs[k].off, kVertexBufferBase + k);
   }
-  [enc setVertexBytes:&consts
-               length:sizeof(consts)
-              atIndex:Shader::Binding::Draw];
+  BindBytes(0, 1, &consts, sizeof(consts), Shader::Binding::Draw);
   for (u32 k = 0; k < vs_res.tex.size(); ++k) {
-    [enc setVertexTexture:vs_res.tex[k] atIndex:k];
+    BindTexture(0, vs_res.tex[k], k);
   }
   for (u32 u = 0; u < vs_res.smp.size() && u < 16; ++u) {
-    [enc setVertexSamplerState:vs_res.smp[u] atIndex:u];
+    BindSampler(0, vs_res.smp[u], u);
   }
   if (ps) {
-    [enc setFragmentBytes:pud length:64 atIndex:Shader::Binding::UserData];
-    [enc setFragmentBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
-    [enc setFragmentBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
-    [enc setFragmentBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
+    BindBytes(1, 0, pud, 64, Shader::Binding::UserData);
+    BindBuffer(1, mem[0], 0, Shader::Binding::Mem0);
+    BindBuffer(1, mem[1], 0, Shader::Binding::Mem1);
+    BindBuffer(1, mem_map, 0, Shader::Binding::MemMap);
     for (u32 k = 0; k < ps_res.tex.size(); ++k) {
-      [enc setFragmentTexture:ps_res.tex[k] atIndex:k];
+      BindTexture(1, ps_res.tex[k], k);
     }
     for (u32 u = 0; u < ps_res.smp.size() && u < 16; ++u) {
-      [enc setFragmentSamplerState:ps_res.smp[u] atIndex:u];
+      BindSampler(1, ps_res.smp[u], u);
     }
     if (depth_bounds) {
       const float zb[2] = {r.F(Reg::DB_DEPTH_BOUNDS_MIN),
@@ -3856,20 +3945,18 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       [enc setFragmentBytes:zb
                      length:sizeof(zb)
                     atIndex:Shader::kDepthBoundsBuffer];
-      [enc setFragmentTexture:depth->bounds_copy
-                      atIndex:Shader::kDepthBoundsTexture];
+      bound.buf[1][Shader::kDepthBoundsBuffer] = nil;
+      BindTexture(1, depth->bounds_copy, Shader::kDepthBoundsTexture);
     }
     if (probe_slot >= 0) {
-      [enc setFragmentBuffer:probe_buf
-                      offset:u64(probe_slot) * Shader::kProbeWords * 4
-                     atIndex:Shader::kProbeBinding];
+      BindBuffer(1, probe_buf, u64(probe_slot) * Shader::kProbeWords * 4, Shader::kProbeBinding);
     }
   }
 
   if (capture) {
     debug_vs_buf = [device newBufferWithLength:64 * 16
                                        options:MTLResourceStorageModeShared];
-    [enc setVertexBuffer:debug_vs_buf offset:0 atIndex:6];
+    BindBuffer(0, debug_vs_buf, 0, 6);
     DC_INFO("gpu: capturing VS %#llx ud: %08x %08x %08x %08x %08x %08x %08x "
             "%08x %08x %08x %08x %08x %08x %08x %08x %08x",
             vs_addr, vs_ud[0], vs_ud[1], vs_ud[2], vs_ud[3], vs_ud[4], vs_ud[5],
@@ -4383,6 +4470,14 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
                 cpu_notework_s * 1e3 / frames,
                 (wall - draw - cpu_flip_s * 1e3 / frames -
                  cpu_commit_s * 1e3 / frames - cpu_notework_s * 1e3 / frames));
+        std::string sec;
+        for (u32 k = 0; k < 8; ++k) {
+          char b[48];
+          std::snprintf(b, sizeof(b), " %s %.1f", kDrawSections[k], cpu_section_s[k] * 1e3 / frames);
+          sec += b;
+          cpu_section_s[k] = 0;
+        }
+        DC_INFO("cpu profile:   draw sections (ms/frame, from each marker to the next):%s", sec.c_str());
         cpu_draw_s = cpu_resolve_s = cpu_hash_s = cpu_upload_s = 0;
         cpu_gettex_s = cpu_notework_s = cpu_flip_s = cpu_commit_s = 0;
         cpu_sampler_s = cpu_sgpr_s = 0;
