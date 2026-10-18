@@ -224,6 +224,69 @@ kernel void fill32(device uint* dst [[buffer(0)]], constant uint2& vc [[buffer(1
                    uint i [[thread_position_in_grid]]) {
     if (i < vc.y) dst[i] = vc.x;
 }
+// HTILE (depth with stencil) from the real depth: per 8x8 tile, ZRANGE base
+// (min Z, 14 bits, [31:18]) and a 6-bit code ([17:12]) whose delta table is
+// the one the game decodes (max Z = base + delta + 1); ZMASK expanded. The
+// address is the tile swizzle the game's light culling computes.
+// p: width and height in tiles, dwords available, clear depth bits when the
+// surface reads as its clear value (else ~0).
+constant uint kZDelta[64] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 51, 55, 59, 63, 79, 95, 111,
+    127, 159, 191, 223, 255, 319, 383, 447, 511, 639, 767, 895, 1023, 1279, 1535,
+    1791, 2047, 2559, 3071, 3583, 4095, 5119, 6143, 7167, 8191, 10239, 12287, 14335,
+    16383};
+kernel void htile_build(depth2d<float> z [[texture(0)]], device uint* dst [[buffer(0)]],
+                        constant uint4& p [[buffer(1)]], uint2 t [[thread_position_in_grid]]) {
+    if (t.x >= p.x || t.y >= p.y) return;
+    float lo = 1.0, hi = 0.0;
+    if (p.w != 0xffffffffu) {
+        lo = hi = as_type<float>(p.w);
+    } else {
+        uint2 last = uint2(z.get_width() - 1, z.get_height() - 1);
+        for (uint j = 0; j < 8; ++j) {
+            for (uint i = 0; i < 8; ++i) {
+                float d = z.read(min(t * 8u + uint2(i, j), last));
+                lo = min(lo, d);
+                hi = max(hi, d);
+            }
+        }
+    }
+    uint base = uint(floor(saturate(lo) * 16383.0));
+    uint need = uint(ceil(saturate(hi) * 16383.0));
+    uint c = 0;
+    while (c < 63 && base + kZDelta[c] + 1 < need) ++c;
+    uint x = t.x, y = t.y, mw = (p.x + 63) >> 6;
+    uint low = ((32 * ((y >> 2) & 15) + 2 * ((x >> 2) & 15)) & ~3u) | (((x >> 1) ^ y) & 1) |
+               (((x >> 1) & 1) << 1);
+    uint a = 4 * (((y >> 6) * mw + (x >> 6)) * 512 + low);
+    uint pipe = ((x ^ y ^ (x >> 1)) & 1) | ((((x >> 1) ^ (y >> 1)) & 1) << 1) |
+                ((((x >> 2) ^ (y >> 2)) & 1) << 2);
+    uint i = ((a & 0xff) + pipe * 256 + (a >> 8) * 2048) >> 2;
+    if (i < p.z) dst[i] = (base << 18) | (c << 12) | 0xFu;
+}
+// DC_SCAN_MAX: the largest finite-or-not channel of a target (all slices and
+// levels), then where it is. o: [max bits, x, y, slice, level, r, g, b].
+static inline uint scan_bits(float4 c) {
+    float m = max(c.x, max(c.y, c.z));
+    return isnan(m) || isinf(m) ? 0x7f800000u : (m > 0.0 ? as_type<uint>(m) : 0u);
+}
+kernel void scan_val(texture2d_array<float, access::read> t [[texture(0)]],
+                     device atomic_uint* o [[buffer(0)]], constant uint& lv [[buffer(1)]],
+                     uint3 g [[thread_position_in_grid]]) {
+    if (g.x >= t.get_width(lv) || g.y >= t.get_height(lv) || g.z >= t.get_array_size()) return;
+    atomic_fetch_max_explicit(&o[0], scan_bits(t.read(g.xy, g.z, lv)), memory_order_relaxed);
+}
+kernel void scan_loc(texture2d_array<float, access::read> t [[texture(0)]],
+                     device uint* o [[buffer(0)]], constant uint& lv [[buffer(1)]],
+                     uint3 g [[thread_position_in_grid]]) {
+    if (g.x >= t.get_width(lv) || g.y >= t.get_height(lv) || g.z >= t.get_array_size()) return;
+    float4 c = t.read(g.xy, g.z, lv);
+    uint b = scan_bits(c);
+    if (b != 0u && b == o[0]) {
+        o[1] = g.x; o[2] = g.y; o[3] = g.z; o[4] = lv;
+        o[5] = as_type<uint>(c.x); o[6] = as_type<uint>(c.y); o[7] = as_type<uint>(c.z);
+    }
+}
 fragment float4 copy_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]],
                         constant float2& scale [[buffer(0)]]) {
     constexpr sampler s(filter::nearest, address::clamp_to_edge);
@@ -245,6 +308,14 @@ struct MetalRenderer::Impl {
   u64 mem_map_gen = ~0ull;
   std::vector<Core::Memory::DirectRange> mem_ranges; // sorted by start
   id<MTLComputePipelineState> fill_pipeline = nil;
+  id<MTLComputePipelineState> htile_pipeline = nil;
+  id<MTLComputePipelineState> scan_val_pipeline = nil, scan_loc_pipeline = nil;
+  // DC_SCAN_MAX=<addr>[,<addr>...]: in the traced frame, after every pass or
+  // dispatch writing a color target at one of these addresses, log its
+  // largest value and where it is (finds where a blown-up value appears).
+  std::vector<u64> scan_addrs;
+  std::unordered_map<const void *, u64> scan_seen; // target -> written seq
+  std::string scan_label;
 
   // ---- recording ----
   id<MTLCommandBuffer> cmd = nil;
@@ -366,6 +437,7 @@ struct MetalRenderer::Impl {
   struct Meta {
     u64 target = 0;
     bool depth = false;
+    u32 width = 0, height = 0; // of the surface: one address can hold several
   };
   std::unordered_map<u64, Meta> metas;
 
@@ -595,11 +667,15 @@ struct MetalRenderer::Impl {
       if (*q == ':') {
         probe.pc = std::strtoul(q + 1, &q, 16);
       }
-      // '*': any pixel; 'nan<k>': the first whose vk is NaN/Inf
+      // '*': any pixel; 'nan<k>': the first whose vk is NaN/Inf; 'big<k>': the
+      // first whose vk is above 10000 or not finite
       if (*q == ':' && q[1] == '*') {
         probe.x = ~0u;
       } else if (*q == ':' && !std::strncmp(q + 1, "nan", 3)) {
         probe.x = ~1u;
+        probe.y = std::strtoul(q + 4, &q, 10);
+      } else if (*q == ':' && !std::strncmp(q + 1, "big", 3)) { // |vk| > 10000
+        probe.x = ~2u;
         probe.y = std::strtoul(q + 4, &q, 10);
       } else {
         probe.x = *q == ':' ? std::strtoul(q + 1, &q, 10) : 0;
@@ -698,6 +774,25 @@ struct MetalRenderer::Impl {
     fill_pipeline = [device
         newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fill32"]
                                       error:&err];
+    htile_pipeline = [device
+        newComputePipelineStateWithFunction:[lib newFunctionWithName:@"htile_build"]
+                                      error:&err];
+    if (!htile_pipeline) {
+      DC_ERROR("gpu: htile pipeline: %s", err.localizedDescription.UTF8String);
+    }
+    if (const char *e = std::getenv("DC_SCAN_MAX")) {
+      for (const char *q = e; *q;) {
+        char *end = nullptr;
+        scan_addrs.push_back(std::strtoull(q, &end, 16));
+        q = *end ? end + 1 : end;
+      }
+      scan_val_pipeline = [device
+          newComputePipelineStateWithFunction:[lib newFunctionWithName:@"scan_val"]
+                                        error:&err];
+      scan_loc_pipeline = [device
+          newComputePipelineStateWithFunction:[lib newFunctionWithName:@"scan_loc"]
+                                        error:&err];
+    }
     if (!copy_pipeline) {
       DC_ERROR("gpu: copy pipeline: %s", err.localizedDescription.UTF8String);
     }
@@ -912,6 +1007,65 @@ struct MetalRenderer::Impl {
       }
     }
     pass = {};
+    if (trace && !scan_addrs.empty()) {
+      ScanMax();
+    }
+  }
+
+  void ScanMax() {
+    for (u64 a : scan_addrs) {
+      auto it = color_targets.find(a);
+      if (it == color_targets.end() || !scan_val_pipeline || !scan_loc_pipeline) {
+        continue;
+      }
+      for (auto &t : it->second) {
+        RenderTarget *rt = t.get();
+        if (scan_seen[rt] == rt->written || !rt->tex) {
+          continue;
+        }
+        scan_seen[rt] = rt->written;
+        id<MTLTexture> v = rt->tex;
+        if (v.textureType == MTLTextureType2D) {
+          v = [v newTextureViewWithPixelFormat:v.pixelFormat
+                                   textureType:MTLTextureType2DArray
+                                        levels:NSMakeRange(0, v.mipmapLevelCount)
+                                        slices:NSMakeRange(0, 1)];
+        } else if (v.textureType != MTLTextureType2DArray) {
+          continue;
+        }
+        id<MTLBuffer> b = [device newBufferWithLength:32
+                                              options:MTLResourceStorageModeShared];
+        std::memset(b.contents, 0, 32);
+        EnsureCommandBuffer();
+        id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+        [e setTexture:v atIndex:0];
+        [e setBuffer:b offset:0 atIndex:0];
+        for (id<MTLComputePipelineState> ps : {scan_val_pipeline, scan_loc_pipeline}) {
+          [e setComputePipelineState:ps];
+          for (u32 l = 0; l < v.mipmapLevelCount; ++l) {
+            [e setBytes:&l length:4 atIndex:1];
+            [e dispatchThreads:MTLSizeMake(std::max<u64>(1, v.width >> l),
+                                           std::max<u64>(1, v.height >> l),
+                                           v.arrayLength)
+                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+          }
+        }
+        [e endEncoding];
+        __block std::string what = scan_label;
+        const u64 addr = a;
+        const u32 w = rt->width, h = rt->height;
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+          const u32 *o = static_cast<const u32 *>(b.contents);
+          float c[4];
+          std::memcpy(c, o, 4);
+          std::memcpy(c + 1, o + 5, 12);
+          DC_INFO("gpu: scan %#llx %ux%u after %s: max %g at %u,%u slice %u level %u "
+                  "rgb %g %g %g",
+                  (unsigned long long)addr, w, h, what.c_str(), c[0], o[1], o[2], o[3],
+                  o[4], c[1], c[2], c[3]);
+        }];
+      }
+    }
   }
 
   // DC_DUMP_PASSES: small BGRA copies of the targets of the pass just ended.
@@ -1797,8 +1951,31 @@ struct MetalRenderer::Impl {
       }
     }
 
-    // Render-to-texture: sample the render target directly.
-    if (!storage) {
+    // Render-to-texture: sample the render target directly. A block-compressed
+    // T# over a target of one texel per block (a shader encoding BC blocks,
+    // e.g. the cars' liveries): those blocks as a BC texture; over any other
+    // target, the guest memory (the target's texels are not BC data).
+    if (!storage && fi.compressed && tt.dim == TexDim::Tex2D) {
+      if (RenderTarget *rt = Latest(color_targets, addr, tt.dim)) {
+        if (id<MTLTexture> bc = BlocksAsCompressed(*rt, fi, width, height,
+                                                   last_level + 1)) {
+          if (base_level == 0 && last_level + 1 >= bc.mipmapLevelCount &&
+              swz == kIdentitySwizzle) {
+            return bc;
+          }
+          const u32 levels = std::min<u32>(last_level + 1, bc.mipmapLevelCount);
+          return [bc newTextureViewWithPixelFormat:bc.pixelFormat
+                                       textureType:MTLTextureType2D
+                                            levels:NSMakeRange(std::min(base_level, levels - 1),
+                                                               levels - std::min(base_level, levels - 1))
+                                            slices:NSMakeRange(0, 1)
+                                           swizzle:MTLTextureSwizzleChannelsMake(
+                                                       Swizzle(swz), Swizzle(swz >> 3),
+                                                       Swizzle(swz >> 6), Swizzle(swz >> 9))];
+        }
+      }
+    }
+    if (!storage && !fi.compressed) {
       // As shadPS4's image views: the T# format (same texel size) and swizzle.
       if (RenderTarget *rt =
               Latest(color_targets, addr, tt.dim, width, height)) {
@@ -2219,6 +2396,81 @@ struct MetalRenderer::Impl {
     return *list.back();
   }
 
+  // `rt` holds BC blocks, one per texel (a shader compressed a texture into
+  // it): a `fi.format` texture of width x height with those blocks, copied
+  // again whenever `rt` is written. nil when the shapes do not match.
+  struct BcCopy {
+    id<MTLTexture> tex = nil;
+    u64 written = ~0ull;
+  };
+  std::unordered_map<const RenderTarget *, BcCopy> bc_copies;
+
+  id<MTLTexture> BlocksAsCompressed(RenderTarget &rt, const TextureFormatInfo &fi,
+                                    u32 width, u32 height, u32 levels) {
+    if (!rt.tex || rt.tex.textureType != MTLTextureType2D ||
+        PixelBytes(rt.tex.pixelFormat) != fi.bytes_per_block ||
+        rt.width != (width + 3) / 4 || rt.height != (height + 3) / 4) {
+      return nil;
+    }
+    levels = std::clamp<u32>(std::min<u32>(levels, rt.levels), 1,
+                             1 + static_cast<u32>(std::log2(std::max(width, height))));
+    BcCopy &c = bc_copies[&rt];
+    if (c.tex && c.written == rt.written && c.tex.mipmapLevelCount == levels) {
+      return c.tex;
+    }
+    if (!c.tex || c.tex.mipmapLevelCount != levels || c.tex.pixelFormat != fi.format) {
+      MTLTextureDescriptor *d =
+          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fi.format
+                                                             width:width
+                                                            height:height
+                                                         mipmapped:levels > 1];
+      d.mipmapLevelCount = levels;
+      d.storageMode = MTLStorageModePrivate;
+      d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+      c.tex = [device newTextureWithDescriptor:d];
+      if (!c.tex) {
+        return nil;
+      }
+    }
+    c.written = rt.written;
+    u64 total = 0;
+    for (u32 l = 0; l < levels; ++l) {
+      total += u64(std::max<u32>(1, rt.width >> l)) * std::max<u32>(1, rt.height >> l) *
+               fi.bytes_per_block;
+    }
+    id<MTLBuffer> buf = [device newBufferWithLength:total options:MTLResourceStorageModePrivate];
+    EndPass();
+    EnsureCommandBuffer();
+    id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+    u64 off = 0;
+    for (u32 l = 0; l < levels; ++l) {
+      const u32 bw = std::max<u32>(1, rt.width >> l), bh = std::max<u32>(1, rt.height >> l);
+      const u64 row = u64(bw) * fi.bytes_per_block;
+      [b copyFromTexture:rt.tex
+                   sourceSlice:0
+                   sourceLevel:l
+                  sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:MTLSizeMake(bw, bh, 1)
+                      toBuffer:buf
+             destinationOffset:off
+        destinationBytesPerRow:row
+      destinationBytesPerImage:row * bh];
+      [b copyFromBuffer:buf
+                 sourceOffset:off
+            sourceBytesPerRow:row
+          sourceBytesPerImage:row * bh
+                   sourceSize:MTLSizeMake(std::max<u32>(1, width >> l),
+                                          std::max<u32>(1, height >> l), 1)
+                    toTexture:c.tex
+             destinationSlice:0
+             destinationLevel:l
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+      off += row * bh;
+    }
+    [b endEncoding];
+    return c.tex;
+  }
+
   // Levels [base, base + count) and, for arrays, slices [sbase, sbase + scount)
   // of `rt` (the texture itself when that is all of it).
   static constexpr u32 kIdentitySwizzle = 0xFAC; // T# DST_SEL x=R y=G z=B w=A
@@ -2275,15 +2527,47 @@ struct MetalRenderer::Impl {
     return GetTarget(depth_targets, addr, fmt, width, height, true);
   }
 
-  void NoteMeta(u64 meta, u64 target, bool depth) {
+  void NoteMeta(u64 meta, u64 target, bool depth, u32 width = 0, u32 height = 0) {
     if (meta) {
-      metas[meta] = {target, depth};
+      metas[meta] = {target, depth, width, height};
     }
   }
 
   // A fill or a clear shader rewrote metadata in [addr, addr + bytes):
   // the surfaces it describes now read as their clear value.
   bool expanding_htile = false;
+
+  // HTILE at guest [base, base + bytes) from the depth surface `m` describes
+  // (see htile_build). DC_HTILE_FULL_RANGE keeps the old full-range fill.
+  bool BuildHtile(u64 base, u64 bytes, const Meta &m) {
+    static const bool full = std::getenv("DC_HTILE_FULL_RANGE") != nullptr;
+    RenderTarget *z = full || !htile_pipeline
+                          ? nullptr
+                          : Latest(depth_targets, m.target, std::nullopt, m.width, m.height);
+    id<MTLBuffer> buf = nil;
+    u64 off = 0;
+    if (!z || !z->tex || z->width != m.width || z->height != m.height ||
+        z->tex.textureType != MTLTextureType2D ||
+        z->tex.sampleCount != 1 || !Locate(base, bytes, &buf, &off)) {
+      return false;
+    }
+    const float clear = static_cast<float>(z->clear_depth);
+    u32 p[4] = {(z->width + 7) / 8, (z->height + 7) / 8, static_cast<u32>(bytes / 4), ~0u};
+    if (!z->initialized || z->clear_pending) {
+      std::memcpy(&p[3], &clear, 4);
+    }
+    EndPass();
+    EnsureCommandBuffer();
+    id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+    [e setComputePipelineState:htile_pipeline];
+    [e setTexture:z->tex atIndex:0];
+    [e setBuffer:buf offset:off atIndex:0];
+    [e setBytes:p length:sizeof(p) atIndex:1];
+    [e dispatchThreads:MTLSizeMake(p[0], p[1], 1)
+        threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [e endEncoding];
+    return true;
+  }
 
   bool MarkMetaCleared(u64 addr, u64 bytes) {
     bool any = false;
@@ -2906,6 +3190,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   ++work_since_commit;
   const u64 vs_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS);
   const u64 ps_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS);
+  if (trace && !scan_addrs.empty()) {
+    scan_label = "pass with draw #" + std::to_string(draw_count) + " ps " + Hex(ps_addr);
+  }
   const u32 cb_mode = Bits(r[Reg::CB_COLOR_CONTROL], 4, 3);
   const u32 db_render = r[Reg::DB_RENDER_CONTROL];
   const u32 db_control = r[Reg::DB_DEPTH_CONTROL];
@@ -3022,7 +3309,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       depth->clear_depth = r.F(Reg::DB_DEPTH_CLEAR);
       depth->clear_stencil = r[Reg::DB_STENCIL_CLEAR] & 0xFF;
       if (ZInfo::TileSurface(z_info)) {
-        NoteMeta(u64(r[Reg::DB_HTILE_DATA_BASE]) << 8, zbase, true);
+        NoteMeta(u64(r[Reg::DB_HTILE_DATA_BASE]) << 8, zbase, true, w, h);
       }
     } else {
       depth_fmt = MTLPixelFormatInvalid;
@@ -3671,6 +3958,9 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     return;
   }
   ++stat_dispatches;
+  if (trace && !scan_addrs.empty()) {
+    scan_label = "dispatch cs " + Hex(addr);
+  }
   if (trace) {
     static const u64 peek_cs =
         std::getenv("DC_PEEK_CS")
@@ -3747,9 +4037,10 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
       return;
     }
   }
-  // A shader reading HTILE (e.g. per-tile depth bounds for light culling)
-  // would see stale memory: depth lives in Metal textures. Give it expanded
-  // tiles with the full Z range, so nothing is culled by mistake.
+  // A shader reading HTILE (per-tile depth bounds for light culling) would
+  // see stale memory: depth lives in Metal textures. Build it from the depth
+  // texture, so light culling gets real per-tile depth bounds; failing that,
+  // expanded tiles with the full Z range (nothing culled).
   for (u32 k = 0; k + 3 < 16 && !metas.empty(); ++k) {
     const u64 base =
         (u64(ud[k]) | (u64(ud[k + 1] & 0xFFF) << 32)) & kGpuAddrMask;
@@ -3759,7 +4050,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     }
     const u32 stride = (ud[k + 1] >> 16) & 0x3FFF;
     const u64 bytes = u64(ud[k + 2]) * (stride ? stride : 1);
-    if (bytes && bytes < (64ull << 20)) {
+    if (bytes && bytes < (64ull << 20) && !BuildHtile(base, bytes, m->second)) {
       expanding_htile = true; // our own fill, not the game clearing depth
       DmaData(0, base, 2, 0xFFFC000Fu, static_cast<u32>(bytes & ~3ull));
       expanding_htile = false;
@@ -4181,6 +4472,9 @@ void MetalRenderer::Draw(const RegFile &regs, const DrawCall &draw) {
                    regs.ProgramAddr(Liverpool::Reg::SPI_SHADER_PGM_LO_PS),
                    draw.count, draw.instances, draw.indexed);
     impl->Draw(regs, draw);
+    if (impl->trace && !impl->scan_addrs.empty()) {
+      impl->EndPass(); // DC_SCAN_MAX: scan after every draw
+    }
     if (impl->pass_timing && impl->enc && !impl->ts_cmd.empty() &&
         !impl->ts_cmd.back().compute) {
       Impl::TsPass &t = impl->ts_cmd.back();

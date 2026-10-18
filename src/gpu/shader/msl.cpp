@@ -1658,10 +1658,12 @@ std::string Emitter::Run() {
     if (probe) {
         // x == ~0: the first invocation to get there (any pixel / lane).
         // x == ~0: the first invocation to get there (any pixel / lane); x == ~1: the
-        // first one whose v[probe_y] is NaN or infinite.
-        const bool any = o.probe_x == ~0u || o.probe_x == ~1u;
+        // first one whose v[probe_y] is NaN or infinite; x == ~2: above 10000 or not finite.
+        const bool any = o.probe_x == ~0u || o.probe_x == ~1u || o.probe_x == ~2u;
         const std::string first = "atomic_exchange_explicit((device atomic_uint*)&dbg[7], 1u, memory_order_relaxed) == 0u";
-        std::string dump = o.probe_x == ~1u ? "    if (!isfinite(as_type<float>(v" + N(o.probe_y) + ")) && " + first + ") {"
+        const std::string vy = "as_type<float>(v" + N(o.probe_y) + ")";
+        std::string dump = o.probe_x == ~1u ? "    if (!isfinite(" + vy + ") && " + first + ") {"
+                         : o.probe_x == ~2u ? "    if ((!isfinite(" + vy + ") || abs(" + vy + ") > 10000.0f) && " + first + ") {"
                          : any ? "    if (" + first + ") {"
                          : p.stage == Stage::Fragment
                              ? "    if (uint(pin.pos.x) == " + N(o.probe_x) + "u && uint(pin.pos.y) == " + N(o.probe_y) + "u) {"
