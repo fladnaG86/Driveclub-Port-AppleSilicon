@@ -1,5 +1,14 @@
 # Driveclub Native
 
+> **Apple Silicon fork.** This repository is a fork of
+> [BlackLineInteractive/Driveclub-Port](https://github.com/BlackLineInteractive/Driveclub-Port)
+> that runs the macOS backend on **Apple Silicon Macs under Rosetta 2**
+> (playable races, ~25 fps on an M1 Max), with many GPU fixes and performance work.
+> What was done, how to build it and what is left:
+> **[docs/APPLE_SILICON.md](docs/APPLE_SILICON.md)** · in italiano:
+> **[docs/APPLE_SILICON.it.md](docs/APPLE_SILICON.it.md)**.
+> The rest of this README is upstream's.
+
 [![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtube.com/@blacklineinteractive)
 
 ![LOGO](media/logo.png)
