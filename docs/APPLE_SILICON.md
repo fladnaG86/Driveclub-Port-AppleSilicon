@@ -33,6 +33,9 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
 
 ## Build and run
 
+**Prebuilt:** download the zip from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) (no build tools needed),
+then follow its README. To build it yourself:
+
 Requirements: Apple Silicon Mac with Rosetta 2, Xcode (command line tools),
 CMake >= 3.24, Ninja, and **an x86_64 build of SDL3** (Homebrew's SDL3 on Apple
 Silicon is arm64 and cannot be linked into an x86_64 binary).

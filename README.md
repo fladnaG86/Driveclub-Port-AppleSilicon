@@ -4,7 +4,7 @@
 > [BlackLineInteractive/Driveclub-Port](https://github.com/BlackLineInteractive/Driveclub-Port)
 > that runs the macOS backend on **Apple Silicon Macs under Rosetta 2**
 > (playable races, ~25 fps on an M1 Max), with many GPU fixes and performance work.
-> What was done, how to build it and what is left:
+> **Prebuilt download:** [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest). What was done, how to build it and what is left:
 > **[docs/APPLE_SILICON.md](docs/APPLE_SILICON.md)** · in italiano:
 > **[docs/APPLE_SILICON.it.md](docs/APPLE_SILICON.it.md)**.
 > The rest of this README is upstream's.

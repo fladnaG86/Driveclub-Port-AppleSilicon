@@ -34,6 +34,9 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
 
 ## Compilare e avviare
 
+**Build pronta:** scarica lo zip dalle [Release](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) (non servono strumenti di
+sviluppo) e segui il suo README. Per compilarlo da sé:
+
 Servono: Mac Apple Silicon con Rosetta 2, Xcode (command line tools),
 CMake >= 3.24, Ninja e **SDL3 compilato per x86_64** (l'SDL3 di Homebrew su
 Apple Silicon è arm64 e non si può collegare a un binario x86_64).
