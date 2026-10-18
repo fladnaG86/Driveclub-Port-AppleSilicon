@@ -9,6 +9,10 @@
 > **[docs/APPLE_SILICON.it.md](docs/APPLE_SILICON.it.md)**.
 > The rest of this README is upstream's.
 
+[![Driveclub racing on an M1 Max under Rosetta 2 (click to play the video)](media/apple-silicon-race.jpg)](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/apple-silicon-video/driveclub-apple-silicon.mp4)
+
+*Gameplay on a MacBook Pro M1 Max under Rosetta 2. Click the image to play the video (MP4, 2:32).*
+
 [![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtube.com/@blacklineinteractive)
 
 ![LOGO](media/logo.png)

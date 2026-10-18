@@ -11,6 +11,10 @@ backend su **Apple Silicon**, eseguendo l'intero processo x86-64 sotto
 Tutto è stato sviluppato e misurato su **una sola macchina: MacBook Pro M1 Max,
 macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati provati.
 
+[![Driveclub on Apple Silicon](../media/apple-silicon-race.jpg)](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/apple-silicon-video/driveclub-apple-silicon.mp4)
+
+*Gameplay su MacBook Pro M1 Max sotto Rosetta 2 — clicca per vedere il video (MP4, 2:32).*
+
 ## Stato
 
 | Area | Stato |
