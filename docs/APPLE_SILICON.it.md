@@ -18,7 +18,7 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
 
 [![Driveclub on Apple Silicon](../media/apple-silicon-race.jpg)](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/apple-silicon-video/driveclub-apple-silicon.mp4)
 
-*Gameplay su MacBook Pro M1 Max sotto Rosetta 2 — clicca per vedere il video (MP4, 2:32). Gli "FPS" nel titolo della finestra in questa registrazione contavano i refresh della finestra, non i frame del gioco (ora corretto); il gioco gira a ~25 fps.*
+*Gameplay su MacBook Pro M1 Max sotto Rosetta 2 — clicca per vedere il video (MP4, 2:32). Gli "FPS" nel titolo della finestra in questa registrazione contavano i refresh della finestra, non i frame del gioco (ora corretto); il gioco gira a ~26-28 fps.*
 
 ## Stato
 
@@ -29,7 +29,7 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
 | Audio | Funziona |
 | Input | DualShock/DualSense via SDL3, oppure tastiera (vedi sotto) |
 | Grafica | Le scene di gara sono corrette, per quanto confrontato con video PS4; vedi *Lacune note* |
-| Prestazioni | ~24-25 fps in gara a 1920x1080 (M1 Max); erano ~12 fps all'inizio del lavoro |
+| Prestazioni | ~26-28 fps in gara a 1920x1080 (M1 Max); erano ~12 fps all'inizio del lavoro |
 | Stabilità | Gare di diversi minuti senza crash; un watchdog GPU chiude il processo in modo pulito se uno shader si blocca |
 
 ## Come giocare
@@ -39,9 +39,9 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
 1. **Controlla i requisiti.** Un Mac Apple Silicon e **la tua copia di Driveclub
    v1.28 (CUSA00003)**, decrittata ed estratta in una cartella. Quella cartella
    contiene `eboot.bin` e `sce_sys/`. Altre versioni del gioco non partono.
-2. **Procurati il programma.** Scarica `driveclub-apple-silicon-v0.1.0.zip`
+2. **Procurati il programma.** Scarica `driveclub-apple-silicon-v0.1.1.zip`
    dalle [Release](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) e scompattalo, oppure compilalo (sezione successiva).
-3. **Apri il Terminale nella cartella del programma.** Per esempio `cd ~/Downloads/driveclub-apple-silicon-v0.1.0`.
+3. **Apri il Terminale nella cartella del programma.** Per esempio `cd ~/Downloads/driveclub-apple-silicon-v0.1.1`.
 4. **Solo la prima volta: togli la quarantena del download.** Il programma non è
    notarizzato da Apple, e senza questo passaggio macOS lo blocca:
    ```bash
@@ -148,7 +148,7 @@ I commit sono piccoli e con messaggi descrittivi (in inglese); questa è la mapp
 | Nessun controllo reale | Hot-plug controller SDL3, stick e grilletti analogici, guida da tastiera | 6be57f8 |
 | Varie | Callback di stato NP, modalità offline, valori realistici per `sceSystemServiceParamGetInt`, timestamp del pad | 28ef31f, ec6b002, a92baaf |
 
-### 4. Prestazioni: da ~12 a ~25 fps
+### 4. Prestazioni: da ~12 a ~27 fps
 
 Misure in gara, 1920x1080, M1 Max. Ogni passo è stato misurato A/B
 (`tools/bench_race.sh`); i numeri sono nei messaggi di commit.
@@ -163,6 +163,7 @@ Misure in gara, 1920x1080, M1 Max. Ogni passo è stato misurato A/B
 | Attributi dei vertici letti da un vertex descriptor Metal | stadio vertex 21 -> 12 ms/frame | 2b56ba0 |
 | Meno overhead CPU per draw (cache dei binding, meno allocazioni, controllo shader una volta per frame) | thread CP ~25 -> ~21 ms/frame | 0c3b904, 37d021e, 6b38290 |
 | **Basi di memoria tradotte dall'host** (sotto) | GPU 35.2 -> 27.2 ms/frame | d08a95f |
+| Risultati di Resolve riusati per programma e descrittori; basi di memoria tradotte una volta per draw | thread CP 22.7 -> 21.1 ms/frame, ~+1-2 fps | 4d6df28 |
 
 **Basi tradotte dall'host (d08a95f).** Gli shader accedono alla memoria guest
 tramite una page table. La cattura Xcode dello shader più pesante (il TAA,

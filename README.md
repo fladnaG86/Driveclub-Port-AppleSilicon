@@ -3,7 +3,7 @@
 > **Apple Silicon fork.** This repository is a fork of
 > [BlackLineInteractive/Driveclub-Port](https://github.com/BlackLineInteractive/Driveclub-Port)
 > that runs the macOS backend on **Apple Silicon Macs under Rosetta 2**
-> (playable races, ~25 fps on an M1 Max), with many GPU fixes and performance work.
+> (playable races, ~26-28 fps on an M1 Max), with many GPU fixes and performance work.
 > **Prebuilt download:** [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest). What was done, how to build it and what is left:
 > **[docs/APPLE_SILICON.md](docs/APPLE_SILICON.md)** · in italiano:
 > **[docs/APPLE_SILICON.it.md](docs/APPLE_SILICON.it.md)**.
@@ -15,7 +15,7 @@
 
 [![Driveclub racing on an M1 Max under Rosetta 2 (click to play the video)](media/apple-silicon-race.jpg)](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/apple-silicon-video/driveclub-apple-silicon.mp4)
 
-*Gameplay on a MacBook Pro M1 Max under Rosetta 2. Click the image to play the video (MP4, 2:32). The "FPS" in the window title of this recording counted window presents, not game frames (fixed since); the game runs at ~25 fps.*
+*Gameplay on a MacBook Pro M1 Max under Rosetta 2. Click the image to play the video (MP4, 2:32). The "FPS" in the window title of this recording counted window presents, not game frames (fixed since); the game runs at ~26-28 fps.*
 
 ## How to play on Apple Silicon
 
@@ -24,7 +24,7 @@
 You need a Mac with Apple Silicon and **your own copy of Driveclub v1.28 (CUSA00003)**,
 decrypted and extracted to a folder (the one with `eboot.bin`). No game files are included.
 
-1. Download `driveclub-apple-silicon-v0.1.0.zip` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) and unzip it.
+1. Download `driveclub-apple-silicon-v0.1.1.zip` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) and unzip it.
 2. Open Terminal in the unzipped folder.
 3. First time only (the program is not notarized): `xattr -dr com.apple.quarantine .`
    Accept if macOS offers to install Rosetta.
