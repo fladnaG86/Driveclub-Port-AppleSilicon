@@ -242,6 +242,7 @@ private:
     u32 max_vgpr = 0;
     bool uses_movrel = false;
     std::set<u32> ps_params; // VS params the PS reads
+    std::set<u32> ps_linear; // ... interpolated with the LINEAR (no perspective) barycentrics
 
     // Structured control flow (see Structure()).
     bool structured = false;
@@ -883,7 +884,23 @@ void Emitter::EmitVintrp(const Inst& i) {
         SetV(i.dst, "0u"); // P10 / P20: vertex deltas
         return;
     }
-    SetV(i.dst, "as_type<uint>(" + AttrExpr(i.attr, i.chan) + ")");
+    const std::string v = AttrExpr(i.attr, i.chan);
+    // The I/J VGPRs say which barycentrics are used; LINEAR_* ones (SPI_PS_INPUT_ADDR
+    // bits 4-6) mean screen-space interpolation, e.g. light volumes that read the
+    // G-buffer at interpolated clip x/y without dividing by w.
+    static const u32 widths[7] = {2, 2, 2, 3, 2, 2, 2};
+    const u32 ij = i.src[0] - Operand::Vgpr0;
+    for (u32 bit = 0, reg = 0; bit < 7; ++bit) {
+        if (!(o.ps_input_addr & (1u << bit))) continue;
+        if (ij >= reg && ij < reg + widths[bit]) {
+            if (bit >= 4 && v.rfind("pin.p", 0) == 0) {
+                ps_linear.insert(o.ps_input_cntl[i.attr & 31] & 0x3F);
+            }
+            break;
+        }
+        reg += widths[bit];
+    }
+    SetV(i.dst, "as_type<uint>(" + v + ")");
 }
 
 void Emitter::EmitDs(const Inst& i) {
@@ -1806,7 +1823,8 @@ std::string Emitter::Run() {
                     flat = true;
                 }
             }
-            src += "    float4 p" + N(k) + " [[user(p" + N(k) + ")" + (flat ? ", flat" : "") + "]];\n";
+            const char* interp = flat ? ", flat" : ps_linear.count(k) ? ", center_no_perspective" : "";
+            src += "    float4 p" + N(k) + " [[user(p" + N(k) + ")" + interp + "]];\n";
         }
         src += "};\nstruct PsOut {\n";
         for (u32 k = 0; k < 8; ++k) {
