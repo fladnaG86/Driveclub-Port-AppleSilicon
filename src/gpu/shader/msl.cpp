@@ -223,7 +223,7 @@ private:
 
     std::string MemInit() const {
         return o.map_hoist ? "DcMem mem = {gm0, gm1, &gmap, {gmap.base, gmap.pages, gmap.split, gmap.limit, "
-                             "gmap.shift, (device const int*)(&gmap + 1)}};"
+                             "gmap.shift, (device const int*)(&gmap + 1), gmap.fva, gmap.fsize, gmap.foff, gmap.fhi}};"
                            : "DcMem mem = {gm0, gm1, &gmap};";
     }
 

@@ -759,6 +759,26 @@ struct MetalRenderer::Impl {
         table[header + ((va - lo) >> shift)] = delta;
       }
     }
+    // The largest mapping, clipped to one mem buffer, becomes the fast window.
+    static const bool fast_map = std::getenv("DC_NO_FAST_MAP") == nullptr;
+    for (const auto &r : fast_map ? ranges : decltype(mem_ranges){}) {
+      u64 va = r.start, phys = r.phys, size = r.size;
+      if (phys < mem_split && phys + size > mem_split) {
+        const u64 below = mem_split - phys;
+        if (below >= size - below) {
+          size = below;
+        } else {
+          va += below, phys += below, size -= below;
+        }
+      }
+      if (phys + size > Core::Memory::kDirectSize || size <= map.fast_size) {
+        continue;
+      }
+      map.fast_va = va;
+      map.fast_size = size;
+      map.fast_hi = phys >= mem_split;
+      map.fast_off = map.fast_hi ? phys - mem_split : phys;
+    }
     // A fresh buffer: work already recorded keeps reading the old table.
     mem_map = [device newBufferWithBytes:table.data()
                                   length:table.size() * 4

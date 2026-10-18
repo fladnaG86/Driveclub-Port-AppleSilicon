@@ -43,6 +43,13 @@ struct GpuMemMap {
     u32 shift;
     u32 pad;
     u64 limit; // physical size
+    // Fast window: guest [fast_va, fast_va + fast_size) maps linearly to byte
+    // fast_off of mem buffer fast_hi, so shaders skip the table there.
+    u64 fast_va;
+    u64 fast_size;
+    u64 fast_off;
+    u32 fast_hi;
+    u32 pad2;
 };
 struct alignas(16) GpuDrawConsts {
     float vp_scale[4];  // viewport scale (1 where the transform is disabled)

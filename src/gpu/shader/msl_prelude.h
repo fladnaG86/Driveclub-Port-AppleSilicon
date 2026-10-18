@@ -9,14 +9,18 @@ using namespace metal;
 
 // Guest VA -> physical page table: a header followed by one entry per page,
 // the page's (phys - va) in 16 KB units (INT_MIN = unmapped).
-struct DcMap { ulong base; ulong pages; ulong split; uint shift; uint pad; ulong limit; };
+struct DcMap { ulong base; ulong pages; ulong split; uint shift; uint pad; ulong limit;
+               ulong fva; ulong fsize; ulong foff; uint fhi; uint pad2; };
 struct DcDraw { float4 vp_scale; float4 vp_offset; float2 rt_scale; uint vte; uint pad; };
 // DcMap's header copied into registers once per invocation (MslOptions::map_hoist).
-struct DcMapL { ulong base; ulong pages; ulong split; ulong limit; uint shift; device const int* entries; };
+struct DcMapL { ulong base; ulong pages; ulong split; ulong limit; uint shift; device const int* entries;
+                ulong fva; ulong fsize; ulong foff; uint fhi; };
 struct DcMem { device uint* lo; device uint* hi; device const DcMap* map; DcMapL mapl; };
 
 // ---- guest memory ----
 static inline device uint* dc_ptr(thread const DcMem& m, ulong va) {
+    ulong fo = va - m.map->fva;
+    if (fo < m.map->fsize) return (m.map->fhi ? m.hi : m.lo) + ((fo + m.map->foff) >> 2);
     ulong i = (va - m.map->base) >> m.map->shift;
     if (i >= m.map->pages) return nullptr;
     int e = ((device const int*)(m.map + 1))[i];
