@@ -15,7 +15,7 @@
 
 [![Driveclub racing on an M1 Max under Rosetta 2 (click to play the video)](media/apple-silicon-race.jpg)](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/apple-silicon-video/driveclub-apple-silicon.mp4)
 
-*Gameplay on a MacBook Pro M1 Max under Rosetta 2. Click the image to play the video (MP4, 2:32). The "FPS" in the window title of this recording counted window presents, not game frames (fixed since); the game runs at ~26-28 fps.*
+*Gameplay on a MacBook Pro M1 Max under Rosetta 2, with the game's audio. Click the image to play the video (MP4, 3:57). The Metal Performance HUD (top right) shows the real frame rate and the GPU time per frame.*
 
 ## How to play on Apple Silicon
 

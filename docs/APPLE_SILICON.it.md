@@ -18,7 +18,7 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
 
 [![Driveclub on Apple Silicon](../media/apple-silicon-race.jpg)](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/apple-silicon-video/driveclub-apple-silicon.mp4)
 
-*Gameplay su MacBook Pro M1 Max sotto Rosetta 2 — clicca per vedere il video (MP4, 2:32). Gli "FPS" nel titolo della finestra in questa registrazione contavano i refresh della finestra, non i frame del gioco (ora corretto); il gioco gira a ~26-28 fps.*
+*Gameplay su MacBook Pro M1 Max sotto Rosetta 2, con l'audio del gioco — clicca per vedere il video (MP4, 3:57). Il Metal Performance HUD (in alto a destra) mostra gli fps reali e il tempo GPU per frame.*
 
 ## Stato
 
