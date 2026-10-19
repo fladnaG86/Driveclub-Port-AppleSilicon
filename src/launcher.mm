@@ -47,6 +47,16 @@ NSInteger Alert(NSAlertStyle style, NSString* title, NSString* text, NSArray<NSS
     return [alert runModal] - NSAlertFirstButtonReturn;
 }
 
+// Copies the log to ~/Desktop/Driveclub-log.txt, where people find it to
+// attach to a report. Only from dialogs: the first write to the Desktop waits
+// for the user to grant access, which a dying process must not do.
+std::filesystem::path SaveLogToDesktop(const std::filesystem::path& log) {
+    const auto dest = HomeDir() / "Desktop/Driveclub-log.txt";
+    std::error_code ec;
+    std::filesystem::copy_file(log, dest, std::filesystem::copy_options::overwrite_existing, ec);
+    return ec ? log : dest;
+}
+
 void RevealLog(const std::filesystem::path& log) {
     NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:log.c_str()]];
     [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[ url ]];
@@ -105,12 +115,14 @@ void BeginSession() {
 
     g_marker = support / ".running";
     if (std::filesystem::exists(g_marker, ec)) {
+        const auto saved = SaveLogToDesktop(previous);
         const NSInteger choice =
             Alert(NSAlertStyleWarning, @"Driveclub did not close normally last time",
-                  @"It may have crashed. If you report the problem, attach the log.",
+                  @"It may have crashed. Its log was saved to your Desktop as Driveclub-log.txt: "
+                  @"please attach it if you report the problem.",
                   @[ @"Continue", @"Show Log" ]);
         if (choice == 1) {
-            RevealLog(previous);
+            RevealLog(saved);
         }
     }
     if (FILE* f = std::fopen(g_marker.c_str(), "w")) {
@@ -176,21 +188,27 @@ void ShowError(const char* title, const char* text) {
         return;
     }
     std::fflush(stderr);
+    const auto saved = SaveLogToDesktop(g_log);
+    body = [body stringByAppendingString:@"\n\nThe log was saved to your Desktop as Driveclub-log.txt."];
     if (Alert(NSAlertStyleCritical, [NSString stringWithUTF8String:title], body,
               @[ @"Quit", @"Show Log" ]) == 1) {
-        RevealLog(g_log);
+        RevealLog(saved);
     }
 }
 
 void RejectGameFolder(const std::filesystem::path& dir) {
     DC_ERROR("unsupported game version in %s", dir.c_str());
     std::fflush(nullptr);
+    if (!g_log.empty()) {
+        SaveLogToDesktop(g_log);
+    }
     const NSInteger choice = Alert(
         NSAlertStyleCritical, @"This version of Driveclub is not supported",
         @"The app needs Driveclub v1.28, European release (CUSA00003). Your eboot.bin is a "
         @"different version: the base game without the 1.28 patch, or another region.\n\n"
         @"If you have the 1.28 patch, copy its files over the base game folder (replacing "
-        @"eboot.bin), then choose that folder.",
+        @"eboot.bin), then choose that folder.\n\nThe log was saved to your Desktop as "
+        @"Driveclub-log.txt.",
         @[ @"Choose Another Folder", @"Quit" ]);
     EndSession();
     if (choice == 0) {

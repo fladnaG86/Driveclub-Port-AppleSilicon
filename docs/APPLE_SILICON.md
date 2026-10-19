@@ -41,7 +41,7 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
    the 1.28 patch as two folders, copy the patch's files over the base game
    folder first (replacing `eboot.bin`). Other game versions do not start: the
    app tells you if yours is one.
-2. **Install the app.** Download `Driveclub-Native-0.2.2.dmg` from
+2. **Install the app.** Download `Driveclub-Native-0.2.3.dmg` from
    [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest),
    open it and drag **Driveclub** onto **Applications**.
 3. **First launch only: allow the app.** It is not notarized by Apple, so macOS
@@ -61,8 +61,8 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
    *Controls* screen press **Cross** again. The race starts.
 7. **To quit**, press `Cmd+Q`.
 
-If the game crashes, the next launch offers to show the log
-(`~/Library/Logs/DriveclubNative/driveclub.log`); attach it to an
+If the game crashes, open it again: the app saves the log to your Desktop as
+`Driveclub-log.txt` (it does the same after any error message). Attach that file to an
 [issue](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues).
 
 **From Terminal** (debug variables, `DC_OFFLINE=1` and so on): the binary inside the
@@ -129,7 +129,7 @@ You need **your own copy of the game** as a decrypted, extracted package
 
 To package the build as `Driveclub.app` in a `.dmg` (ad-hoc signed), pass an
 x86_64 SDL3 built with `-ffile-prefix-map` so it carries no local paths:
-`tools/app/make_app.sh 0.2.2 /path/to/libSDL3.0.dylib` → `dist/`.
+`tools/app/make_app.sh 0.2.3 /path/to/libSDL3.0.dylib` → `dist/`.
 
 ## What was done
 

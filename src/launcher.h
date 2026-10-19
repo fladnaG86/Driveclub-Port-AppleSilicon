@@ -12,7 +12,8 @@ namespace Launcher {
 bool IsInteractive(int argc, char** argv);
 
 // Interactive only: redirects the log to a file and, if the last run did not
-// end cleanly, offers to show its log. Call before anything logs.
+// end cleanly, copies its log to the Desktop and offers to show it. Call
+// before anything logs.
 void BeginSession();
 
 // Marks the run as ended cleanly (no crash alert on the next launch).
@@ -22,7 +23,8 @@ void EndSession();
 // to pick again). Empty if the user cancels.
 std::filesystem::path ChooseGameFolder();
 
-// Alert with a "Show Log" button when the log is a file.
+// Alert with a "Show Log" button when the log is a file; the log is copied to
+// ~/Desktop/Driveclub-log.txt first.
 void ShowError(const char* title, const char* text);
 
 // Unsupported game version: offers to pick another folder (relaunches the

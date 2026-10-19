@@ -37,9 +37,9 @@ folders, copy the patch files over the base game folder (replace when asked).
    Quit with Cmd+Q.
 
 PROBLEMS
-   If the game crashes, the next launch offers to show the log. The logs are
-   in ~/Library/Logs/DriveclubNative. Please attach driveclub.log (or
-   driveclub-previous.log) when you open an issue:
+   If the game crashes, open it again: the app saves the log to your Desktop
+   as Driveclub-log.txt (also after any error message). Please attach that
+   file when you open an issue (all logs: ~/Library/Logs/DriveclubNative):
    https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues
 
 
@@ -81,7 +81,8 @@ i file della patch sopra la cartella del gioco base (sostituisci quando chiede).
    Esc = Options. Esci con Cmd+Q.
 
 PROBLEMI
-   Se il gioco si chiude da solo, al lancio successivo l'app propone di
-   mostrare il log. I log sono in ~/Library/Logs/DriveclubNative. Allega
-   driveclub.log (o driveclub-previous.log) quando apri una segnalazione:
+   Se il gioco si chiude da solo, riaprilo: l'app salva il log sulla
+   Scrivania come Driveclub-log.txt (anche dopo ogni messaggio di errore).
+   Allega quel file quando apri una segnalazione (tutti i log:
+   ~/Library/Logs/DriveclubNative):
    https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues
