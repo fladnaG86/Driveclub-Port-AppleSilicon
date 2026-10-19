@@ -1,0 +1,83 @@
+DRIVECLUB NATIVE for Apple Silicon Macs
+=======================================
+(Italiano più sotto)
+
+Not affiliated with or endorsed by Sony Interactive Entertainment. This app
+contains no game code, game data or keys. You need your own legitimate copy of
+Driveclub v1.28, European release (CUSA00003), as a folder that contains
+eboot.bin and sce_module. If you have the base game and the 1.28 patch as two
+folders, copy the patch files over the base game folder (replace when asked).
+
+1. INSTALL
+   Drag "Driveclub" onto the "Applications" folder in this window.
+
+2. FIRST LAUNCH ONLY: allow the app
+   The app is not notarized by Apple, so macOS blocks it the first time.
+   a. Open Applications and double-click Driveclub. A message says Apple
+      could not verify it. Click "Done" (do NOT click "Move to Trash").
+   b. Open System Settings > Privacy & Security. Scroll down to the message
+      "Driveclub was blocked..." and click "Open Anyway".
+   c. Enter your Mac password, then click "Open Anyway" again.
+   If macOS asks to install Rosetta, click "Install".
+   From now on, a double-click is enough.
+
+3. CHOOSE THE GAME FOLDER
+   The first time, the app asks for your Driveclub folder. Choose the folder
+   that contains eboot.bin and click "Play". The app remembers it.
+   To choose a different folder later, hold the Option key while you open
+   the app.
+
+4. PLAY
+   Loading takes about 40 seconds. At "Start Event" press Cross (Enter on the
+   keyboard), then Cross again at "Controls". The race starts.
+   A DualSense / DualShock 4 controller works over USB or Bluetooth.
+   Keyboard: W throttle, S brake, A/D steer, Enter = Cross, Esc = Options.
+   Quit with Cmd+Q.
+
+PROBLEMS
+   If the game crashes, the next launch offers to show the log. The logs are
+   in ~/Library/Logs/DriveclubNative. Please attach driveclub.log (or
+   driveclub-previous.log) when you open an issue:
+   https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues
+
+
+ITALIANO
+========
+
+Non affiliato né approvato da Sony Interactive Entertainment. L'app non
+contiene codice, dati o chiavi del gioco. Serve una tua copia legittima di
+Driveclub v1.28, versione europea (CUSA00003), come cartella che contiene
+eboot.bin e sce_module. Se hai gioco base e patch 1.28 in due cartelle, copia
+i file della patch sopra la cartella del gioco base (sostituisci quando chiede).
+
+1. INSTALLAZIONE
+   Trascina "Driveclub" sulla cartella "Applicazioni" in questa finestra.
+
+2. SOLO AL PRIMO AVVIO: autorizza l'app
+   L'app non è notarizzata da Apple, quindi macOS la blocca la prima volta.
+   a. Apri Applicazioni e fai doppio clic su Driveclub. Un messaggio dice che
+      Apple non può verificarla. Clicca "Fine" (NON "Sposta nel Cestino").
+   b. Apri Impostazioni di Sistema > Privacy e sicurezza. Scorri fino al
+      messaggio "Driveclub è stato bloccato..." e clicca "Apri comunque".
+   c. Inserisci la password del Mac, poi clicca di nuovo "Apri comunque".
+   Se macOS chiede di installare Rosetta, clicca "Installa".
+   Da quel momento basta il doppio clic.
+
+3. SCEGLI LA CARTELLA DEL GIOCO
+   La prima volta l'app chiede la cartella di Driveclub. Scegli quella che
+   contiene eboot.bin e clicca "Play". L'app la ricorda.
+   Per scegliere un'altra cartella, tieni premuto Opzione (alt) mentre apri
+   l'app.
+
+4. GIOCA
+   Il caricamento dura circa 40 secondi. A "Start Event" premi Croce (Invio
+   sulla tastiera), poi di nuovo Croce a "Controls". La gara parte.
+   Funziona un controller DualSense / DualShock 4 via USB o Bluetooth.
+   Tastiera: W acceleratore, S freno, A/D sterzo, Invio = Croce,
+   Esc = Options. Esci con Cmd+Q.
+
+PROBLEMI
+   Se il gioco si chiude da solo, al lancio successivo l'app propone di
+   mostrare il log. I log sono in ~/Library/Logs/DriveclubNative. Allega
+   driveclub.log (o driveclub-previous.log) quando apri una segnalazione:
+   https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues

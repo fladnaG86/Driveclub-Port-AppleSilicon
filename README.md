@@ -24,13 +24,13 @@
 You need a Mac with Apple Silicon and **your own copy of Driveclub v1.28 (CUSA00003)**,
 decrypted and extracted to a folder (the one with `eboot.bin`). No game files are included.
 
-1. Download `driveclub-apple-silicon-v0.1.1.zip` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) and unzip it.
-2. Open Terminal in the unzipped folder.
-3. First time only (the program is not notarized): `xattr -dr com.apple.quarantine .`
-   Accept if macOS offers to install Rosetta.
-4. Start it: `./driveclub /path/to/your/extracted/game` and wait ~40 s.
-5. Press **Cross** (`Enter`) at *Start Event*, then again at *Controls*: the race starts.
-6. Quit with `Cmd+Q`. If a menu waits for the (closed) online service, start with `DC_OFFLINE=1 ./driveclub ...`.
+1. Download `Driveclub-Native-0.2.0.dmg` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest), open it and drag **Driveclub** onto **Applications**.
+2. First launch only (the app is not notarized): double-click it, click **Done**, then
+   **System Settings → Privacy & Security → Open Anyway**. Accept if macOS offers to install Rosetta.
+3. Choose your game folder (the one with `eboot.bin`) when asked. The app remembers it
+   and tells you if the game version is not supported.
+4. Wait ~40 s, press **Cross** (`Enter`) at *Start Event*, then again at *Controls*: the race starts.
+5. Quit with `Cmd+Q`. Step-by-step guide, logs and Terminal use: [docs/APPLE_SILICON.md](docs/APPLE_SILICON.md#how-to-play).
 
 | PS4 button | Keyboard | In the game |
 | --- | --- | --- |

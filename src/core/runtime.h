@@ -8,6 +8,7 @@
 
 namespace Core::Loader {
 class Linker;
+class Module;
 }
 
 namespace Core::Runtime {
@@ -17,5 +18,9 @@ void StartGame(Loader::Linker& linker);
 
 // Calls a module's init (module_start) once; returns its result.
 int StartModule(const char* name, u64 args = 0, const void* argp = nullptr);
+
+// True if the loaded eboot is the version this runtime patches (v1.28,
+// CUSA00003): every fixed-heap site holds the expected instruction.
+bool IsSupportedExecutable(const Loader::Module& exe);
 
 } // namespace Core::Runtime

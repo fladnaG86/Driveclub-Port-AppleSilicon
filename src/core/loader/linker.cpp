@@ -79,6 +79,10 @@ std::vector<std::filesystem::path> ListPrx(const std::filesystem::path& dir) {
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
         const auto ext = entry.path().extension();
+        // Skip hidden files: copies via exFAT/SMB leave AppleDouble "._x.prx" stubs.
+        if (entry.path().filename().string().starts_with('.')) {
+            continue;
+        }
         if (entry.is_regular_file() && (ext == ".prx" || ext == ".sprx")) {
             out.push_back(entry.path());
         }

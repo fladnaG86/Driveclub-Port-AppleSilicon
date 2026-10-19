@@ -1,5 +1,6 @@
 // Driveclub Native: entry point.
-// Usage: driveclub <game dir> [--load-only]
+// Usage: driveclub <game dir> [--load-only]; without a game dir (Finder launch
+// of Driveclub.app) the folder is picked in a dialog, see launcher.h.
 // Loads and links the game's modules, then brings up the window and the
 // Metal renderer.
 
@@ -27,6 +28,7 @@
 #include "hle/kernel/kernel.h"
 #include "hle/pad/pad.h"
 #include "hle/video_out/video_out.h"
+#include "launcher.h"
 #include "gpu/liverpool/command_processor.h"
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_presenter.h"
@@ -38,9 +40,17 @@ constexpr int kWindowWidth = 1920;
 constexpr int kWindowHeight = 1080;
 
 int Run(int argc, char** argv) {
-    if (argc < 2) {
-        DC_ERROR("usage: %s <game dir> [--load-only]", argv[0]);
-        return 1;
+    const bool interactive = Launcher::IsInteractive(argc, argv);
+    std::filesystem::path game_dir;
+    if (interactive) {
+        Launcher::BeginSession();
+        game_dir = Launcher::ChooseGameFolder();
+        if (game_dir.empty()) {
+            Launcher::EndSession();
+            return 0;
+        }
+    } else {
+        game_dir = argv[1];
     }
     const bool load_only = argc > 2 && std::strcmp(argv[2], "--load-only") == 0;
 
@@ -49,14 +59,22 @@ int Run(int argc, char** argv) {
     Hle::RegisterAll();
 
     const char* home = std::getenv("HOME");
-    Hle::Kernel::SetFileRoots(argv[1], std::filesystem::path(home ? home : "/tmp") /
-                                           "Library/Application Support/DriveclubNative");
+    Hle::Kernel::SetFileRoots(game_dir, std::filesystem::path(home ? home : "/tmp") /
+                                            "Library/Application Support/DriveclubNative");
 
     Core::Loader::Linker linker;
-    if (!linker.LoadGame(argv[1])) {
+    if (!linker.LoadGame(game_dir)) {
+        Launcher::ShowError("The game files could not be loaded",
+                            "Some of the game's modules could not be read. The log has the details.");
         return 1;
     }
     linker.Relocate();
+    if (!Core::Runtime::IsSupportedExecutable(*linker.Executable())) {
+        if (interactive && !std::getenv("DC_HEAP_SITES")) {
+            Launcher::RejectGameFolder(game_dir);
+        }
+        DC_WARN("eboot.bin is not v1.28 (CUSA00003): expect a crash");
+    }
     linker.PrintReport();
     if (load_only) {
         return 0;
@@ -312,6 +330,7 @@ int Run(int argc, char** argv) {
     SDL_Quit();
     // Guest threads and the GPU thread are still running and use the renderer
     // and HLE state: leave without running destructors under them.
+    Launcher::EndSession();
     std::fflush(nullptr);
     std::_Exit(0);
 }
@@ -323,6 +342,7 @@ int main(int argc, char** argv) {
         return Run(argc, argv);
     } catch (const std::exception& e) {
         DC_ERROR("fatal: %s", e.what());
+        Launcher::ShowError("Driveclub stopped because of an error", e.what());
         // Guest threads may be running: do not run static destructors under them.
         std::fflush(nullptr);
         std::_Exit(1);

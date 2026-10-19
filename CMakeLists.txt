@@ -119,6 +119,8 @@ set(DC_METAL_SOURCES
     src/gpu/metal/mtl_renderer.h
     src/gpu/metal/mtl_compiler.mm
     src/gpu/metal/mtl_renderer.mm
+    src/launcher.h
+    src/launcher.mm
 )
 
 add_executable(driveclub ${DC_CORE_SOURCES} ${DC_METAL_SOURCES})
@@ -148,6 +150,7 @@ target_link_libraries(driveclub PRIVATE
     "-framework Metal"
     "-framework QuartzCore"
     "-framework Foundation"
+    "-framework AppKit"
     "-framework CoreText"
     "-framework CoreGraphics"
 )

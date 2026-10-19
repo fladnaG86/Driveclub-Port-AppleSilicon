@@ -38,25 +38,37 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
 
 1. **Controlla i requisiti.** Un Mac Apple Silicon e **la tua copia di Driveclub
    v1.28 (CUSA00003)**, decrittata ed estratta in una cartella. Quella cartella
-   contiene `eboot.bin` e `sce_sys/`. Altre versioni del gioco non partono.
-2. **Procurati il programma.** Scarica `driveclub-apple-silicon-v0.1.1.zip`
-   dalle [Release](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest) e scompattalo, oppure compilalo (sezione successiva).
-3. **Apri il Terminale nella cartella del programma.** Per esempio `cd ~/Downloads/driveclub-apple-silicon-v0.1.1`.
-4. **Solo la prima volta: togli la quarantena del download.** Il programma non è
-   notarizzato da Apple, e senza questo passaggio macOS lo blocca:
-   ```bash
-   xattr -dr com.apple.quarantine .
-   ```
-   Se macOS chiede di installare **Rosetta**, accetta. Oppure esegui prima `softwareupdate --install-rosetta`.
-5. **Avvialo indicando il percorso del gioco estratto:**
-   ```bash
-   ./driveclub /percorso/del/gioco/estratto
-   ```
-   (Trucco: scrivi `./driveclub ` con uno spazio finale, poi trascina la cartella del gioco dal Finder nel Terminale.)
-6. **Aspetta circa 40 secondi** per il caricamento. Si apre una finestra; il titolo mostra gli fps.
-7. **Nel gioco:** nella schermata *Start Event* premi **Croce** (`Invio`). Nella
+   contiene `eboot.bin` e `sce_module/`. Se hai gioco base e patch 1.28 in due
+   cartelle, copia prima i file della patch sopra la cartella del gioco base
+   (sostituendo `eboot.bin`). Altre versioni del gioco non partono: l'app ti
+   avvisa se la tua è una di queste.
+2. **Installa l'app.** Scarica `Driveclub-Native-0.2.0.dmg` dalle
+   [Release](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest),
+   aprilo e trascina **Driveclub** su **Applicazioni**.
+3. **Solo al primo avvio: autorizza l'app.** Non è notarizzata da Apple, quindi
+   macOS la blocca la prima volta:
+   1. Fai doppio clic su **Driveclub** in Applicazioni. macOS dice che non può
+      verificarla: clicca **Fine** (non *Sposta nel Cestino*).
+   2. Apri **Impostazioni di Sistema → Privacy e sicurezza**, scorri fino a
+      *"Driveclub" è stato bloccato…* e clicca **Apri comunque**.
+   3. Inserisci la password e clicca di nuovo **Apri comunque**.
+
+   Se macOS chiede di installare **Rosetta**, accetta. Da lì in poi basta il doppio clic.
+4. **Scegli la cartella del gioco.** La prima volta l'app la chiede: scegli la
+   cartella con `eboot.bin` e clicca **Play**. Viene ricordata; tieni premuto
+   **Opzione** mentre apri l'app per sceglierne un'altra.
+5. **Aspetta circa 40 secondi** per il caricamento. Il titolo della finestra mostra gli fps.
+6. **Nel gioco:** nella schermata *Start Event* premi **Croce** (`Invio`). Nella
    schermata *Controls* premi di nuovo **Croce**. La gara parte.
-8. **Per uscire** chiudi la finestra o premi `Cmd+Q`. Se non risponde, premi `Ctrl+C` nel Terminale.
+7. **Per uscire** premi `Cmd+Q`.
+
+Se il gioco si chiude da solo, al lancio successivo l'app propone di mostrare il
+log (`~/Library/Logs/DriveclubNative/driveclub.log`); allegalo a una
+[segnalazione](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues).
+
+**Da Terminale** (variabili di debug, `DC_OFFLINE=1` e così via): il binario dentro
+l'app accetta la cartella del gioco come prima e scrive il log nel terminale:
+`/Applications/Driveclub.app/Contents/MacOS/driveclub /percorso/del/gioco/estratto`.
 
 I salvataggi vanno in `~/Library/Application Support/DriveclubNative`.
 I servizi online del gioco non esistono più; se un menu resta in attesa della
@@ -91,7 +103,7 @@ Tasti del port:
 
 ## Compilare e avviare
 
-Questa sezione non serve se usi lo zip pronto (vedi *Come giocare*). Per compilarlo da sé:
+Questa sezione non serve se usi l'app pronta (vedi *Come giocare*). Per compilarlo da sé:
 
 Servono: Mac Apple Silicon con Rosetta 2, Xcode (command line tools),
 CMake >= 3.24, Ninja e **SDL3 compilato per x86_64** (l'SDL3 di Homebrew su
@@ -115,6 +127,10 @@ cd Driveclub-Port && ./build/driveclub /percorso/del/gioco/estratto/CUSA00003/Im
 
 Serve **una propria copia del gioco**, come pacchetto decrittato ed estratto
 (il fork è stato provato con la v1.28). Il repository non contiene file del gioco.
+
+Per impacchettare la build come `Driveclub.app` in un `.dmg` (firma ad-hoc), passa
+un SDL3 x86_64 compilato con `-ffile-prefix-map`, così non contiene percorsi locali:
+`tools/app/make_app.sh 0.2.0 /percorso/libSDL3.0.dylib` → `dist/`.
 
 ## Cosa è stato fatto
 

@@ -61,27 +61,40 @@ void ProgramExit() {
 // Rosetta reserves 0xFC0000000-0x7000000000, so the game's fixed heap at
 // 0x1000000000 cannot be mapped. Rewrite the movabs that hold that base (v1.28
 // eboot) to 0x9000000000, which keeps bits 36-38 for the game's range checks.
-void RelocateFixedHeap(const Loader::Module& exe) {
-    constexpr u64 kOld = 0x1000000000, kNew = 0x9000000000;
+constexpr u64 kFixedHeapOld = 0x1000000000, kFixedHeapNew = 0x9000000000;
+
+std::vector<VAddr> HeapSites(const Loader::Module& exe) {
     const char* env = std::getenv("DC_HEAP_SITES");
     const std::string sites = env ? env : "748d85,748d8f,749247,74925a,5fa001";
+    std::vector<VAddr> out;
     size_t pos = 0;
     while (pos < sites.size()) {
         const size_t comma = std::min(sites.find(',', pos), sites.size());
-        const VAddr site = exe.Base() + std::strtoull(sites.substr(pos, comma - pos).c_str(), nullptr, 16);
+        out.push_back(exe.Base() + std::strtoull(sites.substr(pos, comma - pos).c_str(), nullptr, 16));
         pos = comma + 1;
-        auto* code = reinterpret_cast<u8*>(site);
-        u64 imm;
-        std::memcpy(&imm, code + 2, 8);
-        if ((code[0] & 0xFE) != 0x48 || (code[1] & 0xF8) != 0xB8 || imm != kOld) {
-            DC_WARN("heap remap: no movabs %#llx at %#llx", kOld, site);
+    }
+    return out;
+}
+
+bool IsHeapMovabs(VAddr site) {
+    const auto* code = reinterpret_cast<const u8*>(site);
+    u64 imm;
+    std::memcpy(&imm, code + 2, 8);
+    return (code[0] & 0xFE) == 0x48 && (code[1] & 0xF8) == 0xB8 && imm == kFixedHeapOld;
+}
+
+void RelocateFixedHeap(const Loader::Module& exe) {
+    for (const VAddr site : HeapSites(exe)) {
+        if (!IsHeapMovabs(site)) {
+            DC_WARN("heap remap: no movabs %#llx at %#llx", kFixedHeapOld, site);
             continue;
         }
+        auto* code = reinterpret_cast<u8*>(site);
         const VAddr page = site & ~0xFFFull;
         mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
-        std::memcpy(code + 2, &kNew, 8);
+        std::memcpy(code + 2, &kFixedHeapNew, 8);
         mprotect(reinterpret_cast<void*>(page), 0x2000, PROT_READ | PROT_EXEC);
-        DC_INFO("heap remap: %#llx -> %#llx at %#llx", kOld, kNew, site);
+        DC_INFO("heap remap: %#llx -> %#llx at %#llx", kFixedHeapOld, kFixedHeapNew, site);
     }
 }
 
@@ -270,6 +283,11 @@ void StartGame(Loader::Linker&) {
     pthread_create(&thread, &attr, GuestMain, nullptr);
     pthread_attr_destroy(&attr);
     pthread_detach(thread);
+}
+
+bool IsSupportedExecutable(const Loader::Module& exe) {
+    const auto sites = HeapSites(exe);
+    return std::all_of(sites.begin(), sites.end(), IsHeapMovabs);
 }
 
 } // namespace Core::Runtime
