@@ -2,7 +2,11 @@
 
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 
+#include <sys/sysctl.h>
+
+#import <IOKit/IOKitLib.h>
 #import <Metal/Metal.h>
 
 #include "common/log.h"
@@ -42,7 +46,48 @@ static id<MTLDevice> PickDevice() {
     return best;
 }
 
+static std::string SysctlString(const char* name) {
+    char buf[256] = {};
+    size_t len = sizeof(buf) - 1;
+    return sysctlbyname(name, buf, &len, nullptr, 0) == 0 ? buf : "?";
+}
+
+static long long SysctlInt(const char* name) {
+    long long v = 0;
+    size_t len = sizeof(v);
+    return sysctlbyname(name, &v, &len, nullptr, 0) == 0 ? v : -1;
+}
+
+static long long GpuCoreCount() {
+    long long cores = -1;
+    io_service_t gpu = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"));
+    if (gpu) {
+        if (CFTypeRef v = IORegistryEntryCreateCFProperty(gpu, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0)) {
+            if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+                CFNumberGetValue(static_cast<CFNumberRef>(v), kCFNumberLongLongType, &cores);
+            }
+            CFRelease(v);
+        }
+        IOObjectRelease(gpu);
+    }
+    return cores;
+}
+
+// One line that identifies the machine in bug reports.
+static void LogSystem() {
+    NSString* version = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+    DC_INFO("system: Driveclub Native %s, %s, %s, %lld GPU cores, %lldP+%lldE CPU cores, %lld GB, "
+            "macOS %s (%s)%s",
+            version ? version.UTF8String : "dev build", SysctlString("hw.model").c_str(),
+            SysctlString("machdep.cpu.brand_string").c_str(), GpuCoreCount(),
+            SysctlInt("hw.perflevel0.physicalcpu"), SysctlInt("hw.perflevel1.physicalcpu"),
+            SysctlInt("hw.memsize") >> 30, SysctlString("kern.osproductversion").c_str(),
+            SysctlString("kern.osversion").c_str(),
+            SysctlInt("sysctl.proc_translated") == 1 ? ", Rosetta" : "");
+}
+
 Device::Device() : impl(std::make_unique<Impl>()) {
+    LogSystem();
     impl->device = PickDevice();
     if (!impl->device) {
         throw std::runtime_error("no Metal 3 capable GPU found");

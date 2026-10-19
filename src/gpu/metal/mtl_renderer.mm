@@ -686,6 +686,10 @@ struct MetalRenderer::Impl {
     return sample;
   }
   std::atomic<u64> gpu_ns{0};
+  // Frame rate and GPU time logged every 10 s, for bug reports.
+  std::atomic<u64> perf_gpu_ns{0};
+  u64 perf_frames = 0;
+  std::chrono::steady_clock::time_point perf_t0{};
   mach_port_t draw_thread = 0; // DC_GPU_STATS: whose CPU time to report
   u64 stat_hashed = 0;
   u64 stat_commits = 0, stat_waits = 0, stat_dispatches = 0, stat_draws = 0;
@@ -1389,10 +1393,12 @@ struct MetalRenderer::Impl {
     }
     if (stats) {
       ++stat_commits;
-      [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
-        gpu_ns += static_cast<u64>(GpuSeconds(c) * 1e9);
-      }];
     }
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
+      const u64 ns = static_cast<u64>(GpuSeconds(c) * 1e9);
+      gpu_ns += ns;
+      perf_gpu_ns += ns;
+    }];
     // A command buffer that hogs the GPU for seconds starves WindowServer
     // until its watchdog reboots the Mac: bail out before that happens.
     // DC_GPU_WATCHDOG=<seconds>, 0 disables.
@@ -4721,6 +4727,20 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   }
   if (trace_frame) {
     trace = frame_count == trace_frame;
+  }
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (perf_frames++ == 0) {
+      perf_t0 = now;
+      perf_gpu_ns = 0;
+    } else if (const double dt = std::chrono::duration<double>(now - perf_t0).count(); dt >= 10.0) {
+      const u64 frames = perf_frames - 1;
+      const double gpu_s = perf_gpu_ns.exchange(0) / 1e9;
+      DC_INFO("perf: %.1f fps, gpu %.1f ms/frame (busy %.0f%%), %zu pipelines compiling",
+              frames / dt, gpu_s * 1e3 / frames, gpu_s / dt * 100, pending.size());
+      perf_frames = 1;
+      perf_t0 = now;
+    }
   }
   if (stats) {
     const auto now = std::chrono::steady_clock::now();

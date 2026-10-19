@@ -156,6 +156,7 @@ target_link_libraries(driveclub PRIVATE
     "-framework AppKit"
     "-framework CoreText"
     "-framework CoreGraphics"
+    "-framework IOKit"
 )
 
 # Developer tool: GCN disassembler + MSL translation check (gcn_dis shader.bin [vs|ps] [--msl]).
