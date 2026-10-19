@@ -558,8 +558,13 @@ void Emitter::EmitSmrd(const Inst& i) {
                                     : "((ulong(" + b0 + ") | (ulong(" + b1 + ") << 32)) & 0xfffffffffffful)";
     const std::string off = i.imm ? Hex(i.smrd_offset * 4) : SName(static_cast<u16>(i.smrd_offset));
     // Scalar loads ignore the low address bits: one translation for all dwords.
-    std::string s = Linear(i.pc) ? "{ device uint* p_ = dc_ptr(dc_lin(mem, " + N(p.LinearBaseOf(i.pc)) + "u, " + base +
-                                       "), (" + base + " + ulong(" + off + ")) & ~3ul);"
+    // A register offset on a linear base: past num_records the load reads 0.
+    const std::string in_range = buffer && !i.imm ? "ulong(" + off + ") + " + N(count * 4) + "ul <= ulong(" +
+                                                        SName(static_cast<u16>(i.sbase + 2)) + ") ? "
+                                                  : "";
+    std::string s = Linear(i.pc) ? "{ device uint* p_ = " + in_range + "dc_ptr(dc_lin(mem, " + N(p.LinearBaseOf(i.pc)) +
+                                       "u, " + base + "), (" + base + " + ulong(" + off + ")) & ~3ul)" +
+                                       (in_range.empty() ? "" : " : nullptr") + ";"
                                  : "{ device uint* p_ = dc_ptr_n(mem, (" + base + " + ulong(" + off + ")) & ~3ul, " +
                                        N(count * 4) + "u);";
     for (u32 k = 0; k < count; ++k) {

@@ -72,6 +72,7 @@ struct LinearBase {
     u32 extent = 0;        // bytes read past the base (VBuffer: past the records)
     bool stride0 = false;  // VBuffer: some access is bounded only when the stride is 0
     bool unbounded = false; // VBuffer: some access has no bound at all
+    bool scalar = false;    // VBuffer: scalar loads, bounded by num_records bytes whatever the stride
 
     bool operator==(const LinearBase& b) const {
         return kind == b.kind && words == b.words;

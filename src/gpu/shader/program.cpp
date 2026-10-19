@@ -418,23 +418,32 @@ void CollectLinearBase(Program& p, const Provenance& prov, const Exactness& exac
     LinearBase b;
     if (i.enc == Enc::SMRD) {
         const auto op = static_cast<Smrd>(i.op);
-        if (op == Smrd::S_MEMTIME || op == Smrd::S_DCACHE_INV || op == Smrd::S_DCACHE_INV_VOL || !i.imm) {
+        if (op == Smrd::S_MEMTIME || op == Smrd::S_DCACHE_INV || op == Smrd::S_DCACHE_INV_VOL) {
             return;
         }
         const bool buffer = op >= Smrd::S_BUFFER_LOAD_DWORD;
+        if (!i.imm && !buffer) {
+            return; // a pointer plus a register offset has no known bound
+        }
         const u32 count = op == Smrd::S_LOAD_DWORDX2 || op == Smrd::S_BUFFER_LOAD_DWORDX2   ? 2
                           : op == Smrd::S_LOAD_DWORDX4 || op == Smrd::S_BUFFER_LOAD_DWORDX4 ? 4
                           : op == Smrd::S_LOAD_DWORDX8 || op == Smrd::S_BUFFER_LOAD_DWORDX8 ? 8
                           : op == Smrd::S_LOAD_DWORDX16 || op == Smrd::S_BUFFER_LOAD_DWORDX16 ? 16
                                                                                                 : 1;
         b.kind = buffer ? LinearBase::VBase : LinearBase::Pointer;
-        for (u32 k = 0; k < 2; ++k) {
+        const u32 words = i.imm ? 2 : 3;
+        for (u32 k = 0; k < words; ++k) {
             b.words[k] = prov.Get(i.sbase + k);
             if (!stable(i.sbase + k, b.words[k])) {
                 return;
             }
         }
         b.extent = i.smrd_offset * 4 + count * 4;
+        if (!i.imm) { // register offset: bounded by num_records (the load checks it)
+            b.kind = LinearBase::VBuffer;
+            b.scalar = true;
+            b.extent = count * 4;
+        }
     } else if (i.enc == Enc::MUBUF || i.enc == Enc::MTBUF) {
         if (i.addr64 || i.lds || i.soffset < 128 || i.soffset > 192) {
             return; // only inline non-negative constant soffsets have a known bound
@@ -474,6 +483,7 @@ void CollectLinearBase(Program& p, const Provenance& prov, const Exactness& exac
         e.extent = std::max(e.extent, b.extent);
         e.stride0 |= b.stride0;
         e.unbounded |= b.unbounded;
+        e.scalar &= b.scalar; // a vector access on the same V# needs the strided bound
     }
     p.linear_base_by_pc.emplace_back(i.pc, slot);
 }
@@ -797,7 +807,7 @@ bool LinearBaseRange(const LinearBase& b, const u32* ud, SgprReadCache* cache, u
         }
         const u32 records = ResolveSgpr(b.words[2], ud, cache);
         *va = u64(w0) | (u64(w1 & 0xFFF) << 32);
-        *bytes = (stride ? u64(records) * stride : u64(records)) + b.extent;
+        *bytes = (stride && !b.scalar ? u64(records) * stride : u64(records)) + b.extent;
         break;
     }
     }
