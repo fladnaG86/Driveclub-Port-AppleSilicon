@@ -199,12 +199,13 @@ void ForEachSgprWrite(const Inst& i, F f) {
 // (in program order) reaches it on every path when it dominates the read:
 // each branch region (the instructions a forward branch can skip) holding
 // the write also holds the read. The write's own sources must have been
-// exact. With loops a register is exact where it still holds its value at
-// entry: every write to it comes later and no back edge leads from there to
-// the read.
+// exact. With loops, reaching definitions over the basic blocks: a read is
+// exact when the only write reaching it is the last one before it in
+// program order (whose provenance is the one tracked) and that write's
+// sources were exact, or when only the value at entry reaches it.
 class Exactness {
 public:
-    explicit Exactness(const std::vector<Inst>& code) {
+    explicit Exactness(const std::vector<Inst>& code) : n(code.size()) {
         def.fill(-1);
         exact.fill(true);
         for (size_t k = 0; k < code.size(); ++k) {
@@ -214,11 +215,6 @@ public:
             const u32 target = BranchTarget(code[k]);
             if (target <= code[k].pc) {
                 loops = true;
-                size_t t = 0;
-                while (t < k && code[t].pc < target) {
-                    ++t;
-                }
-                back_edges.emplace_back(k, t);
                 continue;
             }
             size_t t = k + 1;
@@ -228,25 +224,7 @@ public:
             regions.emplace_back(k, t); // instructions k+1 .. t-1 may be skipped
         }
         if (loops) {
-            for (size_t k = 0; k < code.size(); ++k) {
-                ForEachSgprWrite(code[k], [&](u32 reg, u32 count) {
-                    for (u32 r = reg; r < reg + count && r < exact.size(); ++r) {
-                        exact[r] = false;
-                        // The first instruction the write can flow back to.
-                        size_t lo = k;
-                        for (bool moved = true; moved;) {
-                            moved = false;
-                            for (const auto& [src, dst] : back_edges) {
-                                if (src >= lo && dst < lo) {
-                                    lo = dst;
-                                    moved = true;
-                                }
-                            }
-                        }
-                        first_reached[r] = std::min(first_reached[r], s64(lo));
-                    }
-                });
-            }
+            Reaching(code);
         }
     }
 
@@ -257,17 +235,28 @@ public:
         if (reg >= exact.size()) {
             return false;
         }
-        if (loops) {
-            return exact[reg] || cur < first_reached[reg];
+        if (!loops) {
+            return exact[reg] && Dominates(def[reg], cur);
         }
-        return exact[reg] && Dominates(def[reg], cur);
+        // The write reaching `cur` within its block, else what enters it.
+        const size_t b = block_of[cur];
+        s32 v = in[b * kRegs + reg];
+        for (size_t k = block_start[b]; k < size_t(cur); ++k) {
+            if (writes_reg[k * kRegs + reg]) {
+                v = s32(k);
+            }
+        }
+        if (v == kEntry) {
+            return def[reg] < 0; // nothing written yet in program order either
+        }
+        return v >= 0 && v == def[reg] && src_exact[size_t(v)];
     }
 
     // Instruction `index` (the current one) writes its SGPRs; `sources_exact`:
     // the registers its provenance came from were exact.
     void Step(const Inst& i, bool sources_exact) {
         if (loops) {
-            return;
+            src_exact[size_t(cur)] = sources_exact;
         }
         ForEachSgprWrite(i, [&](u32 reg, u32 count) {
             for (u32 r = reg; r < reg + count && r < exact.size(); ++r) {
@@ -278,6 +267,103 @@ public:
     }
 
 private:
+    static constexpr u32 kRegs = 104;
+    static constexpr s32 kNone = -3, kMany = -2, kEntry = -1; // else: the writing instruction
+
+    static s32 Meet(s32 a, s32 b) {
+        if (a == kNone) {
+            return b;
+        }
+        if (b == kNone || a == b) {
+            return a;
+        }
+        return kMany;
+    }
+
+    void Reaching(const std::vector<Inst>& code) {
+        src_exact.assign(n, false);
+        writes_reg.assign(n * kRegs, false);
+        for (size_t k = 0; k < n; ++k) {
+            ForEachSgprWrite(code[k], [&](u32 reg, u32 count) {
+                for (u32 r = reg; r < reg + count && r < kRegs; ++r) {
+                    writes_reg[k * kRegs + r] = true;
+                }
+            });
+        }
+        // Basic blocks: they start at 0, at branch targets and after branches.
+        std::vector<bool> leader(n + 1, false);
+        leader[0] = true;
+        auto index_of = [&](u32 pc) { // inlined fetch code makes pcs non-monotonic
+            for (size_t t = 0; t < n; ++t) {
+                if (code[t].pc == pc) {
+                    return t;
+                }
+            }
+            return n;
+        };
+        for (size_t k = 0; k < n; ++k) {
+            const bool end = code[k].enc == Enc::SOPP && static_cast<Sopp>(code[k].op) == Sopp::S_ENDPGM;
+            if (IsBranch(code[k])) {
+                leader[index_of(BranchTarget(code[k]))] = true;
+            }
+            if (IsBranch(code[k]) || end) {
+                leader[k + 1] = true;
+            }
+        }
+        block_of.assign(n, 0);
+        for (size_t k = 0; k < n; ++k) {
+            if (leader[k]) {
+                block_start.push_back(k);
+            }
+            block_of[k] = block_start.size() - 1;
+        }
+        const size_t nb = block_start.size();
+        std::vector<std::vector<size_t>> preds(nb);
+        for (size_t b = 0; b < nb; ++b) {
+            const size_t last = (b + 1 < nb ? block_start[b + 1] : n) - 1;
+            const Inst& i = code[last];
+            const bool end = i.enc == Enc::SOPP && static_cast<Sopp>(i.op) == Sopp::S_ENDPGM;
+            const bool jump = IsBranch(i) && static_cast<Sopp>(i.op) == Sopp::S_BRANCH;
+            if (IsBranch(i)) {
+                const size_t t = index_of(BranchTarget(i));
+                if (t < n) {
+                    preds[block_of[t]].push_back(b);
+                }
+            }
+            if (!end && !jump && last + 1 < n) {
+                preds[b + 1].push_back(b);
+            }
+        }
+        // Per block and register: the write(s) entering it.
+        in.assign(nb * kRegs, kNone);
+        std::vector<s32> out(nb * kRegs, kNone);
+        for (u32 r = 0; r < kRegs; ++r) {
+            in[r] = kEntry;
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t b = 0; b < nb; ++b) {
+                const size_t end = b + 1 < nb ? block_start[b + 1] : n;
+                for (u32 r = 0; r < kRegs; ++r) {
+                    s32 v = b == 0 ? kEntry : kNone;
+                    for (size_t p : preds[b]) {
+                        v = Meet(v, out[p * kRegs + r]);
+                    }
+                    in[b * kRegs + r] = v;
+                    for (size_t k = block_start[b]; k < end; ++k) {
+                        if (writes_reg[k * kRegs + r]) {
+                            v = s32(k);
+                        }
+                    }
+                    if (out[b * kRegs + r] != v) {
+                        out[b * kRegs + r] = v;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
     bool Dominates(s64 d, s64 r) const {
         if (d < 0) {
             return true; // the value at entry
@@ -292,17 +378,17 @@ private:
         return true;
     }
 
+    size_t n;
     std::vector<std::pair<size_t, size_t>> regions;
-    std::vector<std::pair<size_t, size_t>> back_edges; // (branch, target) indices
-    std::array<s64, 104> first_reached = [] {
-        std::array<s64, 104> a{};
-        a.fill(INT64_MAX);
-        return a;
-    }();
     std::array<s64, 104> def{};
     std::array<bool, 104> exact{};
     s64 cur = 0;
     bool loops = false;
+    // With loops (see Reaching).
+    std::vector<size_t> block_start, block_of;
+    std::vector<s32> in;           // block * kRegs + reg
+    std::vector<bool> writes_reg;  // instruction * kRegs + reg
+    std::vector<bool> src_exact;   // per instruction
 };
 
 // Whether the SGPRs an instruction's provenance result depends on are exact:
