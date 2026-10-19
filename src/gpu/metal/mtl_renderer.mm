@@ -55,6 +55,14 @@ constexpr u64 kGpuAddrMask =
     (1ull << 40) - 1; // Liverpool virtual addresses are 40 bits
 constexpr u32 kNopSizeHint = 0xC0001000; // one-dword NOP carrying a target size
 
+// GPU execution time of a completed command buffer, 0 if Metal gave no
+// timestamps: GPUStartTime can be 0 (seen on M5), and End - 0 would be the
+// system uptime.
+double GpuSeconds(id<MTLCommandBuffer> c) {
+  const double start = c.GPUStartTime, end = c.GPUEndTime;
+  return start > 0 && end >= start ? end - start : 0;
+}
+
 // Key hash for caches: eight bytes per step (keys are mostly descriptor and
 // register arrays; a byte loop was a visible share of the CP thread).
 u64 Fnv(const void *data, size_t size, u64 h = 0xcbf29ce484222325ull) {
@@ -1382,7 +1390,7 @@ struct MetalRenderer::Impl {
     if (stats) {
       ++stat_commits;
       [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
-        gpu_ns += static_cast<u64>((c.GPUEndTime - c.GPUStartTime) * 1e9);
+        gpu_ns += static_cast<u64>(GpuSeconds(c) * 1e9);
       }];
     }
     // A command buffer that hogs the GPU for seconds starves WindowServer
@@ -1404,7 +1412,7 @@ struct MetalRenderer::Impl {
       wd_committed.store(seq, std::memory_order_release);
       [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
         wd_done.store(seq, std::memory_order_release);
-        const double s = c.GPUEndTime - c.GPUStartTime;
+        const double s = GpuSeconds(c);
         if (c.status == MTLCommandBufferStatusError || s > watchdog_s) {
           std::string work;
           {
@@ -1570,7 +1578,7 @@ struct MetalRenderer::Impl {
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
       std::scoped_lock lk(profile_lock);
       auto &e = profile_data[what];
-      e.seconds += c.GPUEndTime - c.GPUStartTime;
+      e.seconds += GpuSeconds(c);
       ++e.calls;
     }];
     Commit(false);
