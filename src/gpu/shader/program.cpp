@@ -199,7 +199,9 @@ void ForEachSgprWrite(const Inst& i, F f) {
 // (in program order) reaches it on every path when it dominates the read:
 // each branch region (the instructions a forward branch can skip) holding
 // the write also holds the read. The write's own sources must have been
-// exact. With loops only user SGPRs nothing writes are exact.
+// exact. With loops a register is exact where it still holds its value at
+// entry: every write to it comes later and no back edge leads from there to
+// the read.
 class Exactness {
 public:
     explicit Exactness(const std::vector<Inst>& code) {
@@ -212,6 +214,11 @@ public:
             const u32 target = BranchTarget(code[k]);
             if (target <= code[k].pc) {
                 loops = true;
+                size_t t = 0;
+                while (t < k && code[t].pc < target) {
+                    ++t;
+                }
+                back_edges.emplace_back(k, t);
                 continue;
             }
             size_t t = k + 1;
@@ -221,10 +228,22 @@ public:
             regions.emplace_back(k, t); // instructions k+1 .. t-1 may be skipped
         }
         if (loops) {
-            for (const Inst& i : code) {
-                ForEachSgprWrite(i, [&](u32 reg, u32 count) {
+            for (size_t k = 0; k < code.size(); ++k) {
+                ForEachSgprWrite(code[k], [&](u32 reg, u32 count) {
                     for (u32 r = reg; r < reg + count && r < exact.size(); ++r) {
                         exact[r] = false;
+                        // The first instruction the write can flow back to.
+                        size_t lo = k;
+                        for (bool moved = true; moved;) {
+                            moved = false;
+                            for (const auto& [src, dst] : back_edges) {
+                                if (src >= lo && dst < lo) {
+                                    lo = dst;
+                                    moved = true;
+                                }
+                            }
+                        }
+                        first_reached[r] = std::min(first_reached[r], s64(lo));
                     }
                 });
             }
@@ -235,10 +254,13 @@ public:
     void At(size_t index) { cur = static_cast<s64>(index); }
 
     bool Exact(u32 reg) const {
-        if (reg >= exact.size() || !exact[reg]) {
+        if (reg >= exact.size()) {
             return false;
         }
-        return loops || Dominates(def[reg], cur);
+        if (loops) {
+            return exact[reg] || cur < first_reached[reg];
+        }
+        return exact[reg] && Dominates(def[reg], cur);
     }
 
     // Instruction `index` (the current one) writes its SGPRs; `sources_exact`:
@@ -271,6 +293,12 @@ private:
     }
 
     std::vector<std::pair<size_t, size_t>> regions;
+    std::vector<std::pair<size_t, size_t>> back_edges; // (branch, target) indices
+    std::array<s64, 104> first_reached = [] {
+        std::array<s64, 104> a{};
+        a.fill(INT64_MAX);
+        return a;
+    }();
     std::array<s64, 104> def{};
     std::array<bool, 104> exact{};
     s64 cur = 0;
