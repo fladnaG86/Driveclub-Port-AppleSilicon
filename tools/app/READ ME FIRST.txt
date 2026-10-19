@@ -2,6 +2,8 @@ DRIVECLUB NATIVE for Apple Silicon Macs
 =======================================
 (Italiano più sotto)
 
+Requires macOS 15 or later.
+
 Not affiliated with or endorsed by Sony Interactive Entertainment. This app
 contains no game code, game data or keys. You need your own legitimate copy of
 Driveclub v1.28, European release (CUSA00003), as a folder that contains
@@ -43,6 +45,8 @@ PROBLEMS
 
 ITALIANO
 ========
+
+Richiede macOS 15 o successivo.
 
 Non affiliato né approvato da Sony Interactive Entertainment. L'app non
 contiene codice, dati o chiavi del gioco. Serve una tua copia legittima di

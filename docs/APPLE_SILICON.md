@@ -35,13 +35,13 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
 
 ### Start the game, step by step
 
-1. **Check the requirements.** A Mac with Apple Silicon and **your own copy of
+1. **Check the requirements.** A Mac with Apple Silicon, **macOS 15 or later**, and **your own copy of
    Driveclub v1.28 (CUSA00003)**, decrypted and extracted to a folder. That
    folder contains `eboot.bin` and `sce_module/`. If you have the base game and
    the 1.28 patch as two folders, copy the patch's files over the base game
    folder first (replacing `eboot.bin`). Other game versions do not start: the
    app tells you if yours is one.
-2. **Install the app.** Download `Driveclub-Native-0.2.0.dmg` from
+2. **Install the app.** Download `Driveclub-Native-0.2.1.dmg` from
    [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest),
    open it and drag **Driveclub** onto **Applications**.
 3. **First launch only: allow the app.** It is not notarized by Apple, so macOS
@@ -129,7 +129,7 @@ You need **your own copy of the game** as a decrypted, extracted package
 
 To package the build as `Driveclub.app` in a `.dmg` (ad-hoc signed), pass an
 x86_64 SDL3 built with `-ffile-prefix-map` so it carries no local paths:
-`tools/app/make_app.sh 0.2.0 /path/to/libSDL3.0.dylib` → `dist/`.
+`tools/app/make_app.sh 0.2.1 /path/to/libSDL3.0.dylib` → `dist/`.
 
 ## What was done
 

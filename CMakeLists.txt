@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 
+# Without this the binary requires the build machine's macOS version.
+set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version")
+
 project(DriveclubNative LANGUAGES C CXX OBJC OBJCXX)
 
 # Backends

@@ -20,6 +20,17 @@ if strings "$sdl" | grep -q "$HOME"; then
     echo "warning: $sdl embeds paths under $HOME" >&2
 fi
 
+# Both binaries must run on the app's minimum macOS (LSMinimumSystemVersion
+# below), not just on the build machine's.
+min_macos=15.0
+for bin in "$repo/build/driveclub" "$sdl"; do
+    minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f && $1=="minos"{print $2; exit}')
+    if [ "$(printf '%s\n%s\n' "$minos" "$min_macos" | sort -V | tail -1)" != "$min_macos" ]; then
+        echo "$bin requires macOS $minos (> $min_macos): build with CMAKE_OSX_DEPLOYMENT_TARGET=$min_macos" >&2
+        exit 1
+    fi
+done
+
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Resources"
 
@@ -54,7 +65,7 @@ cat > "$app/Contents/Info.plist" <<EOF
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$version</string>
     <key>CFBundleVersion</key><string>$version</string>
-    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSMinimumSystemVersion</key><string>$min_macos</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.racing-games</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>Not affiliated with or endorsed by Sony Interactive Entertainment.</string>
