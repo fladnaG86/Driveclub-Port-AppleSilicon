@@ -61,9 +61,15 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
    *Controls* screen press **Cross** again. The race starts.
 7. **To quit**, press `Cmd+Q`.
 
-If the game crashes, open it again: the app saves the log to your Desktop as
-`Driveclub-log.txt` (it does the same after any error message). Attach that file to an
-[issue](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues).
+Every session writes its own log to the **Driveclub Logs** folder on your Desktop,
+named by date and time (`driveclub-2026-10-19_17-30-45.txt`); the last 20 are kept.
+A session that crashed gets `-crash` added to its name (you see it the next time you
+open the app), one that ended with an error message gets `-error`. Each log starts
+with your Mac model, chip and macOS version, and logs the frame rate every 10 seconds.
+Attach the log of the session that went wrong to an
+[issue](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues). The first
+time, macOS asks to let Driveclub access your Desktop; if you refuse, the logs go to
+`~/Library/Logs/DriveclubNative`.
 
 **From Terminal** (debug variables, `DC_OFFLINE=1` and so on): the binary inside the
 app takes the game folder as before and then logs to the terminal:

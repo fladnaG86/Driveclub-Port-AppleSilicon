@@ -62,9 +62,15 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
    schermata *Controls* premi di nuovo **Croce**. La gara parte.
 7. **Per uscire** premi `Cmd+Q`.
 
-Se il gioco si chiude da solo, riaprilo: l'app salva il log sulla Scrivania come
-`Driveclub-log.txt` (lo fa anche dopo ogni messaggio di errore). Allega quel file a una
-[segnalazione](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues).
+Ogni sessione scrive il suo log nella cartella **Driveclub Logs** sulla Scrivania, con
+data e ora nel nome (`driveclub-2026-10-19_17-30-45.txt`); restano gli ultimi 20. Una
+sessione finita in crash prende `-crash` nel nome (lo vedi alla riapertura dell'app),
+una finita con un messaggio di errore prende `-error`. Ogni log inizia con modello del
+Mac, chip e versione di macOS, e riporta gli fps ogni 10 secondi. Allega il log della
+sessione andata male a una
+[segnalazione](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues). La
+prima volta macOS chiede di consentire a Driveclub l'accesso alla Scrivania; se rifiuti,
+i log vanno in `~/Library/Logs/DriveclubNative`.
 
 **Da Terminale** (variabili di debug, `DC_OFFLINE=1` e così via): il binario dentro
 l'app accetta la cartella del gioco come prima e scrive il log nel terminale:

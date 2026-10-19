@@ -37,9 +37,11 @@ folders, copy the patch files over the base game folder (replace when asked).
    Quit with Cmd+Q.
 
 PROBLEMS
-   If the game crashes, open it again: the app saves the log to your Desktop
-   as Driveclub-log.txt (also after any error message). Please attach that
-   file when you open an issue (all logs: ~/Library/Logs/DriveclubNative):
+   Every session writes its log to the "Driveclub Logs" folder on your
+   Desktop, named by date and time. The first time, macOS asks to let
+   Driveclub access your Desktop: click "Allow". A session that crashed gets
+   "-crash" in its name, one that ended with an error gets "-error".
+   Please attach the log of that session when you open an issue:
    https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues
 
 
@@ -81,8 +83,9 @@ i file della patch sopra la cartella del gioco base (sostituisci quando chiede).
    Esc = Options. Esci con Cmd+Q.
 
 PROBLEMI
-   Se il gioco si chiude da solo, riaprilo: l'app salva il log sulla
-   Scrivania come Driveclub-log.txt (anche dopo ogni messaggio di errore).
-   Allega quel file quando apri una segnalazione (tutti i log:
-   ~/Library/Logs/DriveclubNative):
+   Ogni sessione scrive il suo log nella cartella "Driveclub Logs" sulla
+   Scrivania, con data e ora nel nome. La prima volta macOS chiede di
+   consentire a Driveclub l'accesso alla Scrivania: clicca "Consenti". Una
+   sessione finita in crash ha "-crash" nel nome, una finita con un errore
+   "-error". Allega il log di quella sessione quando apri una segnalazione:
    https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/issues

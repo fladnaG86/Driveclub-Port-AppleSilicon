@@ -2,10 +2,15 @@
 
 #include "launcher.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <fstream>
+#include <string>
 #include <system_error>
+#include <vector>
 
 #include <unistd.h>
 
@@ -47,14 +52,57 @@ NSInteger Alert(NSAlertStyle style, NSString* title, NSString* text, NSArray<NSS
     return [alert runModal] - NSAlertFirstButtonReturn;
 }
 
-// Copies the log to ~/Desktop/Driveclub-log.txt, where people find it to
-// attach to a report. Only from dialogs: the first write to the Desktop waits
-// for the user to grant access, which a dying process must not do.
-std::filesystem::path SaveLogToDesktop(const std::filesystem::path& log) {
-    const auto dest = HomeDir() / "Desktop/Driveclub-log.txt";
+constexpr size_t kKeepLogs = 20;
+
+// One log per session in "Driveclub Logs" on the Desktop, where people find
+// it to attach to a report. The first write there waits until the user
+// allows Desktop access, so this runs at launch, never while crashing; if
+// access is denied the logs go to ~/Library/Logs/DriveclubNative.
+std::filesystem::path OpenSessionLog() {
+    char stamp[32];
+    const std::time_t now = std::time(nullptr);
+    std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", std::localtime(&now));
+    const std::string name = std::string("driveclub-") + stamp + ".txt";
+    for (const auto& dir : {HomeDir() / "Desktop/Driveclub Logs", HomeDir() / "Library/Logs/DriveclubNative"}) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        const auto log = dir / name;
+        if (std::freopen(log.c_str(), "w", stderr)) {
+            dup2(fileno(stderr), fileno(stdout));
+            return log;
+        }
+    }
+    return {};
+}
+
+// Keeps the newest kKeepLogs session logs (their names sort by date).
+void PruneLogs(const std::filesystem::path& dir) {
+    std::vector<std::filesystem::path> logs;
     std::error_code ec;
-    std::filesystem::copy_file(log, dest, std::filesystem::copy_options::overwrite_existing, ec);
-    return ec ? log : dest;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const auto name = e.path().filename().string();
+        if (name.starts_with("driveclub-") && e.path().extension() == ".txt") {
+            logs.push_back(e.path());
+        }
+    }
+    std::sort(logs.begin(), logs.end());
+    for (size_t i = 0; i + kKeepLogs < logs.size(); ++i) {
+        std::filesystem::remove(logs[i], ec);
+    }
+}
+
+// Renames driveclub-<date>.txt to driveclub-<date>-<tag>.txt so the sessions
+// that went wrong stand out. An open log keeps being written after the rename.
+std::filesystem::path TagLog(const std::filesystem::path& log, const char* tag) {
+    auto tagged = log;
+    tagged.replace_filename(log.stem().string() + "-" + tag + ".txt");
+    std::error_code ec;
+    std::filesystem::rename(log, tagged, ec);
+    return ec ? log : tagged;
+}
+
+NSString* LogName(const std::filesystem::path& log) {
+    return [NSString stringWithUTF8String:log.filename().c_str()];
 }
 
 void RevealLog(const std::filesystem::path& log) {
@@ -98,35 +146,35 @@ bool IsInteractive(int argc, char** argv) {
 
 void BeginSession() {
     g_interactive = true;
-    const auto logs = HomeDir() / "Library/Logs/DriveclubNative";
     const auto support = HomeDir() / "Library/Application Support/DriveclubNative";
     std::error_code ec;
-    std::filesystem::create_directories(logs, ec);
     std::filesystem::create_directories(support, ec);
 
-    g_log = logs / "driveclub.log";
-    const auto previous = logs / "driveclub-previous.log";
-    std::filesystem::rename(g_log, previous, ec);
-    if (std::freopen(g_log.c_str(), "w", stderr)) {
-        dup2(fileno(stderr), fileno(stdout));
-    } else {
-        g_log.clear();
+    g_log = OpenSessionLog();
+    if (!g_log.empty()) {
+        PruneLogs(g_log.parent_path());
     }
 
+    // The marker holds the log path of the session in progress.
     g_marker = support / ".running";
     if (std::filesystem::exists(g_marker, ec)) {
-        const auto saved = SaveLogToDesktop(previous);
-        const NSInteger choice =
-            Alert(NSAlertStyleWarning, @"Driveclub did not close normally last time",
-                  @"It may have crashed. Its log was saved to your Desktop as Driveclub-log.txt: "
-                  @"please attach it if you report the problem.",
-                  @[ @"Continue", @"Show Log" ]);
-        if (choice == 1) {
-            RevealLog(saved);
+        std::string previous;
+        std::getline(std::ifstream(g_marker), previous);
+        if (!previous.empty() && std::filesystem::exists(previous, ec)) {
+            const auto crashed = TagLog(previous, "crash");
+            NSString* text = [NSString
+                stringWithFormat:@"It may have crashed. Its log is in the \"%@\" folder as %@: "
+                                 @"please attach it if you report the problem.",
+                                 [NSString stringWithUTF8String:crashed.parent_path().filename().c_str()],
+                                 LogName(crashed)];
+            if (Alert(NSAlertStyleWarning, @"Driveclub did not close normally last time", text,
+                      @[ @"Continue", @"Show Log" ]) == 1) {
+                RevealLog(crashed);
+            }
         }
     }
-    if (FILE* f = std::fopen(g_marker.c_str(), "w")) {
-        std::fclose(f);
+    if (std::ofstream marker(g_marker); marker) {
+        marker << g_log.string() << '\n';
     }
     // Paths where the game itself calls exit().
     std::atexit(EndSession);
@@ -188,11 +236,11 @@ void ShowError(const char* title, const char* text) {
         return;
     }
     std::fflush(stderr);
-    const auto saved = SaveLogToDesktop(g_log);
-    body = [body stringByAppendingString:@"\n\nThe log was saved to your Desktop as Driveclub-log.txt."];
+    g_log = TagLog(g_log, "error");
+    body = [body stringByAppendingFormat:@"\n\nThe log is %@.", LogName(g_log)];
     if (Alert(NSAlertStyleCritical, [NSString stringWithUTF8String:title], body,
               @[ @"Quit", @"Show Log" ]) == 1) {
-        RevealLog(saved);
+        RevealLog(g_log);
     }
 }
 
@@ -200,15 +248,14 @@ void RejectGameFolder(const std::filesystem::path& dir) {
     DC_ERROR("unsupported game version in %s", dir.c_str());
     std::fflush(nullptr);
     if (!g_log.empty()) {
-        SaveLogToDesktop(g_log);
+        g_log = TagLog(g_log, "error");
     }
     const NSInteger choice = Alert(
         NSAlertStyleCritical, @"This version of Driveclub is not supported",
         @"The app needs Driveclub v1.28, European release (CUSA00003). Your eboot.bin is a "
         @"different version: the base game without the 1.28 patch, or another region.\n\n"
         @"If you have the 1.28 patch, copy its files over the base game folder (replacing "
-        @"eboot.bin), then choose that folder.\n\nThe log was saved to your Desktop as "
-        @"Driveclub-log.txt.",
+        @"eboot.bin), then choose that folder.",
         @[ @"Choose Another Folder", @"Quit" ]);
     EndSession();
     if (choice == 0) {
