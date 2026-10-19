@@ -76,6 +76,7 @@ enum class OutType : u8 { Float, Uint, Sint };
 
 constexpr u32 kProbeWords = 256;
 constexpr u32 kProbeExportNan = 0xFFFFFFFEu; // probe_pc: at color exports that are NaN/Inf
+constexpr u32 kProbeExportAny = 0xFFFFFFFDu; // probe_pc: at every color export
 constexpr u32 kProbeBinding = 7;
 constexpr u32 kDepthBoundsBuffer = 6;
 constexpr u32 kDepthBoundsTexture = 30;

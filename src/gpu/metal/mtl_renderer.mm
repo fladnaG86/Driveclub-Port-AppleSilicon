@@ -480,6 +480,7 @@ struct MetalRenderer::Impl {
     u32 levels = 1; // mip levels (compute shaders build mip chains in place)
     std::unordered_map<u64, id<MTLTexture>>
         views; // (base, count, format) -> view
+    RenderTarget *view_of = nullptr; // sRGB/linear twin whose texture this views
   };
   using TargetMap =
       std::unordered_map<u64, std::vector<std::unique_ptr<RenderTarget>>>;
@@ -776,7 +777,11 @@ struct MetalRenderer::Impl {
     if (const char *e = std::getenv("DC_PROBE")) {
       char *q = nullptr;
       probe.shader = std::strtoull(e, &q, 16);
-      if (!std::strcmp(
+      if (!std::strncmp(e, "*:any:", 6)) { // every color export at pixel x,y
+        probe.shader = ~0ull;
+        probe.pc = Shader::kProbeExportAny;
+        q = const_cast<char *>(e + std::strlen(e));
+      } else if (!std::strcmp(
               e,
               "*:nan")) { // every pixel shader's first non-finite color export
         probe.shader = ~0ull;
@@ -802,6 +807,10 @@ struct MetalRenderer::Impl {
       }
       if (*q == ',') {
         probe.y = std::strtoul(q + 1, &q, 10);
+      }
+      if (!std::strncmp(e, "*:any:", 6)) { // x,y (the parsing above is for <pc>:<x>,<y>)
+        probe.x = std::strtoul(e + 6, &q, 10);
+        probe.y = *q == ',' ? std::strtoul(q + 1, &q, 10) : 0;
       }
       probe_buf =
           [device newBufferWithLength:kProbeSlots * Shader::kProbeWords * 4
@@ -2549,6 +2558,28 @@ struct MetalRenderer::Impl {
     return [device newTextureWithDescriptor:d];
   }
 
+  // The same memory rendered as RGBA8 and as sRGB RGBA8 is one surface (the
+  // cars' liveries are composed as sRGB, their mips built and compressed as
+  // linear). Views between the two need no PixelFormatView usage.
+  static bool SrgbTwins(MTLPixelFormat a, MTLPixelFormat b) {
+    auto linear = [](MTLPixelFormat f) {
+      switch (f) {
+      case MTLPixelFormatRGBA8Unorm_sRGB: return MTLPixelFormatRGBA8Unorm;
+      case MTLPixelFormatBGRA8Unorm_sRGB: return MTLPixelFormatBGRA8Unorm;
+      case MTLPixelFormatRG8Unorm_sRGB: return MTLPixelFormatRG8Unorm;
+      case MTLPixelFormatR8Unorm_sRGB: return MTLPixelFormatR8Unorm;
+      default: return f;
+      }
+    };
+    return a != b && linear(a) == linear(b);
+  }
+
+  static bool Holds(const std::vector<std::unique_ptr<RenderTarget>> &list,
+                    const RenderTarget *t) {
+    return std::any_of(list.begin(), list.end(),
+                       [t](const auto &u) { return u.get() == t; });
+  }
+
   RenderTarget &GetTarget(TargetMap &map, u64 addr, MTLPixelFormat fmt,
                           u32 width, u32 height, bool depth, u32 levels = 1,
                           TexDim dim = TexDim::Tex2D, u32 depth_or_layers = 1) {
@@ -2568,6 +2599,15 @@ struct MetalRenderer::Impl {
       const u32 want_layers =
           array ? std::max(t->depth_or_layers, depth_or_layers)
                 : t->depth_or_layers;
+      if (t->view_of && !Holds(list, t->view_of)) {
+        t->view_of = nullptr; // its twin was retired: the view is all that is left
+      }
+      if (t->view_of && (t->levels < levels || t->depth_or_layers < want_layers)) {
+        // A view grows with the texture it views.
+        GetTarget(map, addr, t->view_of->tex.pixelFormat, width, height, depth,
+                  levels, dim, want_layers);
+        return *t;
+      }
       if (t->levels < levels ||
           t->depth_or_layers < want_layers) { // grow, keeping what is there
         const u32 new_levels = std::max(t->levels, levels);
@@ -2592,23 +2632,53 @@ struct MetalRenderer::Impl {
         t->levels = new_levels;
         t->depth_or_layers = want_layers;
         t->views.clear();
+        for (auto &v : list) { // its twins view the new texture
+          if (v->view_of == t.get()) {
+            v->tex = [tex newTextureViewWithPixelFormat:v->tex.pixelFormat];
+            v->levels = new_levels;
+            v->depth_or_layers = want_layers;
+            v->views.clear();
+          }
+        }
         ++texture_epoch; // the old texture object is gone
       }
       return *t;
     }
+    RenderTarget *twin = nullptr;
+    for (auto &t : list) {
+      if (!depth && SrgbTwins(t->tex.pixelFormat, fmt) && t->width == width &&
+          t->height == height && t->dim == dim &&
+          (array || t->depth_or_layers == depth_or_layers)) {
+        twin = t->view_of && Holds(list, t->view_of) ? t->view_of : t.get();
+        break;
+      }
+    }
+    if (twin) {
+      twin = &GetTarget(map, addr, twin->tex.pixelFormat, width, height, false,
+                        levels, dim, depth_or_layers);
+    }
     auto rt = std::make_unique<RenderTarget>();
-    rt->tex = NewTargetTexture(fmt, width, height, levels, depth, dim,
-                               depth_or_layers);
+    if (twin) {
+      rt->tex = [twin->tex newTextureViewWithPixelFormat:fmt];
+      rt->view_of = twin;
+      rt->initialized = twin->initialized;
+      rt->written = twin->written;
+      levels = twin->levels;
+      depth_or_layers = twin->depth_or_layers;
+    } else {
+      rt->tex = NewTargetTexture(fmt, width, height, levels, depth, dim,
+                                 depth_or_layers);
+    }
     rt->addr = addr;
     rt->width = width;
     rt->height = height;
     rt->levels = levels;
     rt->dim = dim;
     rt->depth_or_layers = depth_or_layers;
-    DC_INFO("gpu: %s target %#llx %ux%u (dim=%d d/l=%u) fmt %lu (shader %#llx)",
+    DC_INFO("gpu: %s target %#llx %ux%u (dim=%d d/l=%u) fmt %lu (shader %#llx)%s",
             depth ? "depth" : "render", addr, width, height, (int)dim,
             depth_or_layers, (unsigned long)fmt,
-            (unsigned long long)resolving_shader);
+            (unsigned long long)resolving_shader, twin ? ", a view of its sRGB twin" : "");
     list.push_back(std::move(rt));
     ++texture_epoch; // a new surface: descriptors may now resolve elsewhere
     return *list.back();
@@ -3492,11 +3562,18 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       1) { // DX_RASTERIZATION_KILL: nothing reaches the rasterizer
     return;
   }
-  static const u64 skip_ps =
-      std::getenv("DC_SKIP_PS")
-          ? std::strtoull(std::getenv("DC_SKIP_PS"), nullptr, 16)
-          : 0;
-  if (skip_ps && ps_addr == skip_ps) { // debug: drop one pixel shader's draws
+  static const std::vector<u64> skip_ps = [] { // DC_SKIP_PS=<hex>,<hex>,...
+    std::vector<u64> v;
+    for (const char *p = std::getenv("DC_SKIP_PS"); p && *p;) {
+      char *q = nullptr;
+      v.push_back(std::strtoull(p, &q, 16));
+      p = *q == ',' ? q + 1 : q;
+      if (q == p && *p) break;
+    }
+    return v;
+  }();
+  if (!skip_ps.empty() && std::find(skip_ps.begin(), skip_ps.end(), ps_addr) !=
+                              skip_ps.end()) { // debug: drop these pixel shaders' draws
     return;
   }
 

@@ -190,9 +190,11 @@ private:
         }
     }
 
-    // Register probe at color exports that are not finite.
+    // Register probe at color exports that are not finite (or at all of them).
     void ProbeNanExport(const std::string& dst) {
-        if (o.probe_pc == kProbeExportNan) {
+        if (o.probe_pc == kProbeExportAny) {
+            body += "    /*DC_PROBE*/\n";
+        } else if (o.probe_pc == kProbeExportNan) {
             Line("if (any(!isfinite(" + dst + "))) {");
             body += "    /*DC_PROBE*/\n";
             Line("}");

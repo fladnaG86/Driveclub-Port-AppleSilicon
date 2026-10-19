@@ -167,33 +167,39 @@ void SetTrigger(bool right, u8 value) {
     SetButton(right ? kR2 : kL2, value > 30);
 }
 
-// DC_AUTOPRESS=<sec>,<sec>,...: presses Cross at those times after start
-// (unattended runs that need to get past "Start Event").
+// DC_AUTOPRESS=<sec>[:<hex mask>],...: presses Cross (or that button) at
+// those times after start (unattended runs that need to get past "Start
+// Event", or to switch the camera).
 static void StartAutoPress() {
     const char* e = std::getenv("DC_AUTOPRESS");
     if (!e) {
         return;
-    }
-    std::vector<double> times;
-    for (const char* p = e; *p;) {
-        char* q = nullptr;
-        times.push_back(std::strtod(p, &q));
-        p = *q == ',' ? q + 1 : q;
-        if (q == p && *p) break;
     }
     // DC_AUTOPRESS_BUTTON=<hex mask> (default Cross), DC_AUTOPRESS_HOLD=<ms>.
     const char* be = std::getenv("DC_AUTOPRESS_BUTTON");
     const u32 button = be ? static_cast<u32>(std::strtoul(be, nullptr, 16)) : 0x4000;
     const char* he = std::getenv("DC_AUTOPRESS_HOLD");
     const s64 hold = he ? std::strtoll(he, nullptr, 10) : 250;
-    std::thread([times, button, hold] {
+    std::vector<std::pair<double, u32>> presses;
+    for (const char* p = e; *p;) {
+        char* q = nullptr;
+        const double t = std::strtod(p, &q);
+        if (q == p) break;
+        u32 mask = button;
+        if (*q == ':') {
+            mask = static_cast<u32>(std::strtoul(q + 1, &q, 16));
+        }
+        presses.push_back({t, mask});
+        p = *q == ',' ? q + 1 : q;
+    }
+    std::thread([presses, hold] {
         const auto t0 = std::chrono::steady_clock::now();
-        for (double t : times) {
+        for (auto [t, mask] : presses) {
             std::this_thread::sleep_until(t0 + std::chrono::milliseconds(static_cast<s64>(t * 1000)));
-            DC_INFO("pad: auto-press %#x at %.1f s", button, t);
-            SetButton(button, true);
+            DC_INFO("pad: auto-press %#x at %.1f s", mask, t);
+            SetButton(mask, true);
             std::this_thread::sleep_for(std::chrono::milliseconds(hold));
-            SetButton(button, false);
+            SetButton(mask, false);
         }
     }).detach();
 }
