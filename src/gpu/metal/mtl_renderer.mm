@@ -1960,6 +1960,10 @@ struct MetalRenderer::Impl {
 
   // Blocks until the pipeline `key` has been compiled.
   void WaitCompiled(u64 key) {
+    if (!pending.count(key)) {
+      return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
     while (pending.count(key)) {
       {
         std::unique_lock lk(done_lock);
@@ -1967,6 +1971,13 @@ struct MetalRenderer::Impl {
             lk, [&] { return !done_render.empty() || !done_compute.empty(); });
       }
       TakeCompiled();
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    if (ms > 100) {
+      DC_WARN("gpu: waited %.0f ms for a pipeline (%zu still compiling)", ms,
+              pending.size());
     }
   }
 
@@ -4065,6 +4076,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
       std::string vsrc = MslSource(*vs, vo, vs_key);
       std::string fsrc = ps ? MslSource(*ps, fo, ps_key) : std::string();
       const bool flat = debug_fs && ps && out_type[0] == OutType::Float;
+      const bool will_wait = sync_shaders || probe_slot >= 0;
       compiler->Submit([this, d, vsrc = std::move(vsrc), fsrc = std::move(fsrc),
                         vs_key, ps_key, pkey, flat, vs_addr, ps_addr] {
         id<MTLRenderPipelineState> pso = nil;
@@ -4088,7 +4100,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
           done_render.emplace_back(pkey, pso);
         }
         done_cv.notify_all();
-      });
+      }, will_wait);
     }
     if (!sync_shaders && probe_slot < 0) { // probed draws must run: wait
       if (trace)
@@ -4653,7 +4665,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
           done_compute.emplace_back(pkey, pso);
         }
         done_cv.notify_all();
-      });
+      }, /*urgent=*/true); // waited for right below
     }
     // Dispatches often produce data later work depends on: wait.
     WaitCompiled(pkey);

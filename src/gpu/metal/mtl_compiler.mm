@@ -10,8 +10,9 @@ namespace Gpu::Metal {
 
 ShaderCompiler::ShaderCompiler(id<MTLDevice> device, u32 count) : device(device) {
     for (u32 k = 0; k < count; ++k) {
-        threads.emplace_back([this] { Worker(); });
+        threads.emplace_back([this] { Worker(false); });
     }
+    threads.emplace_back([this] { Worker(true); });
 }
 
 ShaderCompiler::~ShaderCompiler() {
@@ -25,26 +26,33 @@ ShaderCompiler::~ShaderCompiler() {
     }
 }
 
-void ShaderCompiler::Submit(std::function<void()> job) {
+void ShaderCompiler::Submit(std::function<void()> job, bool urgent) {
+    // DC_NO_URGENT_SHADERS: one FIFO queue for everything (A/B).
+    static const bool no_urgent = std::getenv("DC_NO_URGENT_SHADERS") != nullptr;
+    urgent = urgent && !no_urgent;
     {
         std::scoped_lock lk(lock);
-        jobs.push_back(std::move(job));
+        (urgent ? urgent_jobs : jobs).push_back(std::move(job));
     }
-    cv.notify_one();
+    // Wake everyone: a waiting worker may be the urgent-only one.
+    cv.notify_all();
 }
 
-void ShaderCompiler::Worker() {
-    pthread_setname_np("GPU shader compiler");
+void ShaderCompiler::Worker(bool urgent_only) {
+    pthread_setname_np(urgent_only ? "GPU shader compiler (urgent)" : "GPU shader compiler");
     while (true) {
         std::function<void()> job;
         {
             std::unique_lock lk(lock);
-            cv.wait(lk, [this] { return stop || !jobs.empty(); });
+            cv.wait(lk, [&] {
+                return stop || !urgent_jobs.empty() || (!urgent_only && !jobs.empty());
+            });
             if (stop) {
                 return;
             }
-            job = std::move(jobs.front());
-            jobs.pop_front();
+            auto& q = !urgent_jobs.empty() ? urgent_jobs : jobs;
+            job = std::move(q.front());
+            q.pop_front();
         }
         @autoreleasepool {
             job();

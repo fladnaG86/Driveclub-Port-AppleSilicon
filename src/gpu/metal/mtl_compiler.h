@@ -31,16 +31,19 @@ public:
     // compile. Thread-safe.
     id<MTLFunction> Function(u64 key, const std::string& src, u64 address);
 
-    // Runs `job` on a worker thread.
-    void Submit(std::function<void()> job);
+    // Runs `job` on a worker thread. Urgent jobs (the GPU thread is about to
+    // wait for them) go before every queued normal job, and one worker serves
+    // only them, so they never sit behind long pipeline compiles.
+    void Submit(std::function<void()> job, bool urgent = false);
 
 private:
-    void Worker();
+    void Worker(bool urgent_only);
 
     id<MTLDevice> device;
     std::mutex lock;
     std::condition_variable cv;
     std::deque<std::function<void()>> jobs;
+    std::deque<std::function<void()>> urgent_jobs;
     std::vector<std::thread> threads;
     bool stop = false;
 
