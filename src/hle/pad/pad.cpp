@@ -204,27 +204,29 @@ static void StartAutoPress() {
     }).detach();
 }
 
-// DC_AUTO_THROTTLE=<sec>,<ms>: full R2 for <ms> from <sec> after start.
-static void StartAutoThrottle() {
-    const char* e = std::getenv("DC_AUTO_THROTTLE");
+// DC_AUTO_THROTTLE=<sec>,<ms> / DC_AUTO_BRAKE=<sec>,<ms>: full R2 / L2 for
+// <ms> from <sec> after start.
+static void StartAutoTrigger(const char* var, bool right) {
+    const char* e = std::getenv(var);
     if (!e) {
         return;
     }
     double at = 0;
     s64 ms = 0;
     std::sscanf(e, "%lf,%lld", &at, &ms);
-    std::thread([at, ms] {
+    std::thread([at, ms, right] {
         std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<s64>(at * 1000)));
-        DC_INFO("pad: auto-throttle for %lld ms", ms);
-        SetTrigger(true, 255);
+        DC_INFO("pad: auto-%s for %lld ms", right ? "throttle" : "brake", ms);
+        SetTrigger(right, 255);
         std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-        SetTrigger(true, 0);
+        SetTrigger(right, 0);
     }).detach();
 }
 
 void RegisterPad() {
     StartAutoPress();
-    StartAutoThrottle();
+    StartAutoTrigger("DC_AUTO_THROTTLE", true);
+    StartAutoTrigger("DC_AUTO_BRAKE", false);
     constexpr const char* lib = "libScePad";
     DC_HLE(lib, scePadInit);
     DC_HLE(lib, scePadOpen);
