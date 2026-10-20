@@ -24,7 +24,7 @@
 You need a Mac with Apple Silicon running **macOS 15 or later** and **your own copy of Driveclub v1.28 (CUSA00003)**,
 decrypted and extracted to a folder (the one with `eboot.bin`). No game files are included.
 
-1. Download `Driveclub-Native-0.2.6.dmg` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest), open it and drag **Driveclub** onto **Applications**.
+1. Download `Driveclub-Native-0.2.7.dmg` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest), open it and drag **Driveclub** onto **Applications**.
 2. First launch only (the app is not notarized): double-click it, click **Done**, then
    **System Settings → Privacy & Security → Open Anyway**. Accept if macOS offers to install Rosetta.
 3. Choose your game folder (the one with `eboot.bin`) when asked. The app remembers it
