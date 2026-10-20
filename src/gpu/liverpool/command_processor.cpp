@@ -13,6 +13,7 @@
 
 #include "common/log.h"
 #include "core/memory.h"
+#include "gpu/label_trace.h"
 #include "gpu/renderer.h"
 
 namespace Gpu::Liverpool {
@@ -150,6 +151,9 @@ void CommandProcessor::Push(u32 index, Job job) {
 
 void CommandProcessor::SubmitGraphics(std::vector<CmdBuffers> bufs, std::function<void()> after) {
     ++stats.submits;
+    if (LtOn()) {
+        DC_INFO("lt %.0f submit %zu bufs", LtUs(LtNow()), bufs.size());
+    }
     Push(0, {std::move(bufs), std::move(after)});
 }
 
@@ -191,6 +195,13 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
             ring.jobs.pop_front();
             ring.busy = true;
         }
+        const bool lt = ring.index == 0 && LtOn();
+        double lt_user = 0, lt_sys = 0;
+        if (lt) {
+            LtThreadCpu(&lt_user, &lt_sys);
+            lt_lock_ns = 0;
+            DC_INFO("lt %.0f job start (%zu queued)", LtUs(LtNow()), ring.jobs.size());
+        }
         for (const auto& buf : job.buffers) {
             if (ring.index == 0) {
                 ce.stack.clear();
@@ -209,7 +220,13 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
         }
         if (flip_label.addr || flip_label.interrupt) {
             const FlipLabel label = flip_label;
+            if (lt) {
+                DC_INFO("lt %.0f fliplabel rec %#llx=%#x", LtUs(LtNow()), (unsigned long long)label.addr, label.value);
+            }
             AfterGpu([label, this] {
+                if (LtOn()) {
+                    DC_INFO("lt %.0f fliplabel write %#x", LtUs(LtNow()), label.value);
+                }
                 if (label.addr) {
                     *Ptr<u32>(static_cast<u32>(label.addr), static_cast<u32>(label.addr >> 32)) = label.value;
                 }
@@ -221,6 +238,12 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
         }
         if (renderer) {
             renderer->OnSubmit(); // hand everything, signals included, to the host GPU
+        }
+        if (lt) {
+            double user = 0, sys = 0;
+            LtThreadCpu(&user, &sys);
+            DC_INFO("lt %.0f job end cpu user %.0f sys %.0f lock %.0f us", LtUs(LtNow()), user - lt_user, sys - lt_sys,
+                    lt_lock_ns / 1e3);
         }
         {
             std::scoped_lock lk(ring.lock);
@@ -257,7 +280,14 @@ void CommandProcessor::FenceWrite(u32 data_sel, u64 addr, u32 lo, u32 hi, u32 ir
             pending_fences[addr + 4] = hi;
         }
     }
+    const bool lt = addr == Lt().addr && LtOn();
+    if (lt) {
+        DC_INFO("lt %.0f label rec %#x%s", LtUs(LtNow()), lo, t_ring && t_ring->index ? " (compute)" : "");
+    }
     AfterGpu([=, this] {
+        if (lt) {
+            DC_INFO("lt %.0f label write %#x", LtUs(LtNow()), lo);
+        }
         WriteFence(data_sel, static_cast<u32>(addr), static_cast<u32>(addr >> 32), lo, hi);
         if (data_sel == kData32 || data_sel == kData64) {
             std::scoped_lock lk(fence_lock);
@@ -589,7 +619,12 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 break;
             }
             if (src_sel != 2) {
+                const u64 t = LtOn() ? LtNow() : 0;
                 SyncRenderer(); // the GPU may still be producing what we copy
+                if (t) {
+                    DC_INFO("lt %.0f dma sync %.0f us (ctl %#x %u bytes)%s", LtUs(LtNow()), (LtNow() - t) / 1e3, ctl,
+                            bytes, compute ? " (compute)" : "");
+                }
             }
             if (src_sel == 2) {
                 for (u32 k = 0; k + 4 <= bytes; k += 4) {
@@ -623,6 +658,18 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                     renderer->OnSubmit();
                 }
                 u32 iters = 0;
+                const u64 t = LtOn() ? LtNow() : 0;
+                struct Report {
+                    u64 t;
+                    const volatile u32* a;
+                    bool c;
+                    ~Report() {
+                        if (t) {
+                            DC_INFO("lt %.0f waitregmem %p %.0f us%s", LtUs(LtNow()), (const void*)a,
+                                    (LtNow() - t) / 1e3, c ? " (compute)" : "");
+                        }
+                    }
+                } report{t, addr, compute};
                 while (!Compare(func, *addr & mask, ref)) {
                     // Another queue (async compute) may record the write meanwhile:
                     // all queues share one host command stream, so recorded work

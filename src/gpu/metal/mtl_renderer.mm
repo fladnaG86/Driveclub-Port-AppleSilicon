@@ -1,6 +1,7 @@
 #include "gpu/metal/mtl_renderer.h"
 
 #import <Metal/Metal.h>
+#import <QuartzCore/QuartzCore.h>
 #include <mach/mach.h>
 
 #include <algorithm>
@@ -26,6 +27,7 @@
 
 #include "common/log.h"
 #include "core/memory.h"
+#include "gpu/label_trace.h"
 #include "gpu/liverpool/pm4.h"
 #include "gpu/liverpool/registers.h"
 #include "gpu/liverpool/tiling.h"
@@ -419,7 +421,15 @@ struct MetalRenderer::Impl {
   id<MTLBuffer> chunk = nil;
   u64 chunk_off = 0;
   u32 work_since_commit = 0; // draws + dispatches in the open command buffer
-  static constexpr u32 kCommitEvery = 400;
+  // Draws + dispatches per command buffer. The guest waits for the frame's
+  // flip label before submitting the next frame, so the work recorded after
+  // the last commit is pure latency: 400 left a ~5 ms GPU tail per frame
+  // (frames over 33 ms, ~27 fps), 60 leaves ~2 ms (~29.4 fps) at no GPU cost.
+  // DC_COMMIT_EVERY=<n> overrides.
+  const u32 kCommitEvery = [] {
+    const char *v = std::getenv("DC_COMMIT_EVERY");
+    return v ? static_cast<u32>(std::atoi(v)) : 60u;
+  }();
 
   // Signals: an event value encoded between passes, so fences do not cut
   // command buffers. Callbacks run in order on the listener's queue.
@@ -1403,6 +1413,17 @@ struct MetalRenderer::Impl {
     if (stats) {
       ++stat_commits;
     }
+    if (Gpu::LtOn()) {
+      const u64 seq = commits;
+      DC_INFO("lt %.0f commit cb %llu", Gpu::LtUs(Gpu::LtNow()), (unsigned long long)seq);
+      [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        // GPUStartTime/GPUEndTime are host seconds (CACurrentMediaTime).
+        const double off = double(Gpu::LtNow()) - CACurrentMediaTime() * 1e9;
+        DC_INFO("lt %.0f done cb %llu gpu %.0f..%.0f", Gpu::LtUs(Gpu::LtNow()),
+                (unsigned long long)seq, Gpu::LtUs(u64(c.GPUStartTime * 1e9 + off)),
+                Gpu::LtUs(u64(c.GPUEndTime * 1e9 + off)));
+      }];
+    }
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
       const u64 ns = static_cast<u64>(GpuSeconds(c) * 1e9);
       gpu_ns += ns;
@@ -1786,7 +1807,11 @@ struct MetalRenderer::Impl {
   void WaitLast() {
     if (last_committed) {
       const auto t0 = std::chrono::steady_clock::now();
+      const u64 lt = Gpu::LtOn() ? Gpu::LtNow() : 0;
       [last_committed waitUntilCompleted];
+      if (lt) {
+        DC_INFO("lt %.0f wait gpu %.0f us", Gpu::LtUs(Gpu::LtNow()), (Gpu::LtNow() - lt) / 1e3);
+      }
       if (stats) {
         ++stat_waits;
         stat_wait_s +=
@@ -5060,12 +5085,12 @@ MetalRenderer::MetalRenderer(Device &device) : impl(std::make_unique<Impl>()) {
 }
 
 MetalRenderer::~MetalRenderer() {
-  std::scoped_lock lk(impl->lock);
+  Gpu::LtLock lk(impl->lock);
   impl->Commit(true);
 }
 
 void MetalRenderer::Draw(const RegFile &regs, const DrawCall &draw) {
-  std::scoped_lock lk(impl->lock);
+  Gpu::LtLock lk(impl->lock);
   if (!impl->draw_thread) {
     impl->draw_thread = pthread_mach_thread_np(pthread_self());
   }
@@ -5098,7 +5123,7 @@ void MetalRenderer::Draw(const RegFile &regs, const DrawCall &draw) {
 
 void MetalRenderer::Dispatch(const RegFile &regs, std::uint32_t x,
                              std::uint32_t y, std::uint32_t z) {
-  std::scoped_lock lk(impl->lock);
+  Gpu::LtLock lk(impl->lock);
   @autoreleasepool {
     impl->NoteWork("  dispatch cs %#llx %ux%ux%u\n",
                    regs.ProgramAddr(Liverpool::Reg::COMPUTE_PGM_LO), x, y, z);
@@ -5113,7 +5138,7 @@ void MetalRenderer::Dispatch(const RegFile &regs, std::uint32_t x,
 }
 
 bool MetalRenderer::DispatchIndirect(const RegFile &regs, std::uint64_t args) {
-  std::scoped_lock lk(impl->lock);
+  Gpu::LtLock lk(impl->lock);
   id<MTLBuffer> buf = nil;
   u64 off = 0;
   if ((args & 3) || !impl->Locate(args, 12, &buf, &off)) {
@@ -5136,7 +5161,7 @@ bool MetalRenderer::DispatchIndirect(const RegFile &regs, std::uint64_t args) {
 }
 
 void MetalRenderer::OnSubmit() {
-  std::scoped_lock lk(impl->lock);
+  Gpu::LtLock lk(impl->lock);
   // DC_SERIAL: wait for the GPU after every submit (debug: rules out CPU/GPU
   // races on guest memory).
   static const bool serial = std::getenv("DC_SERIAL") != nullptr;
@@ -5146,14 +5171,14 @@ void MetalRenderer::OnSubmit() {
 }
 
 void MetalRenderer::WaitIdle() {
-  std::scoped_lock lk(impl->lock);
+  Gpu::LtLock lk(impl->lock);
   @autoreleasepool {
     impl->Commit(true);
   }
 }
 
 void MetalRenderer::Signal(std::function<void()> done) {
-  std::scoped_lock lk(impl->lock);
+  Gpu::LtLock lk(impl->lock);
   @autoreleasepool {
     impl->Signal(std::move(done));
   }
@@ -5161,7 +5186,7 @@ void MetalRenderer::Signal(std::function<void()> done) {
 
 void MetalRenderer::Flip(const FlipInfo &flip) {
   flips.fetch_add(1, std::memory_order_relaxed);
-  std::scoped_lock lk(impl->lock);
+  Gpu::LtLock lk(impl->lock);
   @autoreleasepool {
     impl->Flip(flip);
   }
@@ -5170,7 +5195,7 @@ void MetalRenderer::Flip(const FlipInfo &flip) {
 bool MetalRenderer::DmaData(std::uint32_t dst_sel, std::uint64_t dst,
                             std::uint32_t src_sel, std::uint64_t src,
                             std::uint32_t bytes) {
-  std::scoped_lock lk(impl->lock);
+  Gpu::LtLock lk(impl->lock);
   @autoreleasepool {
     return impl->DmaData(dst_sel, dst, src_sel, src, bytes);
   }
@@ -5189,7 +5214,7 @@ void MetalRenderer::OnContextRegs(const std::uint32_t *body,
       reg != Reg::DB_Z_INFO) {
     return;
   }
-  std::scoped_lock lk(impl->lock);
+  Gpu::LtLock lk(impl->lock);
   impl->OnContextRegs(body, body_dwords);
 }
 
