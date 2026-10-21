@@ -28,6 +28,7 @@
 #include "common/log.h"
 #include "core/memory.h"
 #include "gpu/label_trace.h"
+#include "launcher.h"
 #include "gpu/liverpool/pm4.h"
 #include "gpu/liverpool/registers.h"
 #include "gpu/liverpool/tiling.h"
@@ -331,10 +332,11 @@ struct MetalRenderer::Impl {
   id<MTLComputePipelineState> fill_pipeline = nil;
   id<MTLComputePipelineState> htile_pipeline = nil;
   id<MTLComputePipelineState> scan_val_pipeline = nil, scan_loc_pipeline = nil;
-  // DC_SCAN_MAX=<addr>[,<addr>...]: in the traced frame, after every pass or
-  // dispatch writing a color target at one of these addresses, log its
-  // largest value and where it is (finds where a blown-up value appears).
+  // DC_SCAN_MAX=<addr>[,<addr>...] (or all targets when F12 traces a frame):
+  // in the traced frame, after every pass or dispatch writing a color target,
+  // log its largest value and where it is (finds where a blown-up value appears).
   std::vector<u64> scan_addrs;
+  bool scan_all = false;
   std::unordered_map<const void *, u64> scan_seen; // target -> written seq
   std::string scan_label;
 
@@ -919,18 +921,22 @@ struct MetalRenderer::Impl {
     if (!htile_pipeline) {
       DC_ERROR("gpu: htile pipeline: %s", err.localizedDescription.UTF8String);
     }
+    scan_val_pipeline = [device
+        newComputePipelineStateWithFunction:[lib newFunctionWithName:@"scan_val"]
+                                      error:&err];
+    scan_loc_pipeline = [device
+        newComputePipelineStateWithFunction:[lib newFunctionWithName:@"scan_loc"]
+                                      error:&err];
     if (const char *e = std::getenv("DC_SCAN_MAX")) {
-      for (const char *q = e; *q;) {
-        char *end = nullptr;
-        scan_addrs.push_back(std::strtoull(q, &end, 16));
-        q = *end ? end + 1 : end;
+      if (!std::strcmp(e, "*")) {
+        scan_all = true;
+      } else {
+        for (const char *q = e; *q;) {
+          char *end = nullptr;
+          scan_addrs.push_back(std::strtoull(q, &end, 16));
+          q = *end ? end + 1 : end;
+        }
       }
-      scan_val_pipeline = [device
-          newComputePipelineStateWithFunction:[lib newFunctionWithName:@"scan_val"]
-                                        error:&err];
-      scan_loc_pipeline = [device
-          newComputePipelineStateWithFunction:[lib newFunctionWithName:@"scan_loc"]
-                                        error:&err];
     }
     if (!copy_pipeline) {
       DC_ERROR("gpu: copy pipeline: %s", err.localizedDescription.UTF8String);
@@ -1172,20 +1178,24 @@ struct MetalRenderer::Impl {
       }
     }
     pass = {};
-    if (trace && !scan_addrs.empty()) {
+    if (trace && (scan_all || !scan_addrs.empty())) {
       ScanMax();
     }
   }
 
   void ScanMax() {
-    for (u64 a : scan_addrs) {
-      auto it = color_targets.find(a);
-      if (it == color_targets.end() || !scan_val_pipeline || !scan_loc_pipeline) {
-        continue;
-      }
-      for (auto &t : it->second) {
+    if (!scan_val_pipeline || !scan_loc_pipeline) {
+      return;
+    }
+    auto scan_at = [&](u64 a, const std::vector<std::unique_ptr<RenderTarget>> &list) {
+      for (auto &t : list) {
         RenderTarget *rt = t.get();
-        if (scan_seen[rt] == rt->written || !rt->tex) {
+        const MTLPixelFormat f = rt->tex ? rt->tex.pixelFormat : MTLPixelFormatInvalid;
+        if (scan_seen[rt] == rt->written || !rt->tex ||
+            f == MTLPixelFormatRGBA8Uint || f == MTLPixelFormatR32Uint ||
+            f == MTLPixelFormatRG32Uint || f == MTLPixelFormatRGBA32Uint ||
+            f == MTLPixelFormatR16Uint || f == MTLPixelFormatR8Uint ||
+            f == MTLPixelFormatRG16Uint || f == MTLPixelFormatRGBA16Uint) {
           continue;
         }
         scan_seen[rt] = rt->written;
@@ -1219,16 +1229,28 @@ struct MetalRenderer::Impl {
         __block std::string what = scan_label;
         const u64 addr = a;
         const u32 w = rt->width, h = rt->height;
+        const u32 pf = static_cast<u32>(f);
         [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
           const u32 *o = static_cast<const u32 *>(b.contents);
           float c[4];
           std::memcpy(c, o, 4);
           std::memcpy(c + 1, o + 5, 12);
-          DC_INFO("gpu: scan %#llx %ux%u after %s: max %g at %u,%u slice %u level %u "
+          DC_INFO("gpu: scan %#llx %ux%u fmt %u after %s: max %g at %u,%u slice %u level %u "
                   "rgb %g %g %g",
-                  (unsigned long long)addr, w, h, what.c_str(), c[0], o[1], o[2], o[3],
+                  (unsigned long long)addr, w, h, pf, what.c_str(), c[0], o[1], o[2], o[3],
                   o[4], c[1], c[2], c[3]);
         }];
+      }
+    };
+    if (scan_all) {
+      for (const auto &[a, list] : color_targets) {
+        scan_at(a, list);
+      }
+    } else {
+      for (u64 a : scan_addrs) {
+        if (auto it = color_targets.find(a); it != color_targets.end()) {
+          scan_at(a, it->second);
+        }
       }
     }
   }
@@ -3565,7 +3587,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   ++work_since_commit;
   const u64 vs_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS);
   const u64 ps_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS);
-  if (trace && !scan_addrs.empty()) {
+  if (trace && (scan_all || !scan_addrs.empty())) {
     scan_label = "pass with draw #" + std::to_string(draw_count) + " ps " + Hex(ps_addr);
   }
   const u32 cb_mode = Bits(r[Reg::CB_COLOR_CONTROL], 4, 3);
@@ -4470,7 +4492,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     return;
   }
   ++stat_dispatches;
-  if (trace && !scan_addrs.empty()) {
+  if (trace && (scan_all || !scan_addrs.empty())) {
     scan_label = "dispatch cs " + Hex(addr);
   }
   if (trace) {
@@ -4750,6 +4772,9 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
     }
     DumpPass();
   }
+  if (trace && (scan_all || !scan_addrs.empty())) {
+    ScanMax();
+  }
   // DC_DUMP_CS=<cs>: with DC_TRACE_FRAME, the textures that shader samples.
   static const u64 dump_cs = std::getenv("DC_DUMP_CS")
                                  ? std::strtoull(std::getenv("DC_DUMP_CS"),
@@ -4781,11 +4806,28 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   }
 }
 
-// F11: records the next two frames into ../bench/capture_<flip>.gputrace for
+// Where F11/F12 write captures and frame dumps: the session log folder when
+// launched from Finder (whose working directory is "/"), otherwise ../bench.
+std::filesystem::path TraceDir() {
+  std::filesystem::path base = Launcher::LogDir();
+  if (base.empty()) {
+    base = "../bench";
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(base, ec);
+  if (ec) {
+    const char *home = std::getenv("HOME");
+    base = std::filesystem::path(home ? home : "/tmp") / "Desktop/Driveclub Logs";
+    std::filesystem::create_directories(base, ec);
+  }
+  return base;
+}
+
+// F11: records the next two frames into capture_<flip>.gputrace for
 // Xcode (needs MTL_CAPTURE_ENABLED=1 in the environment at launch).
 void MetalRenderer::Impl::StartCapture() {
   Commit(false); // the capture starts at a command buffer boundary
-  if (BeginCapture("../bench/capture_" + std::to_string(frame_count) + ".gputrace")) {
+  if (BeginCapture((TraceDir() / ("capture_" + std::to_string(frame_count) + ".gputrace")).string())) {
     capture_end = frame_count + 2;
   }
 }
@@ -4831,9 +4873,12 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   if (g_trace_request.exchange(false)) {
     trace_frame = frame_count + 1;
     dump_passes = true;
+    scan_all = true;
     if (!dump_frames || key_trace_only) {
-      key_trace_dir = "../bench/f12_" + std::to_string(trace_frame);
-      std::filesystem::create_directories(key_trace_dir);
+      std::error_code ec;
+      const auto dir = TraceDir() / ("f12_" + std::to_string(trace_frame));
+      std::filesystem::create_directories(dir, ec);
+      key_trace_dir = dir.string();
       dump_frames = key_trace_dir.c_str();
       key_trace_only = true;
     }
@@ -5113,7 +5158,7 @@ void MetalRenderer::Draw(const RegFile &regs, const DrawCall &draw) {
                    draw.count, draw.instances, draw.indexed);
     impl->Draw(regs, draw);
     if (impl->trace && !impl->scan_addrs.empty()) {
-      impl->EndPass(); // DC_SCAN_MAX: scan after every draw
+      impl->EndPass(); // DC_SCAN_MAX=<addrs>: scan after every draw
     }
     if (impl->pass_timing && impl->enc && !impl->ts_cmd.empty() &&
         !impl->ts_cmd.back().compute) {

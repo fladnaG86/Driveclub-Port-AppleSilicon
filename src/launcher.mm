@@ -187,6 +187,10 @@ void EndSession() {
     }
 }
 
+std::filesystem::path LogDir() {
+    return g_log.empty() ? std::filesystem::path{} : g_log.parent_path();
+}
+
 std::filesystem::path ChooseGameFolder() {
     NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
     const bool repick = ([NSEvent modifierFlags] & NSEventModifierFlagOption) != 0;

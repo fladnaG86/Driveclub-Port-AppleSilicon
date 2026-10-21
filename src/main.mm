@@ -144,6 +144,7 @@ int Run(int argc, char** argv) {
                     }
                     break;
                 case SDLK_F12:
+                case SDLK_P:
                     if (pressed) {
                         Gpu::Metal::RequestFrameTrace(); // GPU trace + pass dumps of the next frame
                     }

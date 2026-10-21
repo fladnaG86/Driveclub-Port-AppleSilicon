@@ -20,6 +20,9 @@ void BeginSession();
 // Marks the run as ended cleanly (no crash alert on the next launch).
 void EndSession();
 
+// Folder holding the session log, or empty when running from the command line.
+std::filesystem::path LogDir();
+
 // The remembered game folder, or one picked in a dialog (hold Option at launch
 // to pick again). Empty if the user cancels.
 std::filesystem::path ChooseGameFolder();
