@@ -1,6 +1,7 @@
 #include "gpu/liverpool/command_processor.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <algorithm>
 #include <cstdlib>
@@ -9,6 +10,7 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 #include <x86intrin.h>
 
 #include "common/log.h"
@@ -657,7 +659,6 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 if (renderer) {
                     renderer->OnSubmit();
                 }
-                u32 iters = 0;
                 const u64 t = LtOn() ? LtNow() : 0;
                 struct Report {
                     u64 t;
@@ -670,6 +671,12 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                         }
                     }
                 } report{t, addr, compute};
+                // DC_WAIT_SLEEP=1: yield for the first kWaitSpin, then sleep, so long
+                // waits (async compute, ~9 ms a frame) stop burning a core. Off by
+                // default: ~10% less process CPU on an idle Mac, fps not proven.
+                static const bool no_sleep = std::getenv("DC_WAIT_SLEEP") == nullptr;
+                constexpr auto kWaitSpin = std::chrono::microseconds(200);
+                const auto t0 = std::chrono::steady_clock::now();
                 while (!Compare(func, *addr & mask, ref)) {
                     // Another queue (async compute) may record the write meanwhile:
                     // all queues share one host command stream, so recorded work
@@ -677,12 +684,17 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                     if (PendingFence(reinterpret_cast<u64>(addr), &pending) && Compare(func, pending & mask, ref)) {
                         break;
                     }
-                    if (++iters > 1000000) {
+                    const auto waited = std::chrono::steady_clock::now() - t0;
+                    if (waited > std::chrono::seconds(1)) {
                         DC_WARN("gpu: WaitRegMem timeout (addr=%p val=%#x ref=%#x mask=%#x func=%u)",
                                 addr, *addr, ref, mask, func);
                         break;
                     }
-                    sched_yield();
+                    if (no_sleep || waited < kWaitSpin) {
+                        sched_yield();
+                    } else {
+                        usleep(50);
+                    }
                 }
             }
             break;
