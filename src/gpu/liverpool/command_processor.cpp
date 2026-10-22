@@ -382,6 +382,31 @@ void CommandProcessor::RunConstantEngine(const std::function<bool()>& done) {
             }
             break;
         }
+        case Op::WriteData: {
+            static const bool log_ce = std::getenv("DC_LOG_CE") != nullptr;
+            if (log_ce) {
+                const u32 dst_sel = (body[0] >> 8) & 0xF;
+                DC_INFO("gpu: CE WRITE_DATA %#llx %u dwords ctl %#x dst_sel %u",
+                        (unsigned long long)(u64(body[1]) | (u64(body[2]) << 32)), n > 3 ? n - 3 : 0, body[0], dst_sel);
+            }
+            break;
+        }
+        case Op::DmaData: {
+            static const bool log_ce = std::getenv("DC_LOG_CE") != nullptr;
+            if (log_ce) {
+                const u32 ctl = body[0];
+                const u32 cmd = body[5];
+                const u32 bytes = cmd & 0x1FFFFF;
+                const u32 src_sel = (ctl >> 29) & 3;
+                const u32 dst_sel = (ctl >> 20) & 3;
+                const u64 dst_addr = dst_sel == 1 ? (body[3] & 0xFFFF) : u64(body[3]) | (u64(body[4]) << 32);
+                const u64 src_addr = src_sel == 2 ? body[1]
+                                    : src_sel == 1 ? (body[1] & 0xFFFF) : u64(body[1]) | (u64(body[2]) << 32);
+                DC_INFO("gpu: CE DMA_DATA dst %#llx src %#llx %u bytes (ctl %#x src_sel %u dst_sel %u)",
+                        (unsigned long long)dst_addr, (unsigned long long)src_addr, bytes, ctl, src_sel, dst_sel);
+            }
+            break;
+        }
         case Op::IncrementCeCounter:
             ++ce.ce_counter;
             break;
@@ -493,6 +518,34 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
         const u32 body_n = HeaderBodyDwords(header);
         const u32* body = p + 1;
         ++stats.packets;
+
+        // DC_FIND_DWORD=<value>[,<value>]: log PM4 packets whose body contains
+        // one of these dwords. Used to find where a resource address is set.
+        static const char* find_env = std::getenv("DC_FIND_DWORD");
+        static u32 find_vals[4] = {};
+        static u32 find_count = 0;
+        static bool find_init = false;
+        if (!find_init && find_env) {
+            const char* q = find_env;
+            while (*q && find_count < 4) {
+                find_vals[find_count++] = u32(std::strtoul(q, const_cast<char**>(&q), 16));
+                if (*q == ',') ++q;
+                else break;
+            }
+            find_init = true;
+        }
+        for (u32 fi = 0; fi < find_count; ++fi) {
+            const u32 needle = find_vals[fi];
+            for (u32 bi = 0; bi < body_n; ++bi) {
+                if (body[bi] != needle) continue;
+                DC_INFO("gpu: find dword %#x op %#x body[%u] at cmd+%#zx; body", needle, op, bi,
+                        static_cast<size_t>(body - cmds.data()));
+                for (u32 bj = 0; bj < body_n && bj < 12; ++bj) {
+                    DC_INFO("gpu:   [%u] %08x", bj, body[bj]);
+                    if (bj == 11 && body_n > 12) DC_INFO("gpu:   ... (%u dwords)", body_n);
+                }
+            }
+        }
 
         switch (op) {
         case Op::Nop:
@@ -761,7 +814,9 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             // The args may be GPU-written and not landed yet; garbage counts
             // would make a draw that hangs the GPU.
             if (a[0] > kMaxIndirectCount || a[1] > kMaxIndirectCount) {
-                DC_WARN("gpu: skipping indirect draw with count=%u instances=%u", a[0], a[1]);
+                DC_WARN("gpu: skipping indirect draw with count=%u instances=%u (vs %#llx ps %#llx)", a[0], a[1],
+                        (unsigned long long)regs.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS),
+                        (unsigned long long)regs.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS));
                 break;
             }
             if (indexed) {

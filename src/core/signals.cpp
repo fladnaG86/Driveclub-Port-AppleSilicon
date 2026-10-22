@@ -262,9 +262,10 @@ bool WatchFault(ucontext_t* uc, u64 fault) {
         if (std::find(g_watch_sites.begin(), g_watch_sites.end(), rip) == g_watch_sites.end()) {
             g_watch_sites.push_back(rip);
             const auto& ss = uc->uc_mcontext->__ss;
-            DC_INFO("watch: new site %s addr %#llx rdi %#llx rsi %#llx rdx %#llx rbx %#llx r12 %#llx r14 %#llx ret %s",
-                    g_describer ? g_describer(rip).c_str() : "?", fault, ss.__rdi, ss.__rsi, ss.__rdx,
-                    ss.__rbx, ss.__r12, ss.__r14,
+            const bool wr = (uc->uc_mcontext->__es.__err & 2) != 0;
+            DC_INFO("watch: new site %s %s addr %#llx rdi %#llx rsi %#llx rdx %#llx rbx %#llx r12 %#llx r14 %#llx ret %s",
+                    g_describer ? g_describer(rip).c_str() : "?", wr ? "WRITE" : "read", fault, ss.__rdi, ss.__rsi,
+                    ss.__rdx, ss.__rbx, ss.__r12, ss.__r14,
                     g_describer ? g_describer(*reinterpret_cast<u64*>(ss.__rsp)).c_str() : "?");
         }
     }

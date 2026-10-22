@@ -681,6 +681,7 @@ struct MetalRenderer::Impl {
   id<MTLFunction> debug_fs =
       nil; // DC_DEBUG_FLAT: every pixel shader outputs magenta
   bool trace = false;
+  bool gds_readback = false; // DC_GDS_READBACK: log GDS->memory copies in the traced frame
   u64 trace_frame = 0; // DC_TRACE_FRAME=n: DC_GPU_TRACE for flip n only
   bool dump_passes =
       false; // DC_DUMP_PASSES: with DC_TRACE_FRAME, every pass's targets
@@ -869,6 +870,7 @@ struct MetalRenderer::Impl {
       debug_vsout = std::strtoull(v, nullptr, 16);
     }
     trace = std::getenv("DC_GPU_TRACE") != nullptr;
+    gds_readback = std::getenv("DC_GDS_READBACK") != nullptr;
     dump_passes = std::getenv("DC_DUMP_PASSES") != nullptr;
     if (const char *e = std::getenv("DC_TRACE_FRAME")) {
       trace_frame = std::strtoull(e, nullptr, 10);
@@ -1174,8 +1176,8 @@ struct MetalRenderer::Impl {
   // CP DMA on the host GPU, in order with the work around it.
   bool DmaData(u32 dst_sel, u64 dst, u32 src_sel, u64 src, u32 bytes) {
     if (trace) {
-      DC_INFO("gpu: dma %u:%#llx <- %u:%#llx, %u bytes", dst_sel, dst, src_sel,
-              src, bytes);
+      DC_INFO("gpu: dma q%u %u:%#llx <- %u:%#llx, %u bytes", Gpu::t_queue, dst_sel, dst,
+              src_sel, src, bytes);
     }
     if ((bytes & 3) || (dst & 3) || (src_sel != 2 && (src & 3))) {
       return false;
@@ -1215,6 +1217,15 @@ struct MetalRenderer::Impl {
           destinationOffset:doff
                        size:bytes];
       [b endEncoding];
+      if (trace && gds_readback && src_sel == 1 && dst_sel != 1 && bytes == 4) {
+        const u32 q = Gpu::t_queue;
+        const u64 addr = dst;
+        const u32 off = static_cast<u32>(src);
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+          const u32 v = *reinterpret_cast<const u32 *>(addr);
+          DC_INFO("gpu: gds-read q%u %#llx <- gds %#x = %u", q, addr, off, v);
+        }];
+      }
     } else if (value == (value & 0xFF) * 0x01010101u) {
       id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
       [b fillBuffer:dbuf
@@ -3586,6 +3597,41 @@ struct MetalRenderer::Impl {
   void Draw(const RegFile &r, const DrawCall &dc);
   void Dispatch(const RegFile &r, u32 x, u32 y, u32 z);
   u64 indirect_args = 0; // guest address of the group counts (DispatchIndirect)
+
+  // DC_FIND_ADDR=<addr>: in the traced frame, the draws and dispatches whose
+  // user data, or tables it points to (two levels deep), hold a V# covering
+  // that address (finds the shaders reading or writing a buffer).
+  void FindRefs(const u32 *d, u32 n, int depth, const std::string &path,
+                const char *who, u64 shader) {
+    static const u64 find = std::getenv("DC_FIND_ADDR")
+                                ? std::strtoull(std::getenv("DC_FIND_ADDR"), nullptr, 16)
+                                : 0;
+    if (!find) {
+      return;
+    }
+    for (u32 k = 0; k + 4 <= n; ++k) {
+      const u64 base = (u64(d[k]) | (u64(d[k + 1] & 0xFFF) << 32)) & kGpuAddrMask;
+      const u32 stride = (d[k + 1] >> 16) & 0x3FFF;
+      const u64 size = stride ? u64(d[k + 2]) * stride : d[k + 2];
+      if (base && find >= base && find < base + std::max<u64>(size, 16)) {
+        DC_INFO("gpu: find %#llx: %s %#llx %s[%u] = %08x %08x %08x %08x",
+                (unsigned long long)find, who, (unsigned long long)shader,
+                path.c_str(), k, d[k], d[k + 1], d[k + 2], d[k + 3]);
+      }
+    }
+    if (depth >= 2) {
+      return;
+    }
+    for (u32 k = 0; k + 2 <= n; ++k) {
+      const u64 p = (u64(d[k]) | (u64(d[k + 1]) << 32)) & kGpuAddrMask;
+      id<MTLBuffer> b = nil;
+      u64 off = 0;
+      if (p > 0x7000000000ull && !(p & 3) && Locate(p, 256, &b, &off)) {
+        FindRefs(reinterpret_cast<const u32 *>(p), 64, depth + 1,
+                 path + "[" + std::to_string(k) + "]->", who, shader);
+      }
+    }
+  }
   void StartCapture();
   bool BeginCapture(const std::string &path);
   void Flip(const FlipInfo &f);
@@ -3849,6 +3895,39 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   DrawLap(2);
   const u32 *vs_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_VS_0);
   const u32 *ps_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_PS_0);
+  // DC_PEEK_VS=<vs>: in the traced frame, the V#s of that vertex shader's
+  // resource table (user data 12-13) and how many of each buffer's records
+  // have a FLT_MAX or non-finite dword among their first three.
+  static const u64 peek_vs = std::getenv("DC_PEEK_VS")
+                                 ? std::strtoull(std::getenv("DC_PEEK_VS"), nullptr, 16)
+                                 : 0;
+  if (trace) {
+    FindRefs(vs_ud, 16, 0, "ud", "vs", vs_addr);
+    FindRefs(ps_ud, 16, 0, "ud", "ps", ps_addr);
+  }
+  if (trace && peek_vs && vs_addr == peek_vs) {
+    const u64 table = (u64(vs_ud[12]) | (u64(vs_ud[13]) << 32)) & kGpuAddrMask;
+    for (u32 e = 0; e < 8 && table; ++e) {
+      const u32 *v = reinterpret_cast<const u32 *>(table + e * 16);
+      const u64 base = (u64(v[0]) | (u64(v[1] & 0xFFF) << 32)) & kGpuAddrMask;
+      const u32 stride = (v[1] >> 16) & 0x3FFF, num = v[2];
+      u32 big = 0, first = ~0u;
+      if (base && stride >= 12 && stride <= 256 && num < (1u << 20)) {
+        for (u32 n = 0; n < num; ++n) {
+          const float *f = reinterpret_cast<const float *>(base + u64(n) * stride);
+          if (!(std::fabs(f[0]) < 1e30f) || !(std::fabs(f[1]) < 1e30f) ||
+              !(std::fabs(f[2]) < 1e30f)) {
+            big += 1;
+            first = std::min(first, n);
+          }
+        }
+      }
+      DC_INFO("gpu: peek vs %#llx table %#llx [%u] = %08x %08x %08x %08x: base %#llx "
+              "stride %u records %u, %u big (first %d)",
+              (unsigned long long)vs_addr, (unsigned long long)table, e, v[0], v[1], v[2], v[3],
+              (unsigned long long)base, stride, num, big, first == ~0u ? -1 : int(first));
+    }
+  }
   Program *vs = GetProgram(Stage::Vertex, vs_addr, vs_ud,
                            Bits(r[Reg::SPI_SHADER_PGM_RSRC2_VS], 1, 5),
                            Bits(r[Reg::SPI_SHADER_PGM_RSRC1_VS], 24, 2));
@@ -4573,12 +4652,13 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   const u32 ty = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_Y] & 0xFFFF);
   const u32 tz = std::max<u32>(1, r[Reg::COMPUTE_NUM_THREAD_Z] & 0xFFFF);
   if (trace) {
-    DC_INFO("gpu: dispatch cs=%#llx groups %ux%ux%u threads %ux%ux%u rsrc2=%#x "
+    DC_INFO("gpu: dispatch q%u cs=%#llx groups %ux%ux%u threads %ux%ux%u rsrc2=%#x "
             "ud=%08x %08x %08x %08x %08x %08x %08x "
             "%08x %08x %08x %08x %08x %08x %08x %08x %08x",
-            addr, gx, gy, gz, tx, ty, tz, rsrc2, ud[0], ud[1], ud[2], ud[3],
+            Gpu::t_queue, addr, gx, gy, gz, tx, ty, tz, rsrc2, ud[0], ud[1], ud[2], ud[3],
             ud[4], ud[5], ud[6], ud[7], ud[8], ud[9], ud[10], ud[11], ud[12],
             ud[13], ud[14], ud[15]);
+    FindRefs(ud, 16, 0, "ud", "cs", addr);
   }
   if (!addr || !gx || !gy || !gz) {
     return;

@@ -101,11 +101,11 @@ void RelocateFixedHeap(const Loader::Module& exe) {
 // DC_PROBE_FN=<eboot offset>,...: logs every 5 s how often those functions ran.
 void StartProbes(const Loader::Module& exe) {
     const char* env = std::getenv("DC_PROBE_FN");
-    if (!env) {
+    if (!env && !std::getenv("DC_WATCH")) {
         return;
     }
     std::vector<u64> offsets;
-    for (const char* p = env; *p;) {
+    for (const char* p = env ? env : ""; *p;) {
         char* q = nullptr;
         const u64 off = std::strtoull(p, &q, 16);
         if (Signals::AddProbe(exe.Base() + off)) {
@@ -144,13 +144,23 @@ void StartProbes(const Loader::Module& exe) {
         if (const char* w = std::getenv("DC_PROBE_WATCH")) { // ...,<sec>[,<offset in the target>]
             std::sscanf(w, "%u,%llx,%x,%lf,%llx", &wk, &woff, &wbytes, &wsec, &winner);
         }
+        // DC_WATCH=<addr>,<bytes>,<sec>: the CPU code touching that range, from <sec> on.
+        u64 waddr = 0;
+        if (const char* w = std::getenv("DC_WATCH")) {
+            std::sscanf(w, "%llx,%x,%lf", &waddr, &wbytes, &wsec);
+        }
         const auto t0 = std::chrono::steady_clock::now();
         bool watching = false;
         auto last = t0;
         for (;;) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             const auto now = std::chrono::steady_clock::now();
-            if (wsec >= 0 && !watching && now - t0 > std::chrono::duration<double>(wsec)) {
+            if (waddr && !watching && now - t0 > std::chrono::duration<double>(wsec)) {
+                DC_INFO("watch: %#llx (%u bytes)", waddr, wbytes);
+                Signals::WatchAccess(waddr, wbytes);
+                watching = true;
+            }
+            if (!waddr && wsec >= 0 && !watching && now - t0 > std::chrono::duration<double>(wsec)) {
                 // DC_PROBE_WATCH_RSI: objects are the rsi values; pointer offset ffffffff: no
                 // dereference, watch the object itself
                 const auto args = Signals::ProbeDistinctArgs(0, std::getenv("DC_PROBE_WATCH_RSI") != nullptr);
