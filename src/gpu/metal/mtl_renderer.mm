@@ -690,6 +690,7 @@ struct MetalRenderer::Impl {
   // dispatch referencing it.
   bool rain_diag = false;
   static constexpr u64 kRainDropVs = 0x7003086d00;
+  static constexpr u64 kRainDropLightCs = 0x7003086100; // writes the drop colors
   u64 trace_frame = 0; // DC_TRACE_FRAME=n: DC_GPU_TRACE for flip n only
   bool dump_passes =
       false; // DC_DUMP_PASSES: with DC_TRACE_FRAME, every pass's targets
@@ -4677,6 +4678,33 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
             ud[4], ud[5], ud[6], ud[7], ud[8], ud[9], ud[10], ud[11], ud[12],
             ud[13], ud[14], ud[15]);
     FindRefs(ud, 16, 0, "ud", "cs", addr);
+    // DC_RAIN_DIAG: what the drop lighting shader leaves in the drop colors
+    // once the GPU has run it (a peek at record time only sees what the CPU
+    // wrote), and the light count it loops over.
+    if (rain_diag && addr == kRainDropLightCs && cmd) {
+      const u64 table = (u64(ud[12]) | (u64(ud[13]) << 32)) & kGpuAddrMask;
+      if (Readable(table, 40 * 4)) {
+        const u32 *t = reinterpret_cast<const u32 *>(table);
+        const u64 colors = (u64(t[20]) | (u64(t[21] & 0xFFF) << 32)) & kGpuAddrMask;
+        const u64 lights = (u64(t[36]) | (u64(t[37] & 0xFFF) << 32)) & kGpuAddrMask;
+        const u32 n = std::min<u32>(t[22], gx * tx);
+        const u32 light_count = Readable(lights, 4) ? *reinterpret_cast<const u32 *>(lights) : ~0u;
+        if (Readable(colors, u64(n) * 16)) {
+          [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+            const float *c = reinterpret_cast<const float *>(colors);
+            u32 big = 0;
+            for (u32 i = 0; i < n; ++i) {
+              big += !(std::fabs(c[i * 4]) < 1e30f) || !(std::fabs(c[i * 4 + 1]) < 1e30f) ||
+                     !(std::fabs(c[i * 4 + 2]) < 1e30f);
+            }
+            DC_INFO("gpu: rain diag: after cs %#llx: colors %#llx %u/%u big, [0] = %g %g %g %g, "
+                    "lights %#llx count %u",
+                    (unsigned long long)kRainDropLightCs, (unsigned long long)colors, big, n, c[0], c[1],
+                    c[2], c[3], (unsigned long long)lights, light_count);
+          }];
+        }
+      }
+    }
   }
   if (!addr || !gx || !gy || !gz) {
     return;
