@@ -578,6 +578,53 @@ struct MetalRenderer::Impl {
   };
   std::unordered_map<u64, TextureEntry> textures;
   std::unordered_map<u32, id<MTLTexture>> dummy_textures;
+
+  // Streaming reuses texture memory with new descriptors, and each one gets
+  // its own entry: without eviction every track load kept the last one's
+  // textures (37 GB after a few events). Entries unused for kTextureMaxAge
+  // frames go; a later use uploads again. Command buffers retain what they
+  // bind, so dropping ours is safe while the GPU still reads it.
+  // DC_TEX_MAX_AGE=<frames> overrides (0 keeps everything, the old way).
+  // Track loads create thousands of textures within seconds (15 GB peaks),
+  // so past kTextureBudget anything unused for a couple of frames goes at
+  // once. The budget is 1/8 of RAM, at least 1 GB (a race uses ~1.2 GB);
+  // DC_TEX_BUDGET_MB=<MB> overrides.
+  static constexpr u64 kTextureSweepEvery = 150;
+  static constexpr u64 kTextureMinAge = 2;
+  const u64 kTextureMaxAge = [] {
+    const char *v = std::getenv("DC_TEX_MAX_AGE");
+    return v ? std::strtoull(v, nullptr, 10) : 600ull;
+  }();
+  const u64 kTextureBudget = [] {
+    if (const char *v = std::getenv("DC_TEX_BUDGET_MB")) {
+      return std::strtoull(v, nullptr, 10) << 20;
+    }
+    return std::max<u64>(NSProcessInfo.processInfo.physicalMemory / 8, 1ull << 30);
+  }();
+  u64 texture_bytes = 0;
+  u64 texture_bytes_peak = 0; // since the last "mem:" line
+  u64 texture_pressure_frame = ~0ull;
+  void EvictTextures(u64 max_age) {
+    if (kTextureMaxAge == 0) {
+      return;
+    }
+    for (auto it = textures.begin(); it != textures.end();) {
+      if (frame_count - it->second.frame > max_age) {
+        texture_bytes -= it->second.tex ? it->second.tex.allocatedSize : 0;
+        it = textures.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  // After a new texture: over budget, drop what the last frames did not use
+  // (once per frame; what is left is in use and stays).
+  void TexturePressure() {
+    if (texture_bytes > kTextureBudget && texture_pressure_frame != frame_count) {
+      texture_pressure_frame = frame_count;
+      EvictTextures(kTextureMinAge);
+    }
+  }
   id<MTLSamplerState> default_sampler = nil;
   id<MTLBuffer> quad_indices = nil;
   id<MTLBuffer> gds = nil; // 64 KB global data share
@@ -703,6 +750,50 @@ struct MetalRenderer::Impl {
   std::atomic<u64> perf_gpu_ns{0};
   u64 perf_frames = 0;
   std::chrono::steady_clock::time_point perf_t0{};
+
+  // "mem:" line next to "perf:": what the process and the host caches hold,
+  // in MB, so a log shows which one grows.
+  void LogMemory() {
+    task_vm_info_data_t vm{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    const u64 footprint =
+        task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm), &count) == KERN_SUCCESS
+            ? vm.phys_footprint
+            : 0;
+    const u64 tex_bytes = texture_bytes;
+    const u64 tex_peak = std::max(texture_bytes_peak, texture_bytes);
+    texture_bytes_peak = 0;
+    auto targets = [](const TargetMap &m, u64 &n) {
+      u64 bytes = 0;
+      for (const auto &[a, v] : m) {
+        for (const auto &rt : v) {
+          ++n;
+          if (rt->tex && !rt->view_of) {
+            bytes += rt->tex.allocatedSize;
+          }
+          bytes += rt->bounds_copy ? rt->bounds_copy.allocatedSize : 0;
+        }
+      }
+      return bytes;
+    };
+    u64 n_color = 0, n_depth = 0;
+    const u64 color_bytes = targets(color_targets, n_color);
+    const u64 depth_bytes = targets(depth_targets, n_depth);
+    u64 retired_bytes = 0;
+    for (const auto &rt : retired) {
+      retired_bytes += rt->tex && !rt->view_of ? rt->tex.allocatedSize : 0;
+    }
+    size_t n_shaders = 0;
+    for (const auto &[a, v] : shaders) {
+      n_shaders += v.size();
+    }
+    constexpr double kMB = 1.0 / (1 << 20);
+    DC_INFO("mem: footprint %.0f, metal %.0f, textures %zu/%.0f (peak %.0f), color %llu/%.0f, depth %llu/%.0f, "
+            "retired %zu/%.0f, shaders %zu, pipelines %zu",
+            footprint * kMB, device.currentAllocatedSize * kMB, textures.size(), tex_bytes * kMB, tex_peak * kMB,
+            (unsigned long long)n_color, color_bytes * kMB, (unsigned long long)n_depth, depth_bytes * kMB,
+            retired.size(), retired_bytes * kMB, n_shaders, pipelines.size());
+  }
   mach_port_t draw_thread = 0; // DC_GPU_STATS: whose CPU time to report
   u64 stat_hashed = 0;
   u64 stat_commits = 0, stat_waits = 0, stat_dispatches = 0, stat_draws = 0;
@@ -2467,6 +2558,8 @@ struct MetalRenderer::Impl {
       if (!e.tex) {
         return Dummy(tt);
       }
+      texture_bytes += e.tex.allocatedSize;
+      texture_bytes_peak = std::max(texture_bytes_peak, texture_bytes);
     }
     const auto *src = reinterpret_cast<const u8 *>(addr);
     std::vector<u8> linear;
@@ -2515,6 +2608,7 @@ struct MetalRenderer::Impl {
     e.frame = frame_count;
     e.addr = addr;
     e.size = size;
+    TexturePressure();
     return view();
   }
 
@@ -4856,6 +4950,9 @@ bool MetalRenderer::Impl::BeginCapture(const std::string &path) {
 void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   CpuTimer t(cpu_profile ? &cpu_flip_s : nullptr);
   ++frame_count;
+  if (frame_count % kTextureSweepEvery == 0) {
+    EvictTextures(kTextureMaxAge);
+  }
   if (capture_end && frame_count >= capture_end) {
     Commit(false);
     [[MTLCaptureManager sharedCaptureManager] stopCapture];
@@ -4897,6 +4994,7 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
       const double gpu_s = perf_gpu_ns.exchange(0) / 1e9;
       DC_INFO("perf: %.1f fps, gpu %.1f ms/frame (busy %.0f%%), %zu pipelines compiling",
               frames / dt, gpu_s * 1e3 / frames, gpu_s / dt * 100, pending.size());
+      LogMemory();
       perf_frames = 1;
       perf_t0 = now;
     }
