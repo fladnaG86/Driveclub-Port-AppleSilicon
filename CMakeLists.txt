@@ -106,6 +106,8 @@ set(DC_CORE_SOURCES
     src/hle/services/misc_services.h
     src/hle/audio_out/audio_out.h
     src/hle/audio_out/audio_out.cpp
+    src/hle/ajm/ajm.h
+    src/hle/ajm/ajm.cpp
     src/hle/services/misc_services.cpp
     src/hle/nid_db.inc
 )
@@ -126,6 +128,12 @@ set(DC_METAL_SOURCES
     src/launcher.h
     src/launcher.mm
 )
+
+# ATRAC9 decoder for libSceAjm (MIT, third_party/libatrac9/LICENSE).
+file(GLOB DC_LIBATRAC9_SOURCES third_party/libatrac9/src/*.c)
+add_library(libatrac9 STATIC ${DC_LIBATRAC9_SOURCES})
+target_include_directories(libatrac9 PUBLIC third_party/libatrac9/src)
+target_compile_options(libatrac9 PRIVATE -w $<$<CONFIG:Release>:-O3 -march=btver2>)
 
 add_executable(driveclub ${DC_CORE_SOURCES} ${DC_METAL_SOURCES})
 
@@ -151,6 +159,7 @@ target_link_options(driveclub PRIVATE
 
 target_link_libraries(driveclub PRIVATE
     SDL3::SDL3
+    libatrac9
     "-framework Metal"
     "-framework QuartzCore"
     "-framework Foundation"

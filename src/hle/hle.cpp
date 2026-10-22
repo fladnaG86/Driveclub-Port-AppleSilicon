@@ -23,6 +23,7 @@ namespace Font { void RegisterFont(); }
 namespace AvPlayer { void RegisterAvPlayer(); }
 namespace MiscServices { void RegisterMiscServices(); }
 namespace AudioOut { void RegisterAudioOut(); }
+namespace Ajm { void RegisterAjm(); }
 
 namespace {
 
@@ -112,6 +113,7 @@ void RegisterAll() {
     AvPlayer::RegisterAvPlayer();
     MiscServices::RegisterMiscServices();
     AudioOut::RegisterAudioOut();
+    Ajm::RegisterAjm();
 }
 
 } // namespace Hle

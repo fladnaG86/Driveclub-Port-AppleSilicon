@@ -122,54 +122,6 @@ s32 sceAudioInGetSilentState(s32 handle) {
     return 0;
 }
 
-// libSceAjm
-s32 sceAjmInitialize(s64 reserved, u32* p_ctx) {
-    if (p_ctx) {
-        *p_ctx = 1;
-    }
-    DC_INFO("sceAjmInitialize() -> ctx 1");
-    return 0;
-}
-
-s32 sceAjmModuleRegister(u32 ctx, u32 type, s64 reserved) {
-    return 0;
-}
-
-s32 sceAjmInstanceCreate(u32 ctx, u32 type, u32 flags, u32* out_inst) {
-    if (out_inst) {
-        *out_inst = 1;
-    }
-    return 0;
-}
-
-s32 sceAjmInstanceDestroy(u32 ctx, u32 inst) {
-    return 0;
-}
-
-s32 sceAjmMemoryRegister(u32 ctx, void* ptr, size_t num_pages) {
-    return 0;
-}
-
-s32 sceAjmMemoryUnregister(u32 ctx, void* ptr) {
-    return 0;
-}
-
-s32 sceAjmBatchJobControlBufferRa() {
-    return 0;
-}
-
-s32 sceAjmBatchJobRunBufferRa() {
-    return 0;
-}
-
-s32 sceAjmBatchStartBuffer() {
-    return 0;
-}
-
-s32 sceAjmBatchWait(u32 context_id, u32 batch_id, s64 timeout, void* result) {
-    return 0;
-}
-
 // libSceHttp & libSceSsl
 s32 sceHttpInit(s32 pool_id, s32 ssl_id, size_t pool_size) {
     return 0;
@@ -319,16 +271,6 @@ void RegisterMiscServices() {
     DC_HLE("libSceAudioIn", sceAudioInGetSilentState);
 
 
-    DC_HLE("libSceAjm", sceAjmInitialize);
-    DC_HLE("libSceAjm", sceAjmModuleRegister);
-    DC_HLE("libSceAjm", sceAjmInstanceCreate);
-    DC_HLE("libSceAjm", sceAjmInstanceDestroy);
-    DC_HLE("libSceAjm", sceAjmMemoryRegister);
-    DC_HLE("libSceAjm", sceAjmMemoryUnregister);
-    DC_HLE("libSceAjm", sceAjmBatchJobControlBufferRa);
-    DC_HLE("libSceAjm", sceAjmBatchJobRunBufferRa);
-    DC_HLE("libSceAjm", sceAjmBatchStartBuffer);
-    DC_HLE("libSceAjm", sceAjmBatchWait);
 
     DC_HLE("libSceVoice", sceVoiceInit);
     DC_HLE("libSceVoice", sceVoiceEnd);
