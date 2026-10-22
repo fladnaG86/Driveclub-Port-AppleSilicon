@@ -17,7 +17,7 @@ fi
 out="../bench/$label"
 rm -rf "$out"
 mkdir -p "$out/frames" "$out/shaders"
-env "$@" DC_GPU_STATS=1 DC_AUTOPRESS=40,45,55 DC_AUTO_THROTTLE=75,60000 \
+env "$@" DC_GPU_STATS=1 DC_AUTOPRESS=${DC_BENCH_PRESS:-30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60,62,64,66,68,70,72,74} DC_AUTO_THROTTLE=75,60000 \
     DC_DUMP_FRAMES="$out/frames" DC_DUMP_EVERY=300 DC_DUMP_SHADERS="$out/shaders" \
     ./build/driveclub "$HOME/driveclub porting/extracted/Image0" > "$out/run.log" 2>&1 &
 pid=$!
