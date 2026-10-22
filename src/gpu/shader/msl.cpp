@@ -567,18 +567,26 @@ void Emitter::EmitSmrd(const Inst& i) {
     // A register offset on a linear base: past the buffer the load reads 0.
     // The size is num_records bytes, or num_records records of STRIDE bytes
     // (the drop lighting reads light n of a stride-64 buffer at 64 * n).
+    // Each dword is checked on its own: the particle sort reads its last
+    // 12-byte pass entry with s_buffer_load_dwordx4, and only the 4th dword
+    // is past the end.
     const std::string stride = "((" + b1 + " >> 16) & 0x3fffu)";
     const std::string size = "(" + stride + " != 0u ? ulong(" + SName(static_cast<u16>(i.sbase + 2)) + ") * " +
                              stride + " : ulong(" + SName(static_cast<u16>(i.sbase + 2)) + "))";
-    const std::string in_range =
-        buffer && !i.imm ? "ulong(" + off + ") + " + N(count * 4) + "ul <= " + size + " ? " : "";
+    const bool checked = buffer && !i.imm;
+    const std::string in_range = checked ? "ulong(" + off + ") + 4ul <= " + size + " ? " : "";
     std::string s = Linear(i.pc) ? "{ device uint* p_ = " + in_range + "dc_ptr(dc_lin(mem, " + N(p.LinearBaseOf(i.pc)) +
                                        "u, " + base + "), (" + base + " + ulong(" + off + ")) & ~3ul)" +
                                        (in_range.empty() ? "" : " : nullptr") + ";"
                                  : "{ device uint* p_ = dc_ptr_n(mem, (" + base + " + ulong(" + off + ")) & ~3ul, " +
                                        N(count * 4) + "u);";
+    if (checked && count > 1 && Linear(i.pc)) {
+        // The offset register may be one of the destinations.
+        s += " ulong r_ = " + size + " - min(" + size + ", ulong(" + off + "));";
+    }
     for (u32 k = 0; k < count; ++k) {
-        s += " " + SName(static_cast<u16>(i.dst + k)) + " = p_ ? p_[" + N(k) + "] : 0u;";
+        const std::string ok = checked && k > 0 && Linear(i.pc) ? "p_ && " + N(4 * k + 4) + "ul <= r_" : "p_";
+        s += " " + SName(static_cast<u16>(i.dst + k)) + " = " + ok + " ? p_[" + N(k) + "] : 0u;";
     }
     Line(s + " }");
 }
