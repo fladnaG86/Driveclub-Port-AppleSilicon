@@ -124,6 +124,17 @@ u32 sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
     return kHwInitPacketSize;
 }
 
+u32 sceGnmDrawInitDefaultHardwareState200(u32* cmdbuf, u32 size) {
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        DC_INFO("gnm: DrawInitDefaultHardwareState200 cmdbuf %p size %u", (void*)cmdbuf, size);
+    }
+    // The 200 variant is the same context-reset + default-state block; the
+    // regular sequence already covers the state the game relies on.
+    return sceGnmDrawInitDefaultHardwareState(cmdbuf, size);
+}
+
 u32 sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
     if (!cmdbuf || size < kHwInitPacketSize) {
         return 0;
@@ -551,6 +562,7 @@ void RegisterGnmDriver() {
     Instance().SetInterruptHandler([](u32 irq) { TriggerGnmEvent(irq); });
 
     Hle::Register("libSceGnmDriver", "Idffwf3yh8s", reinterpret_cast<void*>(sceGnmDrawInitDefaultHardwareState));
+    Hle::Register("libSceGnmDriver", "0H2vBYbTLHI", reinterpret_cast<void*>(sceGnmDrawInitDefaultHardwareState200));
     Hle::Register("libSceGnmDriver", "nF6bFRUBRAU", reinterpret_cast<void*>(sceGnmDispatchInitDefaultHardwareState));
 
     Hle::Register("libSceGnmDriver", "bQVd5YzCal0", reinterpret_cast<void*>(sceGnmSetPsShader));
