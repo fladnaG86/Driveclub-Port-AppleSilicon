@@ -33,6 +33,11 @@ struct DrawCall {
     std::uint32_t index_offset = 0;  // in indices (DRAW_INDEX_OFFSET_2)
     std::uint32_t index_size = 2;    // bytes per index: 2 or 4
     std::uint32_t first_vertex = 0;  // non-indexed draws (indirect)
+    // DRAW_(INDEX_)INDIRECT: guest address of the args, which a compute
+    // shader may still be writing when the CP reads them; the host GPU reads
+    // the instance count there when it runs the draw. `instances` is then
+    // only the CP's early read, 0 if that was not usable.
+    GuestAddr indirect_args = 0;
 };
 
 // What sceVideoOutSubmitFlip asks to show.

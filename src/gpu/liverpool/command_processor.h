@@ -126,6 +126,7 @@ private:
     u64 index_base = 0;
     u32 index_size = 2;
     u32 num_instances = 1;
+    u64 draw_indirect_args = 0; // set around Draw() for DRAW_(INDEX_)INDIRECT
     bool warned_indirect = false;
     bool trace = false; // DC_CP_TRACE
     // Flip label requested by the frame being executed; written once it is shown.

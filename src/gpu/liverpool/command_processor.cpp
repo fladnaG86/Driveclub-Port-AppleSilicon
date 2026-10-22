@@ -441,7 +441,8 @@ void CommandProcessor::Draw(bool indexed, u32 count, u32 index_offset, u32 first
     DrawCall dc;
     dc.indexed = indexed;
     dc.count = count;
-    dc.instances = instances ? instances : num_instances;
+    dc.instances = draw_indirect_args ? instances : instances ? instances : num_instances;
+    dc.indirect_args = draw_indirect_args;
     dc.index_base = index_base;
     dc.index_offset = index_offset;
     dc.index_size = index_size;
@@ -812,18 +813,23 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 regs[kShRegBase + start_inst_loc] = indexed ? a[4] : a[3];
             }
             // The args may be GPU-written and not landed yet; garbage counts
-            // would make a draw that hangs the GPU.
-            if (a[0] > kMaxIndirectCount || a[1] > kMaxIndirectCount) {
+            // would make a draw that hangs the GPU. Instance counts usually
+            // come from a compute shader (particles) that has not run when we
+            // get here: the host GPU reads them from the args when it draws.
+            if (a[0] > kMaxIndirectCount) {
                 DC_WARN("gpu: skipping indirect draw with count=%u instances=%u (vs %#llx ps %#llx)", a[0], a[1],
                         (unsigned long long)regs.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS),
                         (unsigned long long)regs.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS));
                 break;
             }
+            const u32 instances = a[1] > kMaxIndirectCount ? 0 : a[1];
+            draw_indirect_args = (t_ring ? t_ring->indirect_base : 0) + body[0];
             if (indexed) {
-                Draw(true, a[0], a[2], 0, a[1]);
+                Draw(true, a[0], a[2], 0, instances);
             } else {
-                Draw(false, a[0], 0, a[2], a[1]);
+                Draw(false, a[0], 0, a[2], instances);
             }
+            draw_indirect_args = 0;
             break;
         }
 

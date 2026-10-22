@@ -4676,6 +4676,17 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   // ---- primitive assembly ----
   const u32 base_vertex = r[Reg::VGT_INDX_OFFSET];
   const NSUInteger instances = std::max<u32>(dc.instances, 1);
+  // DRAW_(INDEX_)INDIRECT: the guest args (Metal's layout) give the instance
+  // count when the GPU runs the draw; paths that cannot use them need the
+  // CP's early read.
+  // Off by default: Driveclub's particle counts go negative on the GPU too
+  // (instances 0xFFFFFFFF hung the GPU), so the count bug is upstream.
+  static const bool use_gpu_args = std::getenv("DC_GPU_DRAW_ARGS") != nullptr;
+  id<MTLBuffer> abuf = nil;
+  u64 aoff = 0;
+  const bool gpu_args = dc.indirect_args && use_gpu_args && !(dc.indirect_args & 3) &&
+                        Locate(dc.indirect_args, dc.indexed ? 20 : 16, &abuf, &aoff);
+  const bool cpu_count_unusable = dc.indirect_args && dc.instances == 0;
   MTLPrimitiveType mprim = MTLPrimitiveTypeTriangle;
   bool to_list = false; // fans and quads are rebuilt as triangle lists
   switch (prim) {
@@ -4700,6 +4711,9 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     to_list = true;
     break;
   case PrimType::RectList:
+    if (cpu_count_unusable) {
+      return;
+    }
     if (dc.indexed) {
       ReportOnce("indexed RECTLIST draws are not supported");
       return;
@@ -4715,6 +4729,13 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     return;
   }
 
+  if (!dc.indexed && !to_list && gpu_args) {
+    [enc drawPrimitives:mprim indirectBuffer:abuf indirectBufferOffset:aoff];
+    return;
+  }
+  if (cpu_count_unusable) {
+    return;
+  }
   if (!dc.indexed && !to_list) {
     [enc drawPrimitives:mprim
             vertexStart:base_vertex
@@ -4738,6 +4759,25 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   // Indexed lists and strips read the guest index buffer in place (Metal
   // restarts strips at 0xFFFF / 0xFFFFFFFF like VGT_MULTI_PRIM_IB_RESET_INDX =
   // -1).
+  if (dc.indexed && !to_list && (dc.index_size == 2 || dc.index_size == 4) &&
+      gpu_args) {
+    // The first index is in the args, relative to INDEX_BASE.
+    id<MTLBuffer> ibuf = nil;
+    u64 ioff = 0;
+    if ((dc.index_base % dc.index_size) == 0 &&
+        Locate(dc.index_base, (u64(dc.index_offset) + dc.count) * dc.index_size, &ibuf, &ioff)) {
+      [enc drawIndexedPrimitives:mprim
+                       indexType:dc.index_size == 2 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
+                     indexBuffer:ibuf
+               indexBufferOffset:ioff
+                  indirectBuffer:abuf
+            indirectBufferOffset:aoff];
+      return;
+    }
+  }
+  if (cpu_count_unusable) {
+    return;
+  }
   if (dc.indexed && !to_list && (dc.index_size == 2 || dc.index_size == 4)) {
     const u64 src = dc.index_base + u64(dc.index_offset) * dc.index_size;
     id<MTLBuffer> ibuf = nil;
