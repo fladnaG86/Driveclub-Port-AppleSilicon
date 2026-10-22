@@ -185,6 +185,7 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
     pthread_setname_np(name);
     t_ring = &ring;
     t_regs = ring.index == 0 ? &regs : &ring.regs;
+    Gpu::t_queue = ring.index;
     for (;;) {
         Job job;
         {
@@ -612,7 +613,10 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                 }
             }
             u8* gds = renderer ? renderer->Gds() : nullptr;
-            u8* dst = dst_sel == 1 ? (gds ? gds + (body[3] & 0xFFFF) : nullptr) : Ptr<u8>(body[3], body[4]);
+            const u64 dst_off = body[3] & (Gpu::kGdsPartition - 1);
+            u8* dst = dst_sel == 1
+                          ? (gds && dst_off + bytes <= Gpu::kGdsPartition ? gds + dst_off : nullptr)
+                          : Ptr<u8>(body[3], body[4]);
             if (!dst || bytes == 0 || (dst_sel != 1 && !Mapped(dst, bytes)) ||
                 (src_sel != 1 && src_sel != 2 && !Mapped(Ptr<const u8>(body[1], body[2]), bytes))) {
                 if (bytes) {
@@ -633,7 +637,10 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
                     std::memcpy(dst + k, &body[1], 4);
                 }
             } else {
-                const u8* src = src_sel == 1 ? (gds ? gds + (body[1] & 0xFFFF) : nullptr) : Ptr<const u8>(body[1], body[2]);
+                const u64 src_off = body[1] & (Gpu::kGdsPartition - 1);
+                const u8* src = src_sel == 1
+                                    ? (gds && src_off + bytes <= Gpu::kGdsPartition ? gds + src_off : nullptr)
+                                    : Ptr<const u8>(body[1], body[2]);
                 if (src) {
                     std::memmove(dst, src, bytes);
                 }

@@ -980,9 +980,10 @@ struct MetalRenderer::Impl {
                                        length:quads.size() * 4
                                       options:MTLResourceStorageModeShared];
 
-    gds = [device newBufferWithLength:0x10000
+    const NSUInteger gds_bytes = Gpu::kGdsPartition * Gpu::kGdsPartitions;
+    gds = [device newBufferWithLength:gds_bytes
                               options:MTLResourceStorageModeShared];
-    std::memset(gds.contents, 0, 0x10000);
+    std::memset(gds.contents, 0, gds_bytes);
 
     MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
     sd.minFilter = MTLSamplerMinMagFilterLinear;
@@ -1182,20 +1183,20 @@ struct MetalRenderer::Impl {
     id<MTLBuffer> dbuf = nil, sbuf = nil;
     u64 doff = 0, soff = 0;
     if (dst_sel == 1) {
-      if (dst + bytes > gds.length) {
+      if (dst + bytes > Gpu::kGdsPartition) {
         return false;
       }
       dbuf = gds;
-      doff = dst;
+      doff = Gpu::GdsBase() + dst;
     } else if (!Locate(dst, bytes, &dbuf, &doff)) {
       return false;
     }
     if (src_sel == 1) {
-      if (src + bytes > gds.length) {
+      if (src + bytes > Gpu::kGdsPartition) {
         return false;
       }
       sbuf = gds;
-      soff = src;
+      soff = Gpu::GdsBase() + src;
     } else if (src_sel != 2 && !Locate(src, bytes, &sbuf, &soff)) {
       return false;
     }
@@ -4820,7 +4821,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   [e setBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
   [e setBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
   [e setBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
-  [e setBuffer:gds offset:0 atIndex:Shader::Binding::Gds];
+  [e setBuffer:gds offset:Gpu::GdsBase() atIndex:Shader::Binding::Gds];
   if (o.linear_mask) {
     [e setBytes:lin
          length:4 * (32 - std::countl_zero(o.linear_mask))
@@ -5383,7 +5384,7 @@ void MetalRenderer::NoteConstDump(std::uint64_t addr, std::uint32_t bytes) {
 }
 
 std::uint8_t *MetalRenderer::Gds() {
-  return static_cast<std::uint8_t *>(impl->gds.contents);
+  return static_cast<std::uint8_t *>(impl->gds.contents) + Gpu::GdsBase();
 }
 
 void *MetalRenderer::LatestFrame() const {

@@ -10,7 +10,11 @@
 // usable on macOS through MoltenVK; src/gpu/vulkan wraps shadPS4's renderer).
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
+
+#include "gpu/gds.h"
 
 namespace Gpu {
 
@@ -88,9 +92,29 @@ public:
         return false;
     }
 
-    // The 64 KB global data share, shared by shaders and CP DMA (call WaitIdle
-    // before reading what shaders wrote).
+    // The calling queue's partition of the global data share, shared by its
+    // shaders and CP DMA (call WaitIdle before reading what shaders wrote).
     virtual std::uint8_t* Gds() = 0;
 };
+
+// Queue the calling thread executes (0 = graphics, n = compute vqid n).
+inline thread_local std::uint32_t t_queue = 0;
+inline std::uint32_t GdsBase() {
+    static const bool shared = std::getenv("DC_SHARED_GDS") != nullptr;
+    if (shared) {
+        return 0;
+    }
+    // vqid is a growing handle, not a dense index: clamp rather than wrap so a
+    // remapped queue cannot silently land in the graphics ring's slice.
+    if (t_queue >= kGdsPartitions) {
+        static const bool warned = [] {
+            std::fprintf(stderr, "gds: queue id outside the %u partitions\n", kGdsPartitions);
+            return true;
+        }();
+        (void)warned;
+    }
+    const std::uint32_t slice = t_queue < kGdsPartitions ? t_queue : kGdsPartitions - 1;
+    return slice * kGdsPartition;
+}
 
 } // namespace Gpu

@@ -27,7 +27,7 @@ constexpr u32 Mem0 = 1;     // device uint*: direct memory [0, split)
 constexpr u32 Mem1 = 2;     // device uint*: direct memory [split, end)
 constexpr u32 MemMap = 3;   // constant DcMap
 constexpr u32 Draw = 4;     // constant DcDraw (vertex stage)
-constexpr u32 Gds = 5;      // device uint[16K]: global data share (compute stage)
+constexpr u32 Gds = 5;      // device uint[16K]: the queue's 64 KB GDS partition (compute stage)
 constexpr u32 Linear = 8;   // constant uint[]: translated linear bases (MslOptions::linear_mask)
 } // namespace Binding
 

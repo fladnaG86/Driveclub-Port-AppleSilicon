@@ -54,6 +54,7 @@ set(DC_CORE_SOURCES
     src/core/signals.h
     src/core/tls.cpp
     src/core/tls.h
+    src/gpu/gds.h
     src/gpu/renderer.h
     src/gpu/liverpool/pm4.h
     src/gpu/liverpool/command_processor.h

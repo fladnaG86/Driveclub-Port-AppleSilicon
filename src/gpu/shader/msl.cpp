@@ -7,6 +7,7 @@
 #include <set>
 #include <unordered_map>
 
+#include "gpu/gds.h"
 #include "gpu/shader/msl_prelude.h"
 
 namespace Gpu::Shader {
@@ -1025,9 +1026,15 @@ void Emitter::EmitDs(const Inst& i) {
         // One atomic per wave (SIMD group): returns the wave's base slot;
         // lanes add their mbcnt to it.
         const bool append = static_cast<Ds>(i.op) == Ds::DS_APPEND;
-        const std::string idx = "(((m0r & 0xffffu) + " + N(off16) + "u) >> 2)";
-        const std::string target = i.gds ? "(device atomic_uint*)&gds[" + idx + "]"
-                                         : "(threadgroup atomic_uint*)&lds[" + idx + "]";
+        // LDS: M0[15:0] is the size limit, not an address; the list starts at
+        // the instruction offset. GDS: M0[31:16] is the byte base and
+        // M0[15:0] the size limit; the rain's particle compaction (M0 = 0x40)
+        // counts into GDS bytes 0 and 4.
+        const std::string lds_idx = "((" + N(off16) + "u) >> 2)";
+        const std::string gds_idx = "((((m0r >> 16) + " + N(off16) + "u) >> 2) & " +
+                                    N(Gpu::kGdsIndexMask) + "u)";
+        const std::string target = i.gds ? "(device atomic_uint*)&gds[" + gds_idx + "]"
+                                         : "(threadgroup atomic_uint*)&lds[" + lds_idx + "]";
         Line(std::string("{ uint act_ = ") + (p.writes_exec ? "exec_lo != 0u ? 1u : 0u" : "1u") +
              "; uint cnt_ = simd_sum(act_); uint base_ = 0u;");
         Line("  if (simd_is_first()) base_ = atomic_fetch_" + std::string(append ? "add" : "sub") + "_explicit(" +
