@@ -38,6 +38,7 @@ constexpr float kVolume0dB = 32768.0f;
 struct Port {
     bool open = false;
     SDL_AudioStream* stream = nullptr;
+    SDL_AudioDeviceID device = 0;
     u32 buffer_bytes = 0;
     u32 channels = 0;
     // Ring of PCM bytes between the guest and the SDL callback.
@@ -195,11 +196,28 @@ s32 sceAudioOutOpen(s32 user_id, s32 port_type, s32 index, u32 len, u32 freq, u3
         p.read = p.write = 0;
         SDL_AudioSpec spec{is_float ? SDL_AUDIO_F32 : SDL_AUDIO_S16, static_cast<int>(channels),
                            static_cast<int>(freq ? freq : 48000)};
-        p.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, Feed, &p);
-        if (!p.stream) {
+        // The device opens in its own format and the stream converts to it.
+        // Handing it the guest's 7.1 as the device format made CoreAudio
+        // play only front left/right on stereo outputs: centre and surround,
+        // where FMOD pans other cars, ambience and most effects, were lost.
+        p.device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, nullptr);
+        p.stream = p.device ? SDL_CreateAudioStream(&spec, nullptr) : nullptr;
+        if (!p.stream || !SDL_SetAudioStreamGetCallback(p.stream, Feed, &p) ||
+            !SDL_BindAudioStream(p.device, p.stream)) {
             DC_ERROR("audio: cannot open stream: %s", SDL_GetError());
+            if (p.stream) {
+                SDL_DestroyAudioStream(p.stream);
+                p.stream = nullptr;
+            }
+            if (p.device) {
+                SDL_CloseAudioDevice(p.device);
+                p.device = 0;
+            }
             return kErrorPortFull;
         }
+        SDL_AudioSpec device_spec{};
+        int device_frames = 0;
+        SDL_GetAudioDeviceFormat(p.device, &device_spec, &device_frames);
         p.open = true;
         if (const char* dir = DumpDir()) {
             char path[1024];
@@ -208,9 +226,10 @@ s32 sceAudioOutOpen(s32 user_id, s32 port_type, s32 index, u32 len, u32 freq, u3
             p.dump = std::fopen(path, "wb");
             p.dump_started = false;
         }
-        SDL_ResumeAudioStreamDevice(p.stream);
-        DC_INFO("audio: port %zu type %d: %d Hz, %u ch, %s, %u samples per buffer", i + 1, port_type, spec.freq,
-                channels, is_float ? "float" : "s16", len);
+        SDL_ResumeAudioDevice(p.device);
+        DC_INFO("audio: port %zu type %d: %d Hz, %u ch, %s, %u samples per buffer (device %d Hz, %d ch)", i + 1,
+                port_type, spec.freq, channels, is_float ? "float" : "s16", len, device_spec.freq,
+                device_spec.channels);
         return static_cast<s32>(i + 1);
     }
     return kErrorPortFull;
@@ -224,6 +243,8 @@ s32 sceAudioOutClose(s32 handle) {
     }
     SDL_DestroyAudioStream(p->stream); // stops the callback first
     p->stream = nullptr;
+    SDL_CloseAudioDevice(p->device);
+    p->device = 0;
     if (p->dump) {
         std::fclose(p->dump);
         p->dump = nullptr;
