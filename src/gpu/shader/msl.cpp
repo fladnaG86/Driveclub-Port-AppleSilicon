@@ -142,7 +142,7 @@ private:
              " = uint(t_ >> 32); }");
     }
     void SetV(u32 v, const std::string& e) {
-        if (p.writes_exec) {
+        if (guard) {
             Line("if (exec_lo != 0u) " + VName(v) + " = " + e + ";");
         } else {
             Line(VName(v) + " = " + e + ";");
@@ -157,7 +157,7 @@ private:
     }
     void SetVF(const Inst& i, const std::string& fe) { SetV(i.dst, FOut(i, fe)); }
     void SetMask(u16 code, const std::string& cond) {
-        Line("{ uint m_ = ((" + cond + ") && exec_lo != 0u) ? 0xffffffffu : 0u; " + SName(code) +
+        Line("{ uint m_ = ((" + cond + ")" + (guard ? " && exec_lo != 0u" : "") + ") ? 0xffffffffu : 0u; " + SName(code) +
              " = m_; " + SName(Hi(code)) + " = m_; }");
     }
 
@@ -256,6 +256,7 @@ private:
     // Structured control flow (see Structure()).
     bool structured = false;
     u32 cur = 0;                              // index of the instruction being emitted
+    bool guard = false;                       // its lane writes need `exec_lo != 0u`
     std::unordered_map<u32, u32> index_of;    // pc -> instruction index
     std::unordered_map<u32, u32> loop_end;    // loop header index -> index of its last back edge
 
@@ -291,6 +292,10 @@ private:
 };
 
 void Emitter::Emit(const Inst& i) {
+    // Where the lane is surely on (see LaneOn) the guards are dead weight that
+    // makes the Metal compiler take seconds on big shaders.
+    const size_t index = static_cast<size_t>(&i - p.code.data());
+    guard = p.writes_exec && !(index < p.lane_on.size() && p.lane_on[index]);
     if (i.pc == o.probe_pc && p.stage != Stage::Vertex) {
         body += "    /*DC_PROBE*/\n";
     }
@@ -802,14 +807,14 @@ void Emitter::EmitVop(const Inst& i) {
         if (static_cast<Vop>(i.op) == Vop::V_MOVRELS_B32) {
             SetV(i.dst, "t_");
         } else {
-            Line("if (exec_lo != 0u) switch (" + N(i.dst) + "u + m0r) { /*DC_REL_WRITE*/ default: break; }");
+            Line(std::string(guard ? "if (exec_lo != 0u) " : "") + "switch (" + N(i.dst) + "u + m0r) { /*DC_REL_WRITE*/ default: break; }");
         }
         Line("}");
         uses_movrel = true;
         break;
     }
     case Vop::V_MOVRELD_B32:
-        Line("{ uint t_ = " + U(i, 0) + "; if (exec_lo != 0u) switch (" + N(i.dst) + "u + m0r) { /*DC_REL_WRITE*/ default: break; } }");
+        Line("{ uint t_ = " + U(i, 0) + "; " + (guard ? "if (exec_lo != 0u) " : "") + "switch (" + N(i.dst) + "u + m0r) { /*DC_REL_WRITE*/ default: break; } }");
         uses_movrel = true;
         break;
     case Vop::V_MOV_B32:
@@ -939,7 +944,7 @@ void Emitter::EmitDs(const Inst& i) {
     // LDS: `lds` is the threadgroup memory as dwords; addresses are bytes.
     const std::string a = VName(i.vaddr);
     const u32 off16 = (u32(i.offset1) << 8) | i.offset0;
-    const std::string guard = p.writes_exec ? "if (exec_lo != 0u) " : "";
+    const std::string lane_guard = guard ? "if (exec_lo != 0u) " : "";
     auto at = [&](u32 byte_off) { return "lds[(" + a + " + " + N(byte_off) + "u) >> 2]"; };
     auto atomic = [&](const char* fn, bool rtn, bool sign) {
         const std::string ty = sign ? "threadgroup atomic_int*" : "threadgroup atomic_uint*";
@@ -948,30 +953,30 @@ void Emitter::EmitDs(const Inst& i) {
         if (rtn) {
             SetV(i.dst, "uint(" + call + ")");
         } else {
-            Line(guard + "(void)" + call + ";");
+            Line(lane_guard + "(void)" + call + ";");
         }
     };
     switch (static_cast<Ds>(i.op)) {
-    case Ds::DS_WRITE_B32: Line(guard + at(off16) + " = " + VName(i.data0) + ";"); break;
+    case Ds::DS_WRITE_B32: Line(lane_guard + at(off16) + " = " + VName(i.data0) + ";"); break;
     case Ds::DS_WRITE2_B32:
     case Ds::DS_WRITE2ST64_B32: {
         const u32 scale = static_cast<Ds>(i.op) == Ds::DS_WRITE2ST64_B32 ? 256 : 4;
-        Line(guard + "{ " + at(i.offset0 * scale) + " = " + VName(i.data0) + "; " + at(i.offset1 * scale) + " = " +
+        Line(lane_guard + "{ " + at(i.offset0 * scale) + " = " + VName(i.data0) + "; " + at(i.offset1 * scale) + " = " +
              VName(i.data1) + "; }");
         break;
     }
     case Ds::DS_WRITE_B64:
-        Line(guard + "{ " + at(off16) + " = " + VName(i.data0) + "; " + at(off16 + 4) + " = " + VName(i.data0 + 1u) + "; }");
+        Line(lane_guard + "{ " + at(off16) + " = " + VName(i.data0) + "; " + at(off16 + 4) + " = " + VName(i.data0 + 1u) + "; }");
         break;
     case Ds::DS_WRITE2_B64:
-        Line(guard + "{ " + at(i.offset0 * 8) + " = " + VName(i.data0) + "; " + at(i.offset0 * 8 + 4) + " = " +
+        Line(lane_guard + "{ " + at(i.offset0 * 8) + " = " + VName(i.data0) + "; " + at(i.offset0 * 8 + 4) + " = " +
              VName(i.data0 + 1u) + "; " + at(i.offset1 * 8) + " = " + VName(i.data1) + "; " + at(i.offset1 * 8 + 4) +
              " = " + VName(i.data1 + 1u) + "; }");
         break;
     case Ds::DS_WRITE_B96:
     case Ds::DS_WRITE_B128: {
         const u32 n = static_cast<Ds>(i.op) == Ds::DS_WRITE_B96 ? 3 : 4;
-        std::string w = guard + "{ ";
+        std::string w = lane_guard + "{ ";
         for (u32 k = 0; k < n; ++k) {
             w += at(off16 + 4 * k) + " = " + VName(i.data0 + k) + "; ";
         }
@@ -979,10 +984,10 @@ void Emitter::EmitDs(const Inst& i) {
         break;
     }
     case Ds::DS_WRITE_B8:
-        Line(guard + "((threadgroup uchar*)lds)[" + a + " + " + N(off16) + "u] = uchar(" + VName(i.data0) + ");");
+        Line(lane_guard + "((threadgroup uchar*)lds)[" + a + " + " + N(off16) + "u] = uchar(" + VName(i.data0) + ");");
         break;
     case Ds::DS_WRITE_B16:
-        Line(guard + "((threadgroup ushort*)lds)[(" + a + " + " + N(off16) + "u) >> 1] = ushort(" + VName(i.data0) + ");");
+        Line(lane_guard + "((threadgroup ushort*)lds)[(" + a + " + " + N(off16) + "u) >> 1] = ushort(" + VName(i.data0) + ");");
         break;
     case Ds::DS_READ_B32: SetV(i.dst, at(off16)); break;
     case Ds::DS_READ2_B32:
@@ -1039,7 +1044,7 @@ void Emitter::EmitDs(const Inst& i) {
                                     N(Gpu::kGdsIndexMask) + "u)";
         const std::string target = i.gds ? "(device atomic_uint*)&gds[" + gds_idx + "]"
                                          : "(threadgroup atomic_uint*)&lds[" + lds_idx + "]";
-        Line(std::string("{ uint act_ = ") + (p.writes_exec ? "exec_lo != 0u ? 1u : 0u" : "1u") +
+        Line(std::string("{ uint act_ = ") + (guard ? "exec_lo != 0u ? 1u : 0u" : "1u") +
              "; uint cnt_ = simd_sum(act_); uint base_ = 0u;");
         Line("  if (simd_is_first()) base_ = atomic_fetch_" + std::string(append ? "add" : "sub") + "_explicit(" +
              target + ", cnt_, memory_order_relaxed);");
@@ -1105,7 +1110,7 @@ void Emitter::EmitBuffer(const Inst& i) {
         Line("  DcLin lm_ = dc_lin(mem, " + N(p.LinearBaseOf(i.pc)) + "u, base_);");
     }
 
-    auto store_guard = [&]() { return std::string(p.writes_exec ? "if (!oob_ && exec_lo != 0u) " : "if (!oob_) "); };
+    auto store_guard = [&]() { return std::string(guard ? "if (!oob_ && exec_lo != 0u) " : "if (!oob_) "); };
     auto load_fmt = [&](u32 n, const std::string& fetch) {
         Line("  uint4 f_ = oob_ ? uint4(0u) : " + fetch + ";");
         for (u32 k = 0; k < n; ++k) {
@@ -1135,7 +1140,7 @@ void Emitter::EmitBuffer(const Inst& i) {
         const std::string ty = sign ? "atomic_int" : "atomic_uint";
         const std::string val = sign ? "int(" + VName(i.vdata) + ")" : VName(i.vdata);
         Line("  device uint* p_ = oob_ ? nullptr : dc_ptr(" + M + ", a_);");
-        Line("  uint r_ = 0u; " + std::string(p.writes_exec ? "if (p_ && exec_lo != 0u) " : "if (p_) ") +
+        Line("  uint r_ = 0u; " + std::string(guard ? "if (p_ && exec_lo != 0u) " : "if (p_) ") +
              "r_ = uint(" + fn + "((device " + ty + "*)p_, " + val + ", memory_order_relaxed));");
         if (i.glc) {
             SetV(i.vdata, "r_");
@@ -1280,7 +1285,7 @@ void Emitter::EmitImage(const Inst& i) {
         } else {
             value = std::string(vec) + "(uint4(" + comps[0] + ", " + comps[1] + ", " + comps[2] + ", " + comps[3] + "))";
         }
-        Line((p.writes_exec ? "if (exec_lo != 0u) " : "") + t + ".write(" + value + ", " + int_coord(i.vaddr) + ");");
+        Line((guard ? "if (exec_lo != 0u) " : "") + t + ".write(" + value + ", " + int_coord(i.vaddr) + ");");
         return;
     }
     if (op == Mimg::IMAGE_LOAD || op == Mimg::IMAGE_LOAD_MIP) {
@@ -1299,7 +1304,7 @@ void Emitter::EmitImage(const Inst& i) {
             return;
         }
         const std::string val = tt.sample == TexSample::Uint ? VName(i.vdata) : "int(" + VName(i.vdata) + ")";
-        Line("{ uint r_ = 0u; " + std::string(p.writes_exec ? "if (exec_lo != 0u) " : "") + "r_ = uint(" + t +
+        Line("{ uint r_ = 0u; " + std::string(guard ? "if (exec_lo != 0u) " : "") + "r_ = uint(" + t +
              ".atomic_fetch_add(" + int_coord(i.vaddr) + ", " + val + ").x);");
         if (i.glc) {
             SetV(i.vdata, "r_");
@@ -1435,7 +1440,7 @@ void Emitter::EmitExp(const Inst& i) {
     if (p.stage != Stage::Fragment) {
         return;
     }
-    if (p.writes_exec) {
+    if (guard) {
         Line("if (exec_lo == 0u) discard_fragment();");
     }
     Line("dc_exported = true;");

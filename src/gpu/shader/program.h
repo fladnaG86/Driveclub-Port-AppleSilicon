@@ -99,6 +99,8 @@ struct Program {
     std::vector<u32> labels; // byte offsets that need a case label (sorted)
     bool has_branches = false;
     bool writes_exec = false;
+    // Per instruction index: this lane is surely on before it (see LaneOn).
+    std::vector<bool> lane_on;
 
     // Image instruction pc -> index into `images`.
     std::vector<std::pair<u32, u32>> image_slot_by_pc;

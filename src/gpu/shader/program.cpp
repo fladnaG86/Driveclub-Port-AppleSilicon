@@ -1,6 +1,7 @@
 #include "gpu/shader/program.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "common/log.h"
@@ -514,6 +515,166 @@ bool WritesExec(const Inst& i) {
     }
 }
 
+// Per instruction: whether this lane is surely on (exec_lo != 0u) before it
+// runs, so its lane writes need no exec guard. Lanes run one per thread, so a
+// s_cbranch_execz skips the region for exactly the lanes that are off: on its
+// fall-through (and s_cbranch_execnz's target) the lane is on. A forward
+// must-analysis over the basic blocks, edge-sensitive for those branches,
+// that also tracks the SGPR pairs holding exec saved while the lane was on
+// (s_mov_b64 / s_*_saveexec_b64), so restoring them (s_mov_b64 exec or
+// s_or_b64 exec, exec, saved) turns the lane back on.
+std::vector<bool> LaneOn(const std::vector<Inst>& code) {
+    const size_t n = code.size();
+    struct State {
+        bool on = true;
+        std::array<bool, Operand::SgprMax + 1> saved{}; // SGPR is nonzero for this lane
+        bool operator==(const State&) const = default;
+    };
+    auto meet = [](State& a, const State& b) {
+        a.on = a.on && b.on;
+        for (size_t r = 0; r < a.saved.size(); ++r) {
+            a.saved[r] = a.saved[r] && b.saved[r];
+        }
+    };
+    State top;
+    top.saved.fill(true);
+    const State entry; // all lanes on, no copies
+
+    // An operand pair surely nonzero for this lane.
+    auto on_src = [](const State& s, u16 code) {
+        if (code == Operand::ExecLo) {
+            return s.on;
+        }
+        if (code == Operand::IntPosMax + 1) { // -1: all lanes
+            return true;
+        }
+        return code < Operand::SgprMax && s.saved[code] && s.saved[code + 1u];
+    };
+    auto step = [&](State& s, const Inst& i) {
+        const State before = s;
+        ForEachSgprWrite(i, [&](u32 reg, u32 count) {
+            for (u32 r = reg; r < reg + count && r <= Operand::SgprMax; ++r) {
+                s.saved[r] = false;
+            }
+        });
+        auto set_saved = [&](u16 dst, bool v) {
+            if (dst < Operand::SgprMax) {
+                s.saved[dst] = s.saved[dst + 1u] = v;
+            }
+        };
+        const bool to_exec = i.dst == Operand::ExecLo;
+        if (i.enc == Enc::SOP1) {
+            const auto op = static_cast<Sop1>(i.op);
+            if (op == Sop1::S_MOV_B64) {
+                if (to_exec) {
+                    s.on = on_src(before, i.src[0]);
+                } else {
+                    set_saved(i.dst, on_src(before, i.src[0]));
+                }
+                return;
+            }
+            if (op >= Sop1::S_AND_SAVEEXEC_B64 && op <= Sop1::S_XNOR_SAVEEXEC_B64) {
+                set_saved(i.dst, before.on);
+                s.on = op == Sop1::S_OR_SAVEEXEC_B64 && (before.on || on_src(before, i.src[0]));
+                return;
+            }
+        }
+        if (i.enc == Enc::SOP2 && to_exec) {
+            s.on = static_cast<Sop2>(i.op) == Sop2::S_OR_B64 && (on_src(before, i.src[0]) || on_src(before, i.src[1]));
+            return;
+        }
+        if (WritesExec(i)) {
+            s.on = false;
+        }
+    };
+
+    // Basic blocks as Exactness::Reaching builds them.
+    auto index_of = [&](u32 pc) {
+        for (size_t t = 0; t < n; ++t) {
+            if (code[t].pc == pc) {
+                return t;
+            }
+        }
+        return n;
+    };
+    auto is_end = [](const Inst& i) { return i.enc == Enc::SOPP && static_cast<Sopp>(i.op) == Sopp::S_ENDPGM; };
+    std::vector<bool> leader(n + 1, false);
+    leader[0] = true;
+    for (size_t k = 0; k < n; ++k) {
+        if (IsBranch(code[k])) {
+            leader[index_of(BranchTarget(code[k]))] = true;
+        }
+        if (IsBranch(code[k]) || is_end(code[k])) {
+            leader[k + 1] = true;
+        }
+    }
+    std::vector<size_t> block_start, block_of(n, 0);
+    for (size_t k = 0; k < n; ++k) {
+        if (leader[k]) {
+            block_start.push_back(k);
+        }
+        block_of[k] = block_start.size() - 1;
+    }
+    const size_t nb = block_start.size();
+    auto block_end = [&](size_t b) { return b + 1 < nb ? block_start[b + 1] : n; };
+    // Per block: predecessors and whether the lane is surely on along that edge.
+    struct Edge {
+        size_t from;
+        int lane; // -1: as the predecessor leaves it, 0: off, 1: on
+    };
+    std::vector<std::vector<Edge>> preds(nb);
+    for (size_t b = 0; b < nb; ++b) {
+        const Inst& i = code[block_end(b) - 1];
+        const bool jump = IsBranch(i) && static_cast<Sopp>(i.op) == Sopp::S_BRANCH;
+        const bool execz = IsBranch(i) && static_cast<Sopp>(i.op) == Sopp::S_CBRANCH_EXECZ;
+        const bool execnz = IsBranch(i) && static_cast<Sopp>(i.op) == Sopp::S_CBRANCH_EXECNZ;
+        const size_t t = IsBranch(i) ? index_of(BranchTarget(i)) : n;
+        const bool falls = !is_end(i) && !jump && block_end(b) < n;
+        if (t < n && falls && block_of[t] == b + 1) {
+            preds[b + 1].push_back({b, -1}); // both ways to the same block
+            continue;
+        }
+        if (t < n) {
+            preds[block_of[t]].push_back({b, execz ? 0 : execnz ? 1 : -1});
+        }
+        if (falls) {
+            preds[b + 1].push_back({b, execz ? 1 : execnz ? 0 : -1});
+        }
+    }
+
+    std::vector<State> in(nb, top), out(nb, top);
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (size_t b = 0; b < nb; ++b) {
+            State s = b == 0 ? entry : top;
+            for (const Edge& e : preds[b]) {
+                State o = out[e.from];
+                if (e.lane >= 0) {
+                    o.on = e.lane == 1;
+                }
+                meet(s, o);
+            }
+            in[b] = s;
+            for (size_t k = block_start[b]; k < block_end(b); ++k) {
+                step(s, code[k]);
+            }
+            if (!(out[b] == s)) {
+                out[b] = s;
+                changed = true;
+            }
+        }
+    }
+    std::vector<bool> on(n, false);
+    for (size_t b = 0; b < nb; ++b) {
+        State s = in[b];
+        for (size_t k = block_start[b]; k < block_end(b); ++k) {
+            on[k] = s.on;
+            step(s, code[k]);
+        }
+    }
+    return on;
+}
+
 bool IsImageSample(u16 op) {
     return op >= static_cast<u16>(Mimg::IMAGE_SAMPLE) && op <= static_cast<u16>(Mimg::IMAGE_GET_LOD);
 }
@@ -736,6 +897,11 @@ std::unique_ptr<Program> BuildProgram(const BuildInput& in) {
     }
     std::sort(p->labels.begin(), p->labels.end());
     p->labels.erase(std::unique(p->labels.begin(), p->labels.end()), p->labels.end());
+    // DC_NO_LANE_ON: guard every lane write in programs that write exec (A/B).
+    static const bool no_lane_on = std::getenv("DC_NO_LANE_ON") != nullptr;
+    if (p->writes_exec && !no_lane_on) {
+        p->lane_on = LaneOn(p->code);
+    }
     return p;
 }
 
