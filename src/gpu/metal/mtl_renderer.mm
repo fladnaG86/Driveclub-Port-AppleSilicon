@@ -682,6 +682,14 @@ struct MetalRenderer::Impl {
       nil; // DC_DEBUG_FLAT: every pixel shader outputs magenta
   bool trace = false;
   bool gds_readback = false; // DC_GDS_READBACK: log GDS->memory copies in the traced frame
+  u64 find_addr = 0;         // DC_FIND_ADDR (see FindRefs)
+  u64 peek_vs = 0;           // DC_PEEK_VS (see Draw)
+  // DC_RAIN_DIAG: one F12/P in the rain traces two flips. The first peeks
+  // the rain drop VS; its buffer holding only FLT_MAX (the drop colors, white
+  // screen) becomes DC_FIND_ADDR for the second, which lists every draw and
+  // dispatch referencing it.
+  bool rain_diag = false;
+  static constexpr u64 kRainDropVs = 0x7003086d00;
   u64 trace_frame = 0; // DC_TRACE_FRAME=n: DC_GPU_TRACE for flip n only
   bool dump_passes =
       false; // DC_DUMP_PASSES: with DC_TRACE_FRAME, every pass's targets
@@ -871,6 +879,15 @@ struct MetalRenderer::Impl {
     }
     trace = std::getenv("DC_GPU_TRACE") != nullptr;
     gds_readback = std::getenv("DC_GDS_READBACK") != nullptr;
+    if (const char *e = std::getenv("DC_FIND_ADDR")) {
+      find_addr = std::strtoull(e, nullptr, 16);
+    }
+    rain_diag = std::getenv("DC_RAIN_DIAG") != nullptr;
+    if (const char *e = std::getenv("DC_PEEK_VS")) {
+      peek_vs = std::strtoull(e, nullptr, 16);
+    } else if (rain_diag) {
+      peek_vs = kRainDropVs;
+    }
     dump_passes = std::getenv("DC_DUMP_PASSES") != nullptr;
     if (const char *e = std::getenv("DC_TRACE_FRAME")) {
       trace_frame = std::strtoull(e, nullptr, 10);
@@ -3603,9 +3620,7 @@ struct MetalRenderer::Impl {
   // that address (finds the shaders reading or writing a buffer).
   void FindRefs(const u32 *d, u32 n, int depth, const std::string &path,
                 const char *who, u64 shader) {
-    static const u64 find = std::getenv("DC_FIND_ADDR")
-                                ? std::strtoull(std::getenv("DC_FIND_ADDR"), nullptr, 16)
-                                : 0;
+    const u64 find = find_addr;
     if (!find) {
       return;
     }
@@ -3898,9 +3913,6 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   // DC_PEEK_VS=<vs>: in the traced frame, the V#s of that vertex shader's
   // resource table (user data 12-13) and how many of each buffer's records
   // have a FLT_MAX or non-finite dword among their first three.
-  static const u64 peek_vs = std::getenv("DC_PEEK_VS")
-                                 ? std::strtoull(std::getenv("DC_PEEK_VS"), nullptr, 16)
-                                 : 0;
   if (trace) {
     FindRefs(vs_ud, 16, 0, "ud", "vs", vs_addr);
     FindRefs(ps_ud, 16, 0, "ud", "ps", ps_addr);
@@ -3926,6 +3938,12 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
               "stride %u records %u, %u big (first %d)",
               (unsigned long long)vs_addr, (unsigned long long)table, e, v[0], v[1], v[2], v[3],
               (unsigned long long)base, stride, num, big, first == ~0u ? -1 : int(first));
+      if (rain_diag && !find_addr && num && big == num) {
+        find_addr = base;
+        trace_frame = frame_count + 1;
+        DC_INFO("gpu: rain diag: %#llx is all FLT_MAX, finding its users in flip %llu",
+                (unsigned long long)base, (unsigned long long)trace_frame);
+      }
     }
   }
   Program *vs = GetProgram(Stage::Vertex, vs_addr, vs_ud,
