@@ -2707,6 +2707,10 @@ struct MetalRenderer::Impl {
                           MTLTextureUsageShaderWrite |
                           MTLTextureUsagePixelFormatView;
     }
+    // Integer R32 images may be targets of IMAGE_ATOMIC_ADD.
+    if (fmt == MTLPixelFormatR32Uint || fmt == MTLPixelFormatR32Sint) {
+      d.usage |= MTLTextureUsageShaderAtomic;
+    }
     return [device newTextureWithDescriptor:d];
   }
 

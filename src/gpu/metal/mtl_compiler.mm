@@ -81,7 +81,9 @@ id<MTLFunction> ShaderCompiler::Function(u64 key, const std::string& src, u64 ad
         return MTLMathModeRelaxed;
     }();
     opts.mathMode = math_mode;
-    opts.languageVersion = MTLLanguageVersion3_0;
+    // 3.1 only where needed (texture atomics): other shaders keep their cached binaries.
+    opts.languageVersion = src.find(".atomic_fetch_") != std::string::npos ? MTLLanguageVersion3_1
+                                                                           : MTLLanguageVersion3_0;
     NSError* err = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:@(src.c_str()) options:opts error:&err];
     id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"main0"] : nil;

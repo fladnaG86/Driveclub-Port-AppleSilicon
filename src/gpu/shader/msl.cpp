@@ -1281,6 +1281,21 @@ void Emitter::EmitImage(const Inst& i) {
         Line("}");
         return;
     }
+    if (op == Mimg::IMAGE_ATOMIC_ADD) {
+        // Texture atomics need MSL 3.1: the compiler picks it for shaders using them.
+        if (tt.sample == TexSample::Float) {
+            Unsupported(i);
+            return;
+        }
+        const std::string val = tt.sample == TexSample::Uint ? VName(i.vdata) : "int(" + VName(i.vdata) + ")";
+        Line("{ uint r_ = 0u; " + std::string(p.writes_exec ? "if (exec_lo != 0u) " : "") + "r_ = uint(" + t +
+             ".atomic_fetch_add(" + int_coord(i.vaddr) + ", " + val + ").x);");
+        if (i.glc) {
+            SetV(i.vdata, "r_");
+        }
+        Line("}");
+        return;
+    }
     const bool gather = i.op >= static_cast<u16>(Mimg::IMAGE_GATHER4) && i.op < static_cast<u16>(Mimg::IMAGE_GET_LOD);
     const bool sample = i.op >= static_cast<u16>(Mimg::IMAGE_SAMPLE) && i.op < static_cast<u16>(Mimg::IMAGE_GATHER4);
     if (!gather && !sample && op != Mimg::IMAGE_GET_LOD) {

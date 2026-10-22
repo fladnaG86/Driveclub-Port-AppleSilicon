@@ -53,6 +53,7 @@ int main(int argc, char** argv) {
     const bool ps = argc > 2 && std::strcmp(argv[2], "ps") == 0;
     const bool cs = argc > 2 && std::strcmp(argv[2], "cs") == 0;
     bool print_msl = false;
+    u32 uint_tex = 0; // uint_tex=<mask>: images sampled as uint (default float)
     MslOptions o;
     // After the stage: --msl and MslOptions overrides as key=value.
     for (int k = 3; k < argc; ++k) {
@@ -62,6 +63,10 @@ int main(int argc, char** argv) {
             continue;
         }
         const char* eq = std::strchr(arg, '=');
+        if (eq && std::string(arg, eq - arg) == "uint_tex") {
+            uint_tex = static_cast<u32>(std::strtoul(eq + 1, nullptr, 0));
+            continue;
+        }
         if (!eq || !SetOption(o, std::string(arg, eq - arg), std::strtoul(eq + 1, nullptr, 0))) {
             std::fprintf(stderr, "unknown option %s\n", arg);
             return 1;
@@ -98,6 +103,11 @@ int main(int argc, char** argv) {
         o.ps_input_cntl[k] = k;
     }
     std::vector<TextureType> textures(prog->images.size());
+    for (size_t k = 0; k < textures.size(); ++k) {
+        if (uint_tex & (1u << k)) {
+            textures[k].sample = TexSample::Uint;
+        }
+    }
     o.textures = textures;
     std::vector<std::string> unsupported;
     const std::string src = GenerateMsl(*prog, o, &unsupported);
