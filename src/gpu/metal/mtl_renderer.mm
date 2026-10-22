@@ -242,6 +242,13 @@ fragment float4 dump_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]], 
     if (any(isnan(c)) || any(isinf(c))) return float4(1.0, 0.0, 1.0, 1.0);
     return float4(max(c, 0.0) / (1.0 + max(c, 0.0)) * 2.0, 1.0);
 }
+// A depth surface the game wrote as a color image (sample 0 in .r).
+struct ZOut { float d [[depth(any)]]; };
+fragment ZOut zcopy_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]]) {
+    ZOut o;
+    o.d = src.read(uint2(in.pos.xy)).r;
+    return o;
+}
 kernel void fill32(device uint* dst [[buffer(0)]], constant uint2& vc [[buffer(1)]],
                    uint i [[thread_position_in_grid]]) {
     if (i < vc.y) dst[i] = vc.x;
@@ -660,6 +667,9 @@ struct MetalRenderer::Impl {
   id<MTLRenderPipelineState> copy_pipeline = nil;
   id<MTLRenderPipelineState> dump_pipeline =
       nil; // DC_DUMP_PASSES: x / (1 + x), NaN/Inf magenta
+  // DepthFromColor: per depth format (Depth32Float, Depth32Float_Stencil8).
+  id<MTLRenderPipelineState> zcopy_pipeline = nil, zcopy_pipeline_s8 = nil;
+  id<MTLDepthStencilState> zcopy_ds = nil;
   id<MTLTexture> frames[3] = {nil, nil, nil};
   u32 frame_index = 0;
   std::atomic<void *> latest_frame{nullptr};
@@ -1024,6 +1034,20 @@ struct MetalRenderer::Impl {
     copy_pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&err];
     pd.fragmentFunction = [lib newFunctionWithName:@"dump_fs"];
     dump_pipeline = [device newRenderPipelineStateWithDescriptor:pd error:&err];
+    {
+      MTLRenderPipelineDescriptor *zd = [MTLRenderPipelineDescriptor new];
+      zd.vertexFunction = pd.vertexFunction;
+      zd.fragmentFunction = [lib newFunctionWithName:@"zcopy_fs"];
+      zd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+      zcopy_pipeline = [device newRenderPipelineStateWithDescriptor:zd error:&err];
+      zd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+      zd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+      zcopy_pipeline_s8 = [device newRenderPipelineStateWithDescriptor:zd error:&err];
+      MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+      dd.depthCompareFunction = MTLCompareFunctionAlways;
+      dd.depthWriteEnabled = YES;
+      zcopy_ds = [device newDepthStencilStateWithDescriptor:dd];
+    }
     fill_pipeline = [device
         newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fill32"]
                                       error:&err];
@@ -3542,6 +3566,123 @@ struct MetalRenderer::Impl {
     EndPass();
   }
 
+  // Compute shaders may write a depth surface's memory as a color image
+  // (Driveclub's half-resolution depth for rain and particles): when that
+  // image is newer than the depth texture, the depth takes it over.
+  void DepthFromColor(RenderTarget &z) {
+    static const bool off = std::getenv("DC_NO_DEPTH_FROM_COLOR") != nullptr; // A/B
+    RenderTarget *c = off ? nullptr : Latest(color_targets, z.addr, TexDim::Tex2D, z.width, z.height);
+    if (!c || !c->tex || c->written <= z.written || c->width != z.width ||
+        c->height != z.height || c->tex.textureType != MTLTextureType2D ||
+        z.tex.textureType != MTLTextureType2D) {
+      return;
+    }
+    const MTLPixelFormat zf = z.tex.pixelFormat;
+    id<MTLRenderPipelineState> pso = zf == MTLPixelFormatDepth32Float ? zcopy_pipeline
+                                     : zf == MTLPixelFormatDepth32Float_Stencil8 ? zcopy_pipeline_s8
+                                                                                 : nil;
+    if (!pso) {
+      ReportOnce("depth from a color image: depth format " + std::to_string(zf));
+      return;
+    }
+    EndPass();
+    EnsureCommandBuffer();
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.depthAttachment.texture = z.tex;
+    rp.depthAttachment.loadAction = MTLLoadActionDontCare;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    if (zf == MTLPixelFormatDepth32Float_Stencil8) {
+      rp.stencilAttachment.texture = z.tex;
+      rp.stencilAttachment.loadAction = z.initialized ? MTLLoadActionLoad : MTLLoadActionClear;
+      rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    }
+    id<MTLRenderCommandEncoder> e = [cmd renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:pso];
+    [e setDepthStencilState:zcopy_ds];
+    [e setFragmentTexture:c->tex atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    z.initialized = true;
+    z.clear_pending = false;
+    z.written = ++write_seq;
+    if (trace) {
+      DC_INFO("gpu:   depth %#llx from its color image (%ux%u fmt %lu)",
+              (unsigned long long)z.addr, z.width, z.height,
+              (unsigned long)c->tex.pixelFormat);
+    }
+  }
+
+  // CB_RESOLVE: the multisampled CB0 into CB1 (Driveclub's rain is drawn
+  // with MSAA at half resolution and composited from the resolved copy).
+  // Targets are single sampled here, so the resolve is a copy.
+  void ResolveColor(const RegFile &r) {
+    for (u32 k = 0; k < 2; ++k) {
+      if (!ColorInfo::Format(r.ColorTarget(k, Reg::CB_INFO)) ||
+          !r.ColorTarget(k, Reg::CB_BASE)) {
+        return;
+      }
+    }
+    RenderTarget &src = ColorTargetFor(r, 0);
+    RenderTarget &dst = ColorTargetFor(r, 1);
+    if (&src == &dst) {
+      return;
+    }
+    if (src.clear_pending) {
+      RenderTarget *colors[8] = {&src};
+      BeginPass(colors, nullptr, false, 1.0f);
+      EndPass();
+    }
+    if (src.tex.pixelFormat != dst.tex.pixelFormat) {
+      ReportOnce("resolve between different formats");
+      return;
+    }
+    const u32 sw = std::max(1u, src.width >> src.bind_level);
+    const u32 sh = std::max(1u, src.height >> src.bind_level);
+    const u32 dw = std::max(1u, dst.width >> dst.bind_level);
+    const u32 dh = std::max(1u, dst.height >> dst.bind_level);
+    EndPass();
+    EnsureCommandBuffer();
+    id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+    [b copyFromTexture:src.tex
+               sourceSlice:src.bind_slice
+               sourceLevel:src.bind_level
+              sourceOrigin:MTLOriginMake(0, 0, 0)
+                sourceSize:MTLSizeMake(std::min(sw, dw), std::min(sh, dh), 1)
+                 toTexture:dst.tex
+          destinationSlice:dst.bind_slice
+          destinationLevel:dst.bind_level
+         destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [b endEncoding];
+    dst.initialized = true;
+    dst.clear_pending = false;
+    dst.written = ++write_seq;
+    NoteTargetWritten(dst);
+    if (trace) {
+      DC_INFO("gpu:   resolved %#llx into %#llx", (unsigned long long)src.addr,
+              (unsigned long long)dst.addr);
+    }
+  }
+
+  // The dword a fill shader stores, when it loads it with s_buffer_load_dword
+  // from offset 0 of a buffer in user data (the CMASK/HTILE fill shader).
+  static std::optional<u32> FillValue(const Program &p, const u32 *ud) {
+    for (const auto &i : p.code) {
+      if (i.enc != Shader::Gcn::Enc::SMRD ||
+          static_cast<Shader::Gcn::Smrd>(i.op) != Shader::Gcn::Smrd::S_BUFFER_LOAD_DWORD ||
+          !i.imm || i.smrd_offset != 0 || i.sbase + 3u >= 16u) {
+        continue;
+      }
+      const u64 addr = (u64(ud[i.sbase]) | (u64(ud[i.sbase + 1] & 0xFFF) << 32)) & kGpuAddrMask;
+      if (!addr || !Readable(addr, 4)) {
+        return std::nullopt;
+      }
+      u32 v;
+      std::memcpy(&v, reinterpret_cast<const void *>(addr), 4);
+      return v;
+    }
+    return std::nullopt;
+  }
+
   // True if `p` stores through the V# in user SGPRs ud..ud+3 and never loads
   // from it.
   static bool OnlyStoresTo(const Program &p, u32 ud) {
@@ -3802,6 +3943,10 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     EliminateFastClear(r);
     return;
   }
+  if (cb_mode == 3) { // CB_RESOLVE
+    ResolveColor(r);
+    return;
+  }
   RenderTarget *colors[8] = {};
   MTLPixelFormat color_fmt[8] = {};
   OutType out_type[8] = {};
@@ -3872,6 +4017,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
                               : MTLPixelFormatDepth32Float;
     if (zbase && w && h) {
       depth = &GetDepthTarget(zbase, depth_fmt, w, h);
+      DepthFromColor(*depth);
       depth->clear_depth = r.F(Reg::DB_DEPTH_CLEAR);
       depth->clear_stencil = r[Reg::DB_STENCIL_CLEAR] & 0xFF;
       if (ZInfo::TileSurface(z_info)) {
@@ -4791,7 +4937,22 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   for (u32 k = 0; k + 3 < 16 && !metas.empty(); ++k) {
     const u64 base =
         (u64(ud[k]) | (u64(ud[k + 1] & 0xFFF) << 32)) & kGpuAddrMask;
-    if (metas.count(base) && OnlyStoresTo(*cs, k) && MarkMetaCleared(base, 1)) {
+    auto m = metas.find(base);
+    if (m == metas.end() || !OnlyStoresTo(*cs, k)) {
+      continue;
+    }
+    // HTILE filled with expanded tiles (ZMASK 0xF) after the game wrote the
+    // depth itself (a compute downsample): the data stands, it is no clear.
+    const std::optional<u32> fill = FillValue(*cs, ud);
+    if (m->second.depth && fill && (*fill & 0xF) == 0xF) {
+      if (trace) {
+        DC_INFO("gpu:   HTILE of %#llx expanded (fill %#x): not a clear",
+                (unsigned long long)m->second.target, *fill);
+      }
+      EndPass();
+      return;
+    }
+    if (MarkMetaCleared(base, 1)) {
       EndPass();
       return;
     }
