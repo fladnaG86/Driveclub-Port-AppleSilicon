@@ -471,6 +471,61 @@ void CommandProcessor::Interrupt(u32 irq) {
     }
 }
 
+// DC_FIND_UD=<dword>: log dispatches whose compute user data holds that
+// dword (the low half of a buffer address: finds the shader writing it).
+void CommandProcessor::FindUserData(u32 x, u32 y, u32 z) {
+    static const char* env = std::getenv("DC_FIND_UD");
+    if (!env) {
+        return;
+    }
+    static const u32 needle = u32(std::strtoul(env, nullptr, 16));
+    const u32* ud = regs.UserData(Reg::COMPUTE_USER_DATA_0);
+    for (u32 k = 0; k < 16; ++k) {
+        if (ud[k] == needle) {
+            std::string all;
+            for (u32 j = 0; j < 16; ++j) {
+                char w[12];
+                std::snprintf(w, sizeof(w), " %08x", ud[j]);
+                all += w;
+            }
+            DC_INFO("gpu: find ud %#x: cs %#llx ud[%u] %ux%ux%u:%s", needle,
+                    (unsigned long long)regs.ProgramAddr(Reg::COMPUTE_PGM_LO), k, x, y, z, all.c_str());
+        }
+    }
+    // One level down: tables the user data points to.
+    static const u64 dump_cs = std::getenv("DC_FIND_UD_CS") ? std::strtoull(std::getenv("DC_FIND_UD_CS"), nullptr, 16) : 0;
+    if (dump_cs && regs.ProgramAddr(Reg::COMPUTE_PGM_LO) == dump_cs) {
+        std::string all;
+        for (u32 j = 0; j < 16; ++j) {
+            char w[12];
+            std::snprintf(w, sizeof(w), " %08x", ud[j]);
+            all += w;
+        }
+        DC_INFO("gpu: ud of cs %#llx %ux%ux%u:%s", (unsigned long long)dump_cs, x, y, z, all.c_str());
+        const u64 tp = u64(ud[12]) | (u64(ud[13] & 0xFFFF) << 32);
+        if (tp && Mapped(reinterpret_cast<const u8*>(tp), 64)) {
+            const u32* t = reinterpret_cast<const u32*>(tp);
+            DC_INFO("gpu:   ud[12]-> %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x", t[0], t[1], t[2],
+                    t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11]);
+        }
+    }
+    for (u32 k = 0; k + 1 < 16; ++k) {
+        const u64 ptr = u64(ud[k]) | (u64(ud[k + 1] & 0xFFFF) << 32);
+        if (ptr < 0x7000000000ull || ptr >= 0x8000000000ull || (ptr & 3) ||
+            !Mapped(reinterpret_cast<const u8*>(ptr), 256)) {
+            continue;
+        }
+        const u32* t = reinterpret_cast<const u32*>(ptr);
+        for (u32 j = 0; j < 64; ++j) {
+            if (t[j] == needle) {
+                DC_INFO("gpu: find ud %#x: cs %#llx ud[%u]->[%u] %ux%ux%u: %08x %08x %08x %08x", needle,
+                        (unsigned long long)regs.ProgramAddr(Reg::COMPUTE_PGM_LO), k, j, x, y, z, t[j],
+                        j + 1 < 64 ? t[j + 1] : 0, j + 2 < 64 ? t[j + 2] : 0, j + 3 < 64 ? t[j + 3] : 0);
+            }
+        }
+    }
+}
+
 void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int depth) {
     RegFile& regs = CurRegs();
     const u32* p = cmds.data();
@@ -816,9 +871,12 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
             // would make a draw that hangs the GPU. Instance counts usually
             // come from a compute shader (particles) that has not run when we
             // get here: the host GPU reads them from the args when it draws.
-            if (a[0] > kMaxIndirectCount) {
-                DC_WARN("gpu: skipping indirect draw with count=%u instances=%u (vs %#llx ps %#llx)", a[0], a[1],
-                        (unsigned long long)regs.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS),
+            // DC_GPU_DRAW_ARGS (dangerous, see the Metal renderer): insane CP-read
+            // instance counts are left to the host GPU's own read of the args.
+            static const bool gpu_args = std::getenv("DC_GPU_DRAW_ARGS") != nullptr;
+            if (a[0] > kMaxIndirectCount || (!gpu_args && a[1] > kMaxIndirectCount)) {
+                DC_WARN("gpu: skipping indirect draw with count=%u instances=%u args %p (vs %#llx ps %#llx)", a[0],
+                        a[1], (const void*)a, (unsigned long long)regs.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS),
                         (unsigned long long)regs.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS));
                 break;
             }
@@ -835,6 +893,7 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
 
         case Op::DispatchDirect:
             ++stats.dispatches;
+            FindUserData(body[0], body[1], body[2]);
             if (renderer) {
                 if (auto it = t_dispatch_args.find(reinterpret_cast<u64>(body)); it != t_dispatch_args.end()) {
                     const u64 args = it->second;
@@ -853,6 +912,15 @@ void CommandProcessor::Execute(std::span<const u32> cmds, bool compute, int dept
         case Op::DispatchIndirect: {
             ++stats.dispatches;
             const u32* a = IndirectArgs(body[0], 3);
+            if (a) {
+                FindUserData(a[0], a[1], a[2]);
+            }
+            // The group counts are usually written by an earlier dispatch the
+            // host GPU has not run yet (Driveclub's particle sort sizes its
+            // passes from the particle count): the GPU reads them itself.
+            if (renderer && a && renderer->DispatchIndirect(regs, reinterpret_cast<u64>(a))) {
+                break;
+            }
             if (a && u64(a[0]) * a[1] * a[2] > kMaxIndirectGroups) {
                 DC_WARN("gpu: skipping indirect dispatch %ux%ux%u", a[0], a[1], a[2]);
                 break;
