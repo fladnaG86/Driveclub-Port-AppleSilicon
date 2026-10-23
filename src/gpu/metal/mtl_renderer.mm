@@ -612,17 +612,46 @@ struct MetalRenderer::Impl {
   u64 texture_bytes = 0;
   u64 texture_bytes_peak = 0; // since the last "mem:" line
   u64 texture_pressure_frame = ~0ull;
+  // Freeing a Metal texture is a kernel call: the sweep that drops a track
+  // load's textures (~3 GB) took 100-175 ms on the graphics thread, twice
+  // per race start. The entries die on this queue instead.
+  // DC_NO_TEX_REAPER=1 frees them in place (A/B).
+  dispatch_queue_t texture_reaper = dispatch_queue_create(
+      "gpu texture reaper",
+      dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+                                              QOS_CLASS_UTILITY, 0));
+  const bool texture_reaper_off = std::getenv("DC_NO_TEX_REAPER") != nullptr;
   void EvictTextures(u64 max_age) {
     if (kTextureMaxAge == 0) {
       return;
     }
+    const auto t0 = std::chrono::steady_clock::now();
+    const u64 bytes_before = texture_bytes;
+    auto dead = std::make_shared<std::vector<TextureEntry>>();
     for (auto it = textures.begin(); it != textures.end();) {
       if (frame_count - it->second.frame > max_age) {
         texture_bytes -= it->second.tex ? it->second.tex.allocatedSize : 0;
+        dead->push_back(std::move(it->second));
         it = textures.erase(it);
       } else {
         ++it;
       }
+    }
+    const size_t evicted = dead->size();
+    if (texture_reaper_off) {
+      dead->clear();
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    if (ms > 2) {
+      DC_INFO("gpu: evicted %zu textures (%llu MB) in %.1f ms", evicted,
+              (bytes_before - texture_bytes) >> 20, ms);
+    }
+    if (!dead->empty()) {
+      dispatch_async(texture_reaper, ^{
+        dead->clear();
+      });
     }
   }
   // After a new texture: over budget, drop what the last frames did not use
