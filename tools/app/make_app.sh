@@ -75,6 +75,7 @@ EOF
 
 cp "$repo/LICENSE" "$app/Contents/Resources/LICENSE.txt"
 cp "$repo/tools/app/SDL3-LICENSE.txt" "$app/Contents/Resources/SDL3-LICENSE.txt"
+cp "$repo/third_party/libatrac9/LICENSE" "$app/Contents/Resources/LibAtrac9-LICENSE.txt"
 codesign --force --sign - "$app/Contents/Frameworks/libSDL3.0.dylib"
 codesign --force --sign - "$app"
 codesign --verify --deep --strict "$app"
