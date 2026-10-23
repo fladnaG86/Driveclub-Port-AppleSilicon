@@ -364,7 +364,24 @@ struct MetalRenderer::Impl {
     u8 bytes[2][3][64] = {}; // user data, draw constants (vertex), linear bases per stage
     bool has_bytes[2][3] = {};
     u32 bytes_len[2][3] = {};
+    // Fixed-function state. The encoder retains what it was given, so a
+    // pointer match cannot be a freed object's reused address.
+    __unsafe_unretained id<MTLRenderPipelineState> pso = nil;
+    __unsafe_unretained id<MTLDepthStencilState> depth_state = nil;
+    u32 viewport[2] = {}; // width, height
+    bool has_viewport = false;
+    MTLScissorRect scissor = {};
+    bool has_scissor = false;
+    u32 stencil_ref[2] = {};
+    bool has_stencil_ref = false;
+    int clip = -1, cull = -1, winding = -1;
+    float depth_bias[3] = {};
+    bool has_depth_bias = false;
+    float blend[4] = {};
+    bool has_blend = false;
   } bound;
+  // DC_NO_STATE_CACHE=1: set the fixed-function state on every draw (A/B).
+  const bool state_cache = std::getenv("DC_NO_STATE_CACHE") == nullptr;
   // stage 0 = vertex, 1 = fragment
   void BindBuffer(u32 st, id<MTLBuffer> b, u64 off, u32 idx) {
     if (bound.buf[st][idx] == b && bound.off[st][idx] == off) {
@@ -4544,33 +4561,68 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     return;
   }
 
-  [enc setRenderPipelineState:pso];
-  [enc setViewport:MTLViewport{0, 0, static_cast<double>(pass_width),
-                               static_cast<double>(pass_height), 0, 1}];
-  [enc setScissorRect:MTLScissorRect{static_cast<NSUInteger>(sc.x0),
-                                     static_cast<NSUInteger>(sc.y0),
-                                     static_cast<NSUInteger>(sc.x1 - sc.x0),
-                                     static_cast<NSUInteger>(sc.y1 - sc.y0)}];
+  // Each set below is skipped when `enc` already has that value (see
+  // BoundState): ~10 Objective-C calls per draw otherwise.
+  const bool cache = state_cache;
+  if (!cache || bound.pso != pso) {
+    bound.pso = pso;
+    [enc setRenderPipelineState:pso];
+  }
+  if (!cache || !bound.has_viewport || bound.viewport[0] != pass_width ||
+      bound.viewport[1] != pass_height) {
+    bound.has_viewport = true;
+    bound.viewport[0] = pass_width;
+    bound.viewport[1] = pass_height;
+    [enc setViewport:MTLViewport{0, 0, static_cast<double>(pass_width),
+                                 static_cast<double>(pass_height), 0, 1}];
+  }
+  const MTLScissorRect scissor{static_cast<NSUInteger>(sc.x0),
+                               static_cast<NSUInteger>(sc.y0),
+                               static_cast<NSUInteger>(sc.x1 - sc.x0),
+                               static_cast<NSUInteger>(sc.y1 - sc.y0)};
+  if (!cache || !bound.has_scissor ||
+      std::memcmp(&bound.scissor, &scissor, sizeof(scissor))) {
+    bound.has_scissor = true;
+    bound.scissor = scissor;
+    [enc setScissorRect:scissor];
+  }
   if (depth) {
     const bool st = HasStencil(depth->tex);
     const u32 st_ops = r[Reg::DB_STENCIL_CONTROL];
     const u32 ref_f = r[Reg::DB_STENCILREFMASK],
               ref_b = r[Reg::DB_STENCILREFMASK_BF];
-    [enc setDepthStencilState:GetDepthState(db_control, depth_clear, st, st_ops,
-                                            ref_f, ref_b, stencil_clear)];
+    id<MTLDepthStencilState> ds = GetDepthState(
+        db_control, depth_clear, st, st_ops, ref_f, ref_b, stencil_clear);
+    if (!cache || bound.depth_state != ds) {
+      bound.depth_state = ds;
+      [enc setDepthStencilState:ds];
+    }
     if (st && (db_control & 1)) {
       const bool backface = (db_control >> 7) & 1;
-      [enc setStencilFrontReferenceValue:StencilRef(st_ops, ref_f)
-                      backReferenceValue:backface
-                                             ? StencilRef(st_ops >> 12, ref_b)
-                                             : StencilRef(st_ops, ref_f)];
+      const u32 front_ref = StencilRef(st_ops, ref_f);
+      const u32 back_ref =
+          backface ? StencilRef(st_ops >> 12, ref_b) : front_ref;
+      if (!cache || !bound.has_stencil_ref ||
+          bound.stencil_ref[0] != front_ref ||
+          bound.stencil_ref[1] != back_ref) {
+        bound.has_stencil_ref = true;
+        bound.stencil_ref[0] = front_ref;
+        bound.stencil_ref[1] = back_ref;
+        [enc setStencilFrontReferenceValue:front_ref
+                        backReferenceValue:back_ref];
+      }
     }
   }
   // PA_CL_CLIP_CNTL.ZCLIP_NEAR/FAR_DISABLE: depth is clamped instead of clipped
   // (shadPS4 ZclipEnable(): clipping only when both are enabled).
   const u32 clip_cntl = r[Reg::PA_CL_CLIP_CNTL];
   const bool zclip = !((clip_cntl >> 26) & 1) && !((clip_cntl >> 27) & 1);
-  [enc setDepthClipMode:zclip ? MTLDepthClipModeClip : MTLDepthClipModeClamp];
+  const MTLDepthClipMode clip_mode =
+      zclip ? MTLDepthClipModeClip : MTLDepthClipModeClamp;
+  if (!cache || bound.clip != int(clip_mode)) {
+    bound.clip = int(clip_mode);
+    [enc setDepthClipMode:clip_mode];
+  }
   const u32 su = r[Reg::PA_SU_SC_MODE_CNTL];
   static const bool no_cull = std::getenv("DC_NO_CULL") != nullptr;
   // shadPS4 IsPrimitiveCulled: only triangle-type primitives are culled (not
@@ -4582,28 +4634,46 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
                         prim == PrimType::Polygon;
   const bool cull_front = (su & 1) && !no_cull && cullable,
              cull_back = ((su >> 1) & 1) && !no_cull && cullable;
-  [enc setCullMode:(cull_front && cull_back) ? MTLCullModeNone
-                   : cull_front              ? MTLCullModeFront
-                   : cull_back               ? MTLCullModeBack
-                                             : MTLCullModeNone];
-  [enc setFrontFacingWinding:((su >> 2) & 1) ? MTLWindingClockwise
-                                             : MTLWindingCounterClockwise];
+  const MTLCullMode cull_mode = (cull_front && cull_back) ? MTLCullModeNone
+                                : cull_front              ? MTLCullModeFront
+                                : cull_back               ? MTLCullModeBack
+                                                          : MTLCullModeNone;
+  if (!cache || bound.cull != int(cull_mode)) {
+    bound.cull = int(cull_mode);
+    [enc setCullMode:cull_mode];
+  }
+  const MTLWinding winding = ((su >> 2) & 1) ? MTLWindingClockwise
+                                             : MTLWindingCounterClockwise;
+  if (!cache || bound.winding != int(winding)) {
+    bound.winding = int(winding);
+    [enc setFrontFacingWinding:winding];
+  }
   if (depth) {
     // Polygon offset (shadow maps rely on it): POLY_OFFSET_FRONT/BACK_ENABLE.
     const bool front = (su >> 11) & 1, back = (su >> 12) & 1;
+    float bias[3] = {0, 0, 0}; // depth bias, slope scale, clamp
     if (front || back) {
       const u32 base = Reg::PA_SU_POLY_OFFSET_FRONT_SCALE + (front ? 0 : 2);
-      [enc setDepthBias:r.F(base + 1)
-             slopeScale:r.F(base) / 16.0f
-                  clamp:r.F(Reg::PA_SU_POLY_OFFSET_CLAMP)];
-    } else {
-      [enc setDepthBias:0 slopeScale:0 clamp:0];
+      bias[0] = r.F(base + 1);
+      bias[1] = r.F(base) / 16.0f;
+      bias[2] = r.F(Reg::PA_SU_POLY_OFFSET_CLAMP);
+    }
+    if (!cache || !bound.has_depth_bias ||
+        std::memcmp(bound.depth_bias, bias, sizeof(bias))) {
+      bound.has_depth_bias = true;
+      std::memcpy(bound.depth_bias, bias, sizeof(bias));
+      [enc setDepthBias:bias[0] slopeScale:bias[1] clamp:bias[2]];
     }
   }
-  [enc setBlendColorRed:r.F(Reg::CB_BLEND_RED)
-                  green:r.F(Reg::CB_BLEND_RED + 1)
-                   blue:r.F(Reg::CB_BLEND_RED + 2)
-                  alpha:r.F(Reg::CB_BLEND_RED + 3)];
+  const float blend[4] = {
+      r.F(Reg::CB_BLEND_RED), r.F(Reg::CB_BLEND_RED + 1),
+      r.F(Reg::CB_BLEND_RED + 2), r.F(Reg::CB_BLEND_RED + 3)};
+  if (!cache || !bound.has_blend ||
+      std::memcmp(bound.blend, blend, sizeof(blend))) {
+    bound.has_blend = true;
+    std::memcpy(bound.blend, blend, sizeof(blend));
+    [enc setBlendColorRed:blend[0] green:blend[1] blue:blend[2] alpha:blend[3]];
+  }
 
   Shader::GpuDrawConsts consts{};
   const u32 vte = r[Reg::PA_CL_VTE_CNTL];
