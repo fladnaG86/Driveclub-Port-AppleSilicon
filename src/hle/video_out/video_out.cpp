@@ -5,6 +5,7 @@
 #include <mutex>
 
 #include "common/log.h"
+#include "core/benchmark.h"
 #include "hle/hle.h"
 
 namespace Hle::VideoOut {
@@ -173,6 +174,7 @@ void Driver::OnFlipDone(s32 handle, u32 buf_idx, s64 flip_arg) {
     for (auto* eq : queues) {
         eq->Trigger(kInternalEventFlip, Kernel::kEvfiltVideoOut, data);
     }
+    Core::Benchmark::OnFlip();
 }
 
 void Driver::WaitFlipVblank(s32 handle) {

@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 
 #include "common/log.h"
+#include "core/benchmark.h"
 #include "core/signals.h"
 #include "core/loader/linker.h"
 #include "core/tls.h"
@@ -255,6 +256,9 @@ void* GuestMain(void*) {
     auto* exe = Loader::Linker::Instance()->Executable();
     g_params.argc = 1;
     g_params.argv[0] = "/app0/eboot.bin";
+    if (const char* arg = Benchmark::GuestArg()) {
+        g_params.argv[g_params.argc++] = arg;
+    }
     DC_INFO("jumping to entry point %#llx", exe->Entry());
     JumpToEntry(&g_params, exe->Entry(), &ProgramExit);
 }

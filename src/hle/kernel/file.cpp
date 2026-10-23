@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "common/log.h"
+#include "core/benchmark.h"
 #include "hle/hle.h"
 #include "hle/kernel/kernel.h"
 
@@ -50,6 +51,18 @@ fs::path Translate(const char* guest) {
         absolute = "/app0/";
         absolute.append(p);
         p = absolute;
+    }
+    if (Core::Benchmark::Marker(p)) {
+        return {};
+    }
+    // DC_BENCHMARK serves its test script over /app0.
+    if (const fs::path& overlay = Core::Benchmark::Overlay();
+        !overlay.empty() && p.starts_with("/app0/")) {
+        fs::path host = overlay / fs::path(p.substr(6));
+        std::error_code ec;
+        if (fs::exists(host, ec)) {
+            return host;
+        }
     }
     for (const Mount& m : Mounts()) {
         if (p.starts_with(m.guest) &&

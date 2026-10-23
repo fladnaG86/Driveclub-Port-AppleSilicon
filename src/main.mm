@@ -20,6 +20,7 @@
 
 #include "common/log.h"
 #include "core/address_space.h"
+#include "core/benchmark.h"
 #include "core/loader/linker.h"
 #include "core/memory.h"
 #include "core/runtime.h"
@@ -59,8 +60,10 @@ int Run(int argc, char** argv) {
     Hle::RegisterAll();
 
     const char* home = std::getenv("HOME");
-    Hle::Kernel::SetFileRoots(game_dir, std::filesystem::path(home ? home : "/tmp") /
-                                            "Library/Application Support/DriveclubNative");
+    const std::filesystem::path user_root =
+        std::filesystem::path(home ? home : "/tmp") / "Library/Application Support/DriveclubNative";
+    Hle::Kernel::SetFileRoots(game_dir, user_root);
+    Core::Benchmark::Configure(user_root);
 
     Core::Loader::Linker linker;
     if (!linker.LoadGame(game_dir)) {

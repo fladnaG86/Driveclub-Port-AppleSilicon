@@ -39,6 +39,8 @@ set(DC_CORE_SOURCES
     src/common/types.h
     src/core/address_space.cpp
     src/core/address_space.h
+    src/core/benchmark.cpp
+    src/core/benchmark.h
     src/core/loader/elf_types.h
     src/core/loader/linker.cpp
     src/core/loader/linker.h
