@@ -11,7 +11,7 @@
 # shows a change in GPU work.
 # Event: DC_BENCH=<DC_BENCHMARK settings> (default below: heavy rain, the
 # heaviest case; keys in src/core/benchmark.cpp). Game folder: DC_GAME_DIR.
-# Output in ../bench/<label>/: run.log, frames/, shaders/.
+# Output in ../bench/<label>/: run.log, frames/, shaders/, driveclub (the binary).
 set -u
 cd "$(dirname "$0")/.."
 label=$1
@@ -25,6 +25,7 @@ game=${DC_GAME_DIR:-../extracted/Image0}
 out="../bench/$label"
 rm -rf "$out"
 mkdir -p "$out/frames" "$out/shaders"
+cp build/driveclub "$out/driveclub" # symbols for `sample` profiles of this run
 env "$@" DC_BENCHMARK="$bench" DC_GPU_STATS=1 \
     DC_DUMP_FRAMES="$out/frames" DC_DUMP_EVERY=300 DC_DUMP_SHADERS="$out/shaders" \
     ./build/driveclub "$game" > "$out/run.log" 2>&1 &

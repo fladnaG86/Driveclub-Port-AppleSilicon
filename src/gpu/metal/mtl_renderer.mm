@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #include <mach/mach.h>
+#include <nmmintrin.h>
 
 #include <algorithm>
 #include <atomic>
@@ -2216,25 +2217,27 @@ struct MetalRenderer::Impl {
     }
   }
 
-  // Cheap change detection: a few dwords spread over the texture.
+  // Change detection over every byte. CRC32C in 8 independent lanes: Rosetta
+  // turns the SSE4.2 crc32 into the ARM one, twice the speed of a multiply
+  // chain (hot textures are hashed in full every frame, ~25 MB in a race).
   u64 Hash64(const u8 *p, u64 size) {
     stat_hashed += size;
     CpuTimer t(cpu_profile ? &cpu_hash_s : nullptr);
-    u64 h[4] = {0x9e3779b97f4a7c15ull, 0xc2b2ae3d27d4eb4full,
-                0x165667b19e3779f9ull, 0x27d4eb2f165667c5ull};
+    u64 h[8] = {0x9e3779b9, 0xc2b2ae3d, 0x165667b1, 0x27d4eb2f,
+                0x85ebca6b, 0xc2b2ae35, 0x27d4eb2d, 0x165667c5};
     u64 off = 0;
-    for (; off + 32 <= size; off += 32) {
-      for (u32 k = 0; k < 4; ++k) {
-        u64 v;
-        std::memcpy(&v, p + off + k * 8, 8);
-        h[k] = (h[k] ^ v) * 0x100000001b3ull;
-        h[k] ^= h[k] >> 29;
+    for (; off + 64 <= size; off += 64) {
+      u64 v[8];
+      std::memcpy(v, p + off, sizeof(v));
+      for (u32 k = 0; k < 8; ++k) {
+        h[k] = _mm_crc32_u64(h[k], v[k]);
       }
     }
     for (; off < size; ++off) {
-      h[0] = (h[0] ^ p[off]) * 0x100000001b3ull;
+      h[0] = _mm_crc32_u8(static_cast<u32>(h[0]), p[off]);
     }
-    return h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7);
+    return (h[0] | h[1] << 32) ^ ((h[2] | h[3] << 32) * 3) ^
+           ((h[4] | h[5] << 32) * 5) ^ ((h[6] | h[7] << 32) * 7);
   }
 
   u64 ChunkHash(u64 addr, u64 size, u32 chunk) {
