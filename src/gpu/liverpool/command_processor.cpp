@@ -109,6 +109,8 @@ void CommandProcessor::ClearState() {
         regs[0xA085 + 2 * k] = 0x20002000; // PA_SC_CLIPRECT_n_BR
     }
     regs[0xA08C] = 0xAA99AAAA; // PA_SC_EDGERULE
+    regs[Reg::CB_TARGET_MASK] = 0xFFFFFFFF;
+    regs[0xA08F] = 0xFFFFFFFF; // CB_SHADER_MASK
     regs[Reg::PA_SC_GENERIC_SCISSOR_TL] = 0x80000000;
     regs[Reg::PA_SC_GENERIC_SCISSOR_BR] = 0x40004000;
     for (u32 k = 0; k < 16; ++k) {
