@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <SDL3/SDL.h>
@@ -192,15 +193,30 @@ s32 sceAudioOutOpen(s32 user_id, s32 port_type, s32 index, u32 len, u32 freq, u3
         p.channels = channels;
         p.is_float = is_float;
         p.buffer_bytes = len * channels * (is_float ? 4 : 2);
-        p.ring.assign(u64(p.buffer_bytes) * kRingBuffers, 0);
         p.read = p.write = 0;
         SDL_AudioSpec spec{is_float ? SDL_AUDIO_F32 : SDL_AUDIO_S16, static_cast<int>(channels),
                            static_cast<int>(freq ? freq : 48000)};
+        // Ask for a device period of one guest buffer, like the PS4's audio
+        // hardware. SDL's default (1024 frames at 48 kHz) asked the callback
+        // for more than the ring holds, and SDL plays silence for whatever the
+        // callback cannot give: a 256-frame hole ~43 times a second.
+        // SDL_AUDIO_DEVICE_SAMPLE_FRAMES in the environment still wins.
+        SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, std::to_string(len).c_str());
         // The device opens in its own format and the stream converts to it.
         // Handing it the guest's 7.1 as the device format made CoreAudio
         // play only front left/right on stereo outputs: centre and surround,
         // where FMOD pans other cars, ambience and most effects, were lost.
         p.device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, nullptr);
+        SDL_AudioSpec device_spec{};
+        int device_frames = 0;
+        if (p.device) {
+            SDL_GetAudioDeviceFormat(p.device, &device_spec, &device_frames);
+        }
+        // The ring must cover one device period plus the buffer the guest is
+        // writing, or every callback comes up short (sized before the callback
+        // can run: Feed indexes it).
+        const u32 period_buffers = len ? (static_cast<u32>(std::max(device_frames, 0)) + len - 1) / len : 0;
+        p.ring.assign(u64(p.buffer_bytes) * std::max(kRingBuffers, period_buffers + 2), 0);
         p.stream = p.device ? SDL_CreateAudioStream(&spec, nullptr) : nullptr;
         if (!p.stream || !SDL_SetAudioStreamGetCallback(p.stream, Feed, &p) ||
             !SDL_BindAudioStream(p.device, p.stream)) {
@@ -215,9 +231,6 @@ s32 sceAudioOutOpen(s32 user_id, s32 port_type, s32 index, u32 len, u32 freq, u3
             }
             return kErrorPortFull;
         }
-        SDL_AudioSpec device_spec{};
-        int device_frames = 0;
-        SDL_GetAudioDeviceFormat(p.device, &device_spec, &device_frames);
         p.open = true;
         if (const char* dir = DumpDir()) {
             char path[1024];
@@ -227,9 +240,10 @@ s32 sceAudioOutOpen(s32 user_id, s32 port_type, s32 index, u32 len, u32 freq, u3
             p.dump_started = false;
         }
         SDL_ResumeAudioDevice(p.device);
-        DC_INFO("audio: port %zu type %d: %d Hz, %u ch, %s, %u samples per buffer (device %d Hz, %d ch)", i + 1,
-                port_type, spec.freq, channels, is_float ? "float" : "s16", len, device_spec.freq,
-                device_spec.channels);
+        DC_INFO("audio: port %zu type %d: %d Hz, %u ch, %s, %u samples per buffer (device %d Hz, %d ch, "
+                "%d frames per period; ring %llu buffers)",
+                i + 1, port_type, spec.freq, channels, is_float ? "float" : "s16", len, device_spec.freq,
+                device_spec.channels, device_frames, static_cast<unsigned long long>(p.ring.size() / p.buffer_bytes));
         return static_cast<s32>(i + 1);
     }
     return kErrorPortFull;
