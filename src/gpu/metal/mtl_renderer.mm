@@ -3967,6 +3967,44 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
             u64(r[Reg::DB_Z_READ_BASE]) << 8, u64(r[Reg::DB_Z_WRITE_BASE]) << 8,
             r[Reg::DB_Z_INFO], r[Reg::CB_BLEND0_CONTROL],
             r[Reg::SPI_SHADER_COL_FORMAT]);
+    // Geometry-shader pipeline (VGT_SHADER_STAGES_EN.GS_EN): ES and GS are not
+    // run, only the copy VS. Log what emulating them needs and dump both
+    // programs next to the other shaders.
+    if (r[Reg::VGT_SHADER_STAGES_EN] & 0x20) {
+      const u64 es = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_ES);
+      const u64 gs = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_GS);
+      DC_INFO("gpu:   gs pipeline: stages_en=%#x gs_mode=%#x es=%#llx rsrc %#x %#x gs=%#llx rsrc %#x %#x "
+              "max_vert_out=%u vert_itemsize=%u,%u,%u,%u esgs_itemsize=%u gsvs_itemsize=%u "
+              "gsvs_offset=%u,%u,%u out_prim=%#x instance_cnt=%#x",
+              r[Reg::VGT_SHADER_STAGES_EN], r[Reg::VGT_GS_MODE], es,
+              r[Reg::SPI_SHADER_PGM_RSRC1_ES], r[Reg::SPI_SHADER_PGM_RSRC2_ES], gs,
+              r[Reg::SPI_SHADER_PGM_RSRC1_GS], r[Reg::SPI_SHADER_PGM_RSRC2_GS],
+              r[Reg::VGT_GS_MAX_VERT_OUT], r[Reg::VGT_GS_VERT_ITEMSIZE],
+              r[Reg::VGT_GS_VERT_ITEMSIZE + 1], r[Reg::VGT_GS_VERT_ITEMSIZE + 2],
+              r[Reg::VGT_GS_VERT_ITEMSIZE + 3], r[Reg::VGT_ESGS_RING_ITEMSIZE],
+              r[Reg::VGT_GSVS_RING_ITEMSIZE], r[Reg::VGT_GSVS_RING_OFFSET_1],
+              r[Reg::VGT_GSVS_RING_OFFSET_1 + 1], r[Reg::VGT_GSVS_RING_OFFSET_1 + 2],
+              r[Reg::VGT_GS_OUT_PRIM_TYPE], r[Reg::VGT_GS_INSTANCE_CNT]);
+      for (const auto &[name, ud0] : {std::pair{"es", Reg::SPI_SHADER_USER_DATA_ES_0},
+                                      std::pair{"gs", Reg::SPI_SHADER_USER_DATA_GS_0}}) {
+        std::string w;
+        for (u32 k = 0; k < 16; ++k) {
+          char b[12];
+          std::snprintf(b, sizeof(b), " %08x", r[ud0 + k]);
+          w += b;
+        }
+        DC_INFO("gpu:   gs pipeline: %s user data%s", name, w.c_str());
+      }
+      for (const auto &[name, addr] : {std::pair{"es", es}, std::pair{"gs", gs}}) {
+        const auto *code = reinterpret_cast<const u32 *>(addr);
+        if (dump_dir && addr && Readable(addr, 4)) {
+          char path[512];
+          std::snprintf(path, sizeof(path), "%s/%s_%llx.bin", dump_dir, name, addr);
+          std::ofstream(path, std::ios::binary)
+              .write(reinterpret_cast<const char *>(code), Shader::Gcn::ProgramSize(code));
+        }
+      }
+    }
     if (r.ColorTarget(0, Reg::CB_VIEW)) {
       DC_INFO("gpu:   cb0 view=%#x attrib=%#x pitch=%#x slice=%#x",
               r.ColorTarget(0, Reg::CB_VIEW), r.ColorTarget(0, Reg::CB_ATTRIB),
