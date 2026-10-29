@@ -154,7 +154,10 @@ struct SgprReadCache {
 u32 ResolveSgpr(const SgprSource& src, const u32* user_data, SgprReadCache* cache = nullptr);
 
 // Guest range [va, va + bytes) a linear base covers at draw time, or false
-// when its access is not bounded with these descriptor values.
-bool LinearBaseRange(const LinearBase& b, const u32* user_data, SgprReadCache* cache, u64* va, u64* bytes);
+// when its access is not bounded with these descriptor values. `stride4`
+// (optional): the V# stride is a multiple of 4 (always for pointer bases), so
+// with the dword-aligned base an indexed access is aligned when its offsets are.
+bool LinearBaseRange(const LinearBase& b, const u32* user_data, SgprReadCache* cache, u64* va, u64* bytes,
+                     bool* stride4 = nullptr);
 
 } // namespace Gpu::Shader

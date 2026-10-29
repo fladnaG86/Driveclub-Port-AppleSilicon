@@ -1749,9 +1749,14 @@ struct MetalRenderer::Impl {
   // Translates `p`'s linear bases against the draw's (patched) user data:
   // entry k = dword offset << 1 | upper buffer. Returns the bases that map
   // to one contiguous memory range (MslOptions::linear_mask). DC_NO_LINEAR:
-  // none, every access walks the page table.
-  u32 LinearTable(const Shader::Program &p, const u32 *ud, u32 *out) {
+  // none, every access walks the page table. `aligned` gets the returned bases
+  // whose stride is a multiple of 4 (MslOptions::linear_aligned); DC_NO_ALIGNED:
+  // none, every buffer load keeps its unaligned fallback.
+  u32 LinearTable(const Shader::Program &p, const u32 *ud, u32 *out,
+                  u32 *aligned) {
     static const bool off = std::getenv("DC_NO_LINEAR") != nullptr;
+    static const bool no_aligned = std::getenv("DC_NO_ALIGNED") != nullptr;
+    *aligned = 0;
     if (off) {
       return 0;
     }
@@ -1766,14 +1771,18 @@ struct MetalRenderer::Impl {
     for (u32 k = 0; k < p.linear_bases.size(); ++k) {
       out[k] = 0;
       u64 va = 0, bytes = 0, moff = 0;
-      bool hi = false;
-      if (!Shader::LinearBaseRange(p.linear_bases[k], ud, &cache, &va, &bytes) ||
+      bool hi = false, stride4 = false;
+      if (!Shader::LinearBaseRange(p.linear_bases[k], ud, &cache, &va, &bytes,
+                                   &stride4) ||
           !LocatePhys(va, std::max<u64>(bytes, 4), &moff, &hi) || (moff & 3) ||
           (moff >> 2) >= (1ull << 31)) {
         continue;
       }
       out[k] = (static_cast<u32>(moff >> 2) << 1) | (hi ? 1u : 0u);
       mask |= 1u << k;
+      if (stride4 && !no_aligned) {
+        *aligned |= 1u << k;
+      }
     }
     return mask;
   }
@@ -4288,7 +4297,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   }
   const u64 patched_at = commits;
   u32 vlin[Shader::kMaxLinearBases], plin[Shader::kMaxLinearBases];
-  vo.linear_mask = LinearTable(*vs, vud, vlin);
+  vo.linear_mask = LinearTable(*vs, vud, vlin, &vo.linear_aligned);
   // Vertex fetch by Metal for the fetch loads it can do (all or none): the
   // V# words resolved here give each one a vertex buffer and a format.
   // DC_SW_FETCH keeps every load in the shader.
@@ -4343,6 +4352,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   u64 vs_key = Hash(vs->hash);
   vs_key = Hash(vo.map_hoist, vs_key);
   vs_key = Hash(vo.linear_mask, vs_key);
+  vs_key = Hash(vo.linear_aligned, vs_key);
   for (const auto &a : vo.vertex_attrs) {
     vs_key = Hash(u64(a.pc) | (u64(a.kind) << 32) | (u64(a.swizzle) << 40), vs_key);
   }
@@ -4361,7 +4371,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     fo.col_format = col_format;
     fo.dual_source = dual_source;
     fo.map_hoist = map_hoist;
-    fo.linear_mask = LinearTable(*ps, pud, plin);
+    fo.linear_mask = LinearTable(*ps, pud, plin, &fo.linear_aligned);
     for (u32 k = 0; k < 8; ++k) {
       fo.mrt_type[k] = out_type[k];
       if (color_fmt[k] == MTLPixelFormatRG11B10Float) {
@@ -4403,6 +4413,7 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     ps_key = Hash(fo.dual_source, ps_key);
     ps_key = Hash(fo.map_hoist, ps_key);
     ps_key = Hash(fo.linear_mask, ps_key);
+    ps_key = Hash(fo.linear_aligned, ps_key);
     ps_key = Fnv(fo.mrt_type.data(), sizeof(fo.mrt_type), ps_key);
     ps_key = Hash(fo.mrt_ufloat, ps_key);
     ps_key =
@@ -4707,9 +4718,16 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
     if (ps) {
       PatchUserData(pud);
     }
-    if ((vo.linear_mask && (LinearTable(*vs, vud, vlin) & vo.linear_mask) != vo.linear_mask) ||
-        (ps && fo.linear_mask &&
-         (LinearTable(*ps, pud, plin) & fo.linear_mask) != fo.linear_mask)) {
+    // The pipeline assumed these bases translated (and aligned): they still must be.
+    auto moved = [&](const Shader::Program &p, const u32 *ud, u32 *lin,
+                     const Shader::MslOptions &o) {
+      u32 aligned = 0;
+      const u32 mask = LinearTable(p, ud, lin, &aligned);
+      return (mask & o.linear_mask) != o.linear_mask ||
+             (aligned & o.linear_aligned) != o.linear_aligned;
+    };
+    if ((vo.linear_mask && moved(*vs, vud, vlin, vo)) ||
+        (ps && fo.linear_mask && moved(*ps, pud, plin, fo))) {
       ReportOnce("draw skipped: a linear base moved between key and bind");
       return;
     }
@@ -5158,7 +5176,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   o.textures = types; // borrowed: `types` lives until the key is hashed
   o.map_hoist = map_hoist;
   u32 lin[Shader::kMaxLinearBases];
-  o.linear_mask = LinearTable(*cs, cud, lin);
+  o.linear_mask = LinearTable(*cs, cud, lin, &o.linear_aligned);
   const int probe_slot =
       probe_buf && trace
           ? ProbeSlot(addr, "dispatch " + std::to_string(stat_dispatches) +
@@ -5174,6 +5192,7 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   key = Hash(rsrc2, key);
   key = Hash(o.map_hoist, key);
   key = Hash(o.linear_mask, key);
+  key = Hash(o.linear_aligned, key);
   key = Fnv(types.data(), types.size() * sizeof(TextureType), key);
   const u32 group = tx * ty * tz;
   const u64 pkey = Hash(group, key);

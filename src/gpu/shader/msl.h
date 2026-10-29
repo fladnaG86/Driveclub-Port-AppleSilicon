@@ -115,6 +115,9 @@ struct MslOptions {
     // their accesses index memory directly. Entry k of the buffer at
     // Binding::Linear is the base's dword offset << 1 | 1 for the upper buffer.
     u32 linear_mask = 0;
+    // Bases of linear_mask whose V# stride is a multiple of 4: buffer accesses on
+    // them with constant, dword-aligned offsets drop the unaligned fallback.
+    u32 linear_aligned = 0;
     // DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE: discard where the stored depth (a copy at
     // texture(kDepthBoundsTexture)) is outside [min, max] (buffer(kDepthBoundsBuffer)).
     bool depth_bounds = false;

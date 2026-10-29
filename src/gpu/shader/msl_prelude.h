@@ -47,6 +47,19 @@ static inline DcLin dc_lin(thread const DcMem& m, uint k, ulong va) {
     uint e = m.lin[k];
     return DcLin{((e & 1u) ? m.hi : m.lo) + (e >> 1), va};
 }
+// A linear base whose every access is known dword aligned
+// (MslOptions::linear_aligned): loads need no unaligned fallback.
+struct DcLinA { device uint* p; ulong va; };
+static inline device uint* dc_ptr(thread const DcLinA& m, ulong va) { return m.p + ((va - m.va) >> 2); }
+static inline device uint* dc_ptr_n(thread const DcLinA& m, ulong va, uint bytes) { return dc_ptr(m, va); }
+static inline DcLinA dc_lina(thread const DcMem& m, uint k, ulong va) {
+    uint e = m.lin[k];
+    return DcLinA{((e & 1u) ? m.hi : m.lo) + (e >> 1), va};
+}
+static inline uint dc_ld(thread const DcLinA& m, ulong va) { return *dc_ptr(m, va); }
+template <typename M>
+static inline bool dc_aligned(thread const M& m, ulong va) { return (va & 3ul) == 0ul; }
+static inline bool dc_aligned(thread const DcLinA& m, ulong va) { return true; }
 template <typename M>
 static inline uint dc_ld(thread const M& m, ulong va) {
     device uint* p = dc_ptr(m, va & ~3ul);
@@ -118,7 +131,7 @@ template <typename M>
 static inline uint4 dc_load_fmt(thread const M& m, ulong a, uint dfmt, uint nfmt) {
     uint words = dfmt == 14u ? 4u : dfmt == 13u ? 3u : (dfmt == 11u || dfmt == 12u) ? 2u : 1u;
     uint4 w = uint4(0u);
-    if ((a & 3ul) == 0ul) {
+    if (dc_aligned(m, a)) {
         device uint* p = dc_ptr_n(m, a, words * 4u);
         if (p) for (uint k = 0u; k < words; ++k) w[k] = p[k];
     } else {

@@ -235,6 +235,22 @@ private:
         const u32 k = p.LinearBaseOf(pc);
         return k < kMaxLinearBases && ((o.linear_mask >> k) & 1u);
     }
+    // A buffer access on a linear base whose address is a multiple of 4 in
+    // every lane: the base is (LinearBaseRange), the stride is when the host
+    // says so (MslOptions::linear_aligned), and the offsets are constants.
+    bool AlignedAccess(const Inst& i) const {
+        const u32 k = p.LinearBaseOf(i.pc);
+        if (!Linear(i.pc) || !((o.linear_aligned >> k) & 1u) || i.offen || (i.offset & 3u)) {
+            return false;
+        }
+        if (i.soffset >= Operand::Zero && i.soffset <= Operand::IntPosMax) {
+            return ((i.soffset - Operand::Zero) & 3u) == 0;
+        }
+        if (i.soffset > Operand::IntPosMax && i.soffset <= Operand::IntNegMax) {
+            return ((i.soffset - Operand::IntPosMax) & 3u) == 0; // -1..-16
+        }
+        return false; // SGPR soffset: not known here
+    }
 
     bool Structure();
     void EmitStructured();
@@ -1114,8 +1130,10 @@ void Emitter::EmitBuffer(const Inst& i) {
     Line("  ulong a_ = base_ + ulong(idx_) * ulong(stride_) + ulong(off_);");
     // A base the host translated: the access needs no page-table walk.
     const std::string M = Linear(i.pc) ? "lm_" : "mem";
+    const bool aligned = AlignedAccess(i);
     if (M != "mem") {
-        Line("  DcLin lm_ = dc_lin(mem, " + N(p.LinearBaseOf(i.pc)) + "u, base_);");
+        Line(std::string(aligned ? "  DcLinA lm_ = dc_lina(" : "  DcLin lm_ = dc_lin(") + "mem, " +
+             N(p.LinearBaseOf(i.pc)) + "u, base_);");
     }
 
     auto store_guard = [&]() { return std::string(guard ? "if (!oob_ && exec_lo != 0u) " : "if (!oob_) "); };
@@ -1172,6 +1190,14 @@ void Emitter::EmitBuffer(const Inst& i) {
                     : i.op == static_cast<u16>(Mubuf::BUFFER_LOAD_DWORDX3) ? 3 : 4;
         if (n == 1) {
             SetV(i.vdata, "oob_ ? 0u : dc_ld(" + M + ", a_)");
+            break;
+        }
+        if (aligned) {
+            Line("{ device uint* p_ = dc_ptr(lm_, a_);");
+            for (u32 k = 0; k < n; ++k) {
+                SetV(i.vdata + k, "oob_ ? 0u : p_[" + N(k) + "]");
+            }
+            Line("}");
             break;
         }
         Line("{ device uint* p_ = oob_ || (a_ & 3ul) ? nullptr : dc_ptr_n(" + M + ", a_, " + N(4 * n) + "u);");

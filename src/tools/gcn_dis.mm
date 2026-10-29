@@ -36,6 +36,10 @@ static bool SetOption(Gpu::Shader::MslOptions& o, const std::string& key, unsign
         o.linear_mask = static_cast<u32>(v);
         return true;
     }
+    if (key == "linear_aligned") {
+        o.linear_aligned = static_cast<u32>(v);
+        return true;
+    }
     return false;
 }
 

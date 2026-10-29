@@ -954,9 +954,13 @@ u32 ResolveSgpr(const SgprSource& src, const u32* ud, SgprReadCache* cache) {
     }
 }
 
-bool LinearBaseRange(const LinearBase& b, const u32* ud, SgprReadCache* cache, u64* va, u64* bytes) {
+bool LinearBaseRange(const LinearBase& b, const u32* ud, SgprReadCache* cache, u64* va, u64* bytes,
+                     bool* stride4) {
     const u32 w0 = ResolveSgpr(b.words[0], ud, cache);
     const u32 w1 = ResolveSgpr(b.words[1], ud, cache);
+    if (stride4) {
+        *stride4 = b.kind != LinearBase::VBuffer || ((w1 >> 16) & 3) == 0;
+    }
     switch (b.kind) {
     case LinearBase::Pointer:
         *va = (u64(w0) | (u64(w1) << 32)) & 0xFFFFFFFFFFFFull;
