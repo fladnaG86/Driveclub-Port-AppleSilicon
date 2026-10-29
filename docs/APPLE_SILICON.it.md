@@ -42,7 +42,7 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
    cartelle, copia prima i file della patch sopra la cartella del gioco base
    (sostituendo `eboot.bin`). Altre versioni del gioco non partono: l'app ti
    avvisa se la tua è una di queste.
-2. **Installa l'app.** Scarica `Driveclub-Native-0.2.11.dmg` dalle
+2. **Installa l'app.** Scarica `Driveclub-Native-0.2.12.dmg` dalle
    [Release](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest),
    aprilo e trascina **Driveclub** su **Applicazioni**.
 3. **Solo al primo avvio: autorizza l'app.** Non è notarizzata da Apple, quindi
@@ -136,7 +136,7 @@ Serve **una propria copia del gioco**, come pacchetto decrittato ed estratto
 
 Per impacchettare la build come `Driveclub.app` in un `.dmg` (firma ad-hoc), passa
 un SDL3 x86_64 compilato con `-ffile-prefix-map`, così non contiene percorsi locali:
-`tools/app/make_app.sh 0.2.11 /percorso/libSDL3.0.dylib` → `dist/`.
+`tools/app/make_app.sh 0.2.12 /percorso/libSDL3.0.dylib` → `dist/`.
 
 ## Cosa è stato fatto
 
@@ -186,6 +186,7 @@ Misure in gara, 1920x1080, M1 Max. Ogni passo è stato misurato A/B
 | Meno overhead CPU per draw (cache dei binding, meno allocazioni, controllo shader una volta per frame) | thread CP ~25 -> ~21 ms/frame | 0c3b904, 37d021e, 6b38290 |
 | **Basi di memoria tradotte dall'host** (sotto) | GPU 35.2 -> 27.2 ms/frame | d08a95f |
 | Risultati di Resolve riusati per programma e descrittori; basi di memoria tradotte una volta per draw | thread CP 22.7 -> 21.1 ms/frame, ~+1-2 fps | 4d6df28 |
+| **Load dai buffer senza percorso per indirizzi non allineati** dove l'allineamento è dimostrabile (sotto) | GPU 22.2 -> 20.65 ms/frame sommati sui pass | af2d82c |
 
 **Basi tradotte dall'host (d08a95f).** Gli shader accedono alla memoria guest
 tramite una page table. La cattura Xcode dello shader più pesante (il TAA,
@@ -198,6 +199,17 @@ I dati li legge sempre la GPU, quindi i valori che la GPU scrive più avanti nel
 frame restano corretti. La pipeline viene poi specializzata in modo che quegli
 accessi indicizzino direttamente il buffer di memoria. TAA: 98 -> 80 registri,
 12.8k -> 3.6k istruzioni, 4.3 -> 2.1 ms.
+
+**Load dai buffer allineati (af2d82c).** I contatori GPU di Metal mostravano
+ancora l'ALU occupata ~21% del tempo ma solo ~5% in calcoli FP32, con occupancy
+bassa. Nel TAA le istruzioni in virgola mobile corrispondevano quasi 1:1 al
+codice GCN (~190 contro ~150); il resto era un secondo percorso che ogni load
+di dword dai buffer portava con sé per gli indirizzi non allineati (due load,
+shift e controlli null per dword). La base di una base di memoria tradotta è
+già allineata a 4; ora il renderer segnala anche quali basi hanno uno stride
+multiplo di 4, e gli accessi su di esse con offset costanti allineati leggono
+la memoria direttamente. TAA: 3073 -> 1306 istruzioni AGX, 79 -> 65 registri,
+1.35 -> 0.79 ms. `DC_NO_ALIGNED=1` ripristina il codice precedente.
 
 ## Cosa resta da fare
 

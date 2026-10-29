@@ -41,7 +41,7 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
    the 1.28 patch as two folders, copy the patch's files over the base game
    folder first (replacing `eboot.bin`). Other game versions do not start: the
    app tells you if yours is one.
-2. **Install the app.** Download `Driveclub-Native-0.2.11.dmg` from
+2. **Install the app.** Download `Driveclub-Native-0.2.12.dmg` from
    [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest),
    open it and drag **Driveclub** onto **Applications**.
 3. **First launch only: allow the app.** It is not notarized by Apple, so macOS
@@ -135,7 +135,7 @@ You need **your own copy of the game** as a decrypted, extracted package
 
 To package the build as `Driveclub.app` in a `.dmg` (ad-hoc signed), pass an
 x86_64 SDL3 built with `-ffile-prefix-map` so it carries no local paths:
-`tools/app/make_app.sh 0.2.11 /path/to/libSDL3.0.dylib` → `dist/`.
+`tools/app/make_app.sh 0.2.12 /path/to/libSDL3.0.dylib` → `dist/`.
 
 ## What was done
 
@@ -185,6 +185,7 @@ Measured in a race, 1920x1080, M1 Max. Each step was A/B tested
 | Per-draw CPU overhead cuts (binding cache, fewer allocations, shader check once per frame) | CP thread ~25 -> ~21 ms/frame | 0c3b904, 37d021e, 6b38290 |
 | **Host-translated memory bases** (see below) | GPU 35.2 -> 27.2 ms/frame | d08a95f |
 | Resolve results reused per program and descriptors; memory bases translated once per draw | CP thread 22.7 -> 21.1 ms/frame, ~+1-2 fps | 4d6df28 |
+| **Buffer loads without the unaligned fallback** where the address is provably aligned (see below) | GPU 22.2 -> 20.65 ms/frame summed over passes | af2d82c |
 
 **Host-translated bases (d08a95f).** Shaders reach guest memory through a page
 table. The Xcode capture of the heaviest shader (the TAA, 4.3 ms) showed 196
@@ -196,6 +197,17 @@ those *addresses* on the CPU per draw. Data is still read by the GPU, so values
 the GPU writes later in the frame stay correct. The pipeline is then specialized
 so those accesses index the memory buffer directly. TAA: 98 -> 80 registers,
 12.8k -> 3.6k instructions, 4.3 -> 2.1 ms.
+
+**Aligned buffer loads (af2d82c).** Metal GPU counters still showed the ALU
+busy ~21% of the time but only ~5% on FP32 math, with low occupancy. In the TAA
+the floating-point instructions matched the GCN code almost 1:1 (~190 vs ~150);
+the rest was a second path every dword buffer load carried for unaligned
+addresses (two loads, shifts and null checks per dword). The base of a
+translated memory base is already dword aligned; the renderer now also reports
+which bases have a stride that is a multiple of 4, and accesses on them with
+constant aligned offsets read memory directly. TAA: 3073 -> 1306 AGX
+instructions, 79 -> 65 registers, 1.35 -> 0.79 ms. `DC_NO_ALIGNED=1` restores
+the old code.
 
 ## What is left
 
