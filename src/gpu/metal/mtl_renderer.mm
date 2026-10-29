@@ -1024,6 +1024,7 @@ struct MetalRenderer::Impl {
       DC_INFO("gpu: pass timing %s", pass_timing ? "on" : "unavailable");
     }
     compiler = std::make_unique<ShaderCompiler>(device, 4);
+    PrewarmStart();
     signal_event = [device newSharedEvent];
     signal_listener = [[MTLSharedEventListener alloc]
         initWithDispatchQueue:dispatch_queue_create("gpu signals",
@@ -2219,6 +2220,122 @@ struct MetalRenderer::Impl {
   }
 
   // Moves finished pipelines into the caches.
+  // ================= compute pipeline prewarm =================
+  // Every compute pipeline built is recorded (guest code and address, and the
+  // inputs of its key) in ~/Library/Caches/DriveclubNative/
+  // compute_pipelines.bin. The next launch rebuilds them all on the compiler
+  // threads from the start, with the current translator, so the first
+  // dispatches after an update (new MSL) or a cleared Metal cache do not wait
+  // up to seconds for a compile. DC_NO_PREWARM=1: off.
+  struct PrewarmEntry {
+    u64 pkey = 0, addr = 0;
+    u32 rsrc2 = 0, group = 0, map_hoist = 0, linear_mask = 0, linear_aligned = 0;
+    std::array<u32, 16> ud{};
+    std::vector<TextureType> types;
+    std::vector<u32> code;
+  };
+  std::mutex prewarm_lock;
+  std::unordered_set<u64> prewarm_known;
+  static std::string PrewarmPath() {
+    const char *home = std::getenv("HOME");
+    return home ? std::string(home) + "/Library/Caches/DriveclubNative/compute_pipelines.bin" : "";
+  }
+  static u64 PrewarmKey(u64 hash, u32 rsrc2, bool map_hoist, u32 linear_mask, u32 linear_aligned,
+                        const std::vector<TextureType> &types, u32 group) {
+    u64 key = Hash(hash);
+    key = Hash(~0u, key); // probe_pc: probed dispatches are not recorded
+    key = Hash(rsrc2, key);
+    key = Hash(map_hoist, key);
+    key = Hash(linear_mask, key);
+    key = Hash(linear_aligned, key);
+    key = Fnv(types.data(), types.size() * sizeof(TextureType), key);
+    return key;
+  }
+  void PrewarmRecord(const PrewarmEntry &e) {
+    const std::string path = PrewarmPath();
+    std::scoped_lock lk(prewarm_lock);
+    if (path.empty() || !prewarm_known.insert(e.pkey).second) {
+      return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    std::ofstream f(path, std::ios::binary | std::ios::app);
+    auto put = [&](const void *d, size_t n) { f.write(static_cast<const char *>(d), n); };
+    const u32 ntex = static_cast<u32>(e.types.size()), ncode = static_cast<u32>(e.code.size());
+    put(&e.pkey, 8); put(&e.addr, 8);
+    put(&e.rsrc2, 4); put(&e.group, 4); put(&e.map_hoist, 4); put(&e.linear_mask, 4); put(&e.linear_aligned, 4);
+    put(e.ud.data(), 64);
+    put(&ntex, 4); put(e.types.data(), ntex * sizeof(TextureType));
+    put(&ncode, 4); put(e.code.data(), ncode * 4);
+  }
+  void PrewarmStart() {
+    const std::string path = PrewarmPath();
+    if (std::getenv("DC_NO_PREWARM") || path.empty()) {
+      return;
+    }
+    std::ifstream f(path, std::ios::binary);
+    auto get = [&](void *d, size_t n) { return static_cast<bool>(f.read(static_cast<char *>(d), n)); };
+    std::vector<PrewarmEntry> entries;
+    for (;;) {
+      PrewarmEntry e;
+      u32 ntex = 0, ncode = 0;
+      if (!get(&e.pkey, 8) || !get(&e.addr, 8) || !get(&e.rsrc2, 4) || !get(&e.group, 4) ||
+          !get(&e.map_hoist, 4) || !get(&e.linear_mask, 4) || !get(&e.linear_aligned, 4) ||
+          !get(e.ud.data(), 64) || !get(&ntex, 4) || ntex > 64) {
+        break;
+      }
+      e.types.resize(ntex);
+      if (!get(e.types.data(), ntex * sizeof(TextureType)) || !get(&ncode, 4) || ncode > (1u << 20)) {
+        break;
+      }
+      e.code.resize(ncode);
+      if (!get(e.code.data(), ncode * 4)) {
+        break;
+      }
+      prewarm_known.insert(e.pkey);
+      entries.push_back(std::move(e));
+    }
+    DC_INFO("gpu: prewarming %zu compute pipelines", entries.size());
+    for (auto &e : entries) {
+      compiler->Submit([this, e = std::move(e)] {
+        Shader::BuildInput in{Stage::Compute, e.addr, e.ud.data(), Bits(e.rsrc2, 1, 5),
+                              Bits(e.rsrc2, 11, 2), e.code.data()};
+        in.compute_rsrc2 = e.rsrc2;
+        auto prog = Shader::BuildProgram(in);
+        if (!prog) {
+          return;
+        }
+        const u64 key = PrewarmKey(prog->hash, e.rsrc2, e.map_hoist, e.linear_mask,
+                                   e.linear_aligned, e.types, e.group);
+        if (Hash(e.group, key) != e.pkey) {
+          return; // the key's inputs changed meaning: let the dispatch compile it
+        }
+        Shader::MslOptions o;
+        o.textures = e.types;
+        o.map_hoist = e.map_hoist;
+        o.linear_mask = e.linear_mask;
+        o.linear_aligned = e.linear_aligned;
+        const std::string src = Shader::GenerateMsl(*prog, o, nullptr);
+        id<MTLFunction> fn = compiler->Function(key, src, e.addr);
+        if (!fn) {
+          return;
+        }
+        MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new];
+        d.computeFunction = fn;
+        d.label = [NSString stringWithFormat:@"cs %#llx", e.addr];
+        d.maxTotalThreadsPerThreadgroup = e.group;
+        NSError *err = nil;
+        id<MTLComputePipelineState> pso =
+            [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone
+                                               reflection:nil error:&err];
+        if (pso && pso.maxTotalThreadsPerThreadgroup >= e.group) { // failures: the dispatch reports
+          std::scoped_lock lk(done_lock);
+          done_compute.emplace_back(e.pkey, pso);
+        }
+      }, /*urgent=*/false);
+    }
+  }
+
   void TakeCompiled() {
     std::scoped_lock lk(done_lock);
     for (auto &[k, pso] : done_render) {
@@ -5514,8 +5631,22 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
   if (it == compute_pipelines.end()) {
     if (!pending.count(pkey)) {
       pending.insert(pkey);
+      PrewarmEntry rec; // for the next launch's prewarm (see PrewarmStart)
+      if (probe_slot < 0) {
+        const auto *code = reinterpret_cast<const u32 *>(addr);
+        rec.pkey = pkey;
+        rec.addr = addr;
+        rec.rsrc2 = rsrc2;
+        rec.group = group;
+        rec.map_hoist = o.map_hoist;
+        rec.linear_mask = o.linear_mask;
+        rec.linear_aligned = o.linear_aligned;
+        std::copy(ud, ud + 16, rec.ud.begin());
+        rec.types.assign(types.begin(), types.end());
+        rec.code.assign(code, code + Shader::Gcn::ProgramSize(code) / 4);
+      }
       compiler->Submit([this, src = MslSource(*cs, o, key), key, pkey, group,
-                        addr] {
+                        addr, rec = std::move(rec)] {
         id<MTLComputePipelineState> pso = nil;
         if (id<MTLFunction> fn = compiler->Function(key, src, addr)) {
           MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new];
@@ -5541,6 +5672,9 @@ void MetalRenderer::Impl::Dispatch(const RegFile &r, u32 gx, u32 gy, u32 gz) {
                      (unsigned long)pso.maxTotalThreadsPerThreadgroup);
             pso = nil;
           }
+        }
+        if (pso && rec.pkey) {
+          PrewarmRecord(rec);
         }
         {
           std::scoped_lock lk(done_lock);
