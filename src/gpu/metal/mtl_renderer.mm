@@ -1344,6 +1344,29 @@ struct MetalRenderer::Impl {
     }
   }
 
+  // Texture uploads: blits from staging memory (Upload) in a command buffer
+  // of their own, committed just before the main one so they run first.
+  // The GPU lays texels out; the driver's replaceRegion did it on this thread.
+  // DC_CPU_UPLOAD=1: the old path (managed textures, replaceRegion) for A/B.
+  const bool cpu_upload = std::getenv("DC_CPU_UPLOAD") != nullptr;
+  id<MTLCommandBuffer> up_cmd = nil;
+  id<MTLBlitCommandEncoder> up_blit = nil;
+  id<MTLBlitCommandEncoder> UploadBlit() {
+    if (!up_blit) {
+      up_cmd = [queue commandBuffer];
+      up_blit = [up_cmd blitCommandEncoder];
+    }
+    return up_blit;
+  }
+  void FlushUploads() {
+    if (up_blit) {
+      [up_blit endEncoding];
+      up_blit = nil;
+      [up_cmd commit];
+      up_cmd = nil;
+    }
+  }
+
   // DC_GPU_STATS: why passes over the same targets get split.
   // Compute encoder kept open across back-to-back dispatches: an encoder per
   // dispatch costs the host GPU a flush each. Its dispatches stay serial.
@@ -1551,6 +1574,7 @@ struct MetalRenderer::Impl {
   void Commit(bool wait) {
     CpuTimer t(cpu_profile ? &cpu_commit_s : nullptr);
     EndPass();
+    FlushUploads(); // before any command buffer that samples them
     if (!cmd) {
       if (wait) {
         WaitLast();
@@ -1566,7 +1590,7 @@ struct MetalRenderer::Impl {
         keep.push_back(chunk);
       }
       [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
-        keep.clear();
+        RecycleChunks(keep);
       }];
       chunks.clear();
       chunk = nil;
@@ -2045,6 +2069,35 @@ struct MetalRenderer::Impl {
     }
   }
 
+  // Upload chunks the GPU is done with, by power-of-two size: fresh shared
+  // buffers cost page faults and zeroing per byte (~100 MB a frame while a
+  // track streams in its textures).
+  std::mutex chunk_pool_lock;
+  std::unordered_map<u64, std::vector<id<MTLBuffer>>> chunk_pool;
+  id<MTLBuffer> NewChunk(u64 size) {
+    const u64 cls = std::bit_ceil(std::max(kUploadChunk, size));
+    {
+      std::scoped_lock lk(chunk_pool_lock);
+      auto &v = chunk_pool[cls];
+      if (!v.empty()) {
+        id<MTLBuffer> b = v.back();
+        v.pop_back();
+        return b;
+      }
+    }
+    return [device newBufferWithLength:cls options:MTLResourceStorageModeShared];
+  }
+  void RecycleChunks(std::vector<id<MTLBuffer>> &bufs) {
+    std::scoped_lock lk(chunk_pool_lock);
+    for (id<MTLBuffer> b : bufs) {
+      auto &v = chunk_pool[b.length];
+      if (v.size() < 8) { // keep a bounded amount around
+        v.push_back(b);
+      }
+    }
+    bufs.clear();
+  }
+
   // Bump-allocates transient GPU-visible memory for this command buffer.
   std::pair<id<MTLBuffer>, u64> Upload(const void *data, u64 size) {
     size = (size + 15) & ~15ull;
@@ -2052,8 +2105,7 @@ struct MetalRenderer::Impl {
       if (chunk) {
         chunks.push_back(chunk);
       }
-      chunk = [device newBufferWithLength:std::max(kUploadChunk, size)
-                                  options:MTLResourceStorageModeShared];
+      chunk = NewChunk(size);
       chunk_off = 0;
     }
     const u64 off = chunk_off;
@@ -2662,7 +2714,7 @@ struct MetalRenderer::Impl {
         d.arrayLength = layers;
       }
       d.usage = MTLTextureUsageShaderRead;
-      d.storageMode = MTLStorageModeManaged;
+      d.storageMode = cpu_upload ? MTLStorageModeManaged : MTLStorageModePrivate;
       d.swizzle =
           MTLTextureSwizzleChannelsMake(Swizzle(swz), Swizzle(swz >> 3),
                                         Swizzle(swz >> 6), Swizzle(swz >> 9));
@@ -2684,11 +2736,15 @@ struct MetalRenderer::Impl {
                 h_el = fi.compressed ? (h + 3) / 4 : h;
       const u64 row = u64(w_el) * fi.bytes_per_block;
       const u64 image = row * h_el;
-      linear.resize(image);
+      if (cpu_upload) {
+        linear.resize(image);
+      }
       const u32 level_thick = Tiling::Thickness(m.tile_index);
       for (u32 l = 0; l < layers; ++l) {
         const u64 group_offset = m.offset + m.slice_size * (l / level_thick);
-        Tiling::DetileSlice(m.tile_index, src + group_offset, linear.data(),
+        auto [sbuf, soff] = cpu_upload ? std::pair<id<MTLBuffer>, u64>{nil, 0} : Upload(nullptr, image);
+        u8 *out = cpu_upload ? linear.data() : static_cast<u8 *>(sbuf.contents) + soff;
+        Tiling::DetileSlice(m.tile_index, src + group_offset, out,
                             w_el, h_el, m.pitch_el, fi.bytes_per_block,
                             l % level_thick);
         if (dump_texture == addr && dump_frames && l == 0 &&
@@ -2698,7 +2754,19 @@ struct MetalRenderer::Impl {
                         dump_frames, addr, width_el, height_el,
                         fi.bytes_per_block, frame_count);
           std::ofstream(path, std::ios::binary)
-              .write(reinterpret_cast<const char *>(linear.data()), image);
+              .write(reinterpret_cast<const char *>(out), image);
+        }
+        if (!cpu_upload) {
+          [UploadBlit() copyFromBuffer:sbuf
+                          sourceOffset:soff
+                     sourceBytesPerRow:row
+                   sourceBytesPerImage:image
+                            sourceSize:MTLSizeMake(w, h, 1)
+                             toTexture:e.tex
+                      destinationSlice:tt.dim == TexDim::Tex2DArray ? l : 0
+                      destinationLevel:lv
+                     destinationOrigin:MTLOriginMake(0, 0, tt.dim == TexDim::Tex3D ? l : 0)];
+          continue;
         }
         const MTLRegion region = tt.dim == TexDim::Tex3D
                                      ? MTLRegionMake3D(0, 0, l, w, h, 1)
