@@ -26,8 +26,12 @@ out="../bench/$label"
 rm -rf "$out"
 mkdir -p "$out/frames" "$out/shaders"
 cp build/driveclub "$out/driveclub" # symbols for `sample` profiles of this run
+# Frame and shader dumps write to disk on the GPU thread (hitches when the
+# disk is slow, e.g. a USB stick): DC_BENCH_NODUMP=1 leaves them out.
+dumps=(DC_DUMP_FRAMES="$out/frames" DC_DUMP_EVERY=300 DC_DUMP_SHADERS="$out/shaders")
+[ -n "${DC_BENCH_NODUMP:-}" ] && dumps=()
 env "$@" DC_BENCHMARK="$bench" DC_GPU_STATS=1 \
-    DC_DUMP_FRAMES="$out/frames" DC_DUMP_EVERY=300 DC_DUMP_SHADERS="$out/shaders" \
+    ${dumps[@]+"${dumps[@]}"} \
     ./build/driveclub "$game" > "$out/run.log" 2>&1 &
 pid=$!
 # The game exits by itself (benchmark timeout 240 s + warmup + seconds); this
