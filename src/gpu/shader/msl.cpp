@@ -221,6 +221,21 @@ private:
         if (p.stage == Stage::Fragment) {
             Line("if (!dc_exported) discard_fragment();");
         }
+        if (o.ring.stage == RingStage::Geometry && o.ring.slots > 2) {
+            // The strip this lane emitted, as copy-VS indices of a triangle list:
+            // emitted vertex n sits at ring dword gs2vs/4 + n*16 + lane. Missing
+            // triangles (fewer emits, or across a CUT) are degenerate.
+            const u32 group_dwords = o.ring.GsGroupBytes() / 4;
+            Line("{ uint gb_ = dc_gid.x * " + N(group_dwords) + "u + dc_lidx; device uint* ix_ = dc_gsidx + dc_gtid.x * " +
+                 N(o.ring.IndicesPerPrim()) + "u; uint st_ = 0u;");
+            Line("  for (uint t_ = 0u; t_ + 2u < " + N(o.ring.slots) + "u; ++t_) {");
+            Line("    if ((gs_cut_ >> t_) & 1u) st_ = t_;");
+            Line("    bool ok_ = t_ + 2u < gs_emit_ && ((gs_cut_ >> (t_ + 1u)) & 3u) == 0u;");
+            Line("    uint a_ = ((t_ - st_) & 1u) ? t_ + 1u : t_, b_ = ((t_ - st_) & 1u) ? t_ : t_ + 1u;");
+            Line("    ix_[t_ * 3u] = ok_ ? gb_ + a_ * 16u : gb_; ix_[t_ * 3u + 1u] = ok_ ? gb_ + b_ * 16u : gb_;");
+            Line("    ix_[t_ * 3u + 2u] = ok_ ? gb_ + (t_ + 2u) * 16u : gb_;");
+            Line("  } }");
+        }
         Line(p.stage == Stage::Compute ? "return;" : "return out;");
     }
 
@@ -232,6 +247,9 @@ private:
 
     // The memory instruction at `pc` uses a linear base the host translated.
     bool Linear(u32 pc) const {
+        if (o.ring.stage != RingStage::None) {
+            return false; // swizzled ring addresses leave the range the host checked
+        }
         const u32 k = p.LinearBaseOf(pc);
         return k < kMaxLinearBases && ((o.linear_mask >> k) & 1u);
     }
@@ -551,7 +569,19 @@ void Emitter::EmitSopp(const Inst& i) {
             Line("threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);");
         }
         break;
-    default: break; // waitcnt, nop, sendmsg, priorities: nothing to do
+    case Sopp::S_SENDMSG:
+        // GS messages (msg 2; op 1 CUT, 2 EMIT): an emulated GS counts the
+        // vertices each lane emits and where its strips restart (End()).
+        if (o.ring.stage == RingStage::Geometry && (i.simm16 & 0xF) == 2) {
+            const u32 op = (static_cast<u32>(i.simm16) >> 4) & 3;
+            if (op == 2) {
+                Line("if (exec_lo != 0u) gs_emit_ += 1u;");
+            } else if (op == 1) {
+                Line("if (exec_lo != 0u && gs_emit_ < 32u) gs_cut_ |= 1u << gs_emit_;");
+            }
+        }
+        break;
+    default: break; // waitcnt, nop, other messages, priorities: nothing to do
     }
 }
 
@@ -1127,7 +1157,15 @@ void Emitter::EmitBuffer(const Inst& i) {
     Line("{ ulong base_ = dc_vbase(" + r0 + ", " + r1 + "); uint stride_ = dc_vstride(" + r1 + ");");
     Line("  uint idx_ = " + idx + "; uint off_ = " + Src(i.soffset, 0) + " + " + N(i.offset) + "u + " + voff + ";");
     Line(std::string("  bool oob_ = ") + (i.idxen ? "idx_ >= " + r2 : "(stride_ == 0u && off_ >= " + r2 + ")") + ";");
-    Line("  ulong a_ = base_ + ulong(idx_) * ulong(stride_) + ulong(off_);");
+    if (o.ring.stage != RingStage::None) {
+        // Ring programs address their rings through swizzled V#s: ADD_TID_ENABLE
+        // adds the lane to the index, and the records interleave by lane (taken
+        // whenever ADD_TID is set, as the ES's ring V# relies on it).
+        Line("  ulong a_; if ((" + r3 + " >> 23) & 1u) { oob_ = false; a_ = base_ + dc_swizzled(idx_ + dc_lane, off_, stride_, " +
+             r3 + "); } else { a_ = base_ + ulong(idx_) * ulong(stride_) + ulong(off_); }");
+    } else {
+        Line("  ulong a_ = base_ + ulong(idx_) * ulong(stride_) + ulong(off_);");
+    }
     // A base the host translated: the access needs no page-table walk.
     const std::string M = Linear(i.pc) ? "lm_" : "mem";
     const bool aligned = AlignedAccess(i);
@@ -1736,6 +1774,16 @@ std::string Emitter::Run() {
         if (p.compute_rsrc2 & (1u << 10)) {
             sinit[k++] = "0u"; // TG_SIZE: wave index within the group
         }
+        // Emulated ES / GS (RingInfo): their system SGPRs follow the user ones.
+        // The ring stores go through swizzled V#s, which scale soffset by the
+        // index stride (64 for ESGS, 16 for GSVS): these are the pre-swizzle
+        // values that land each wave / group on its own slice.
+        if (o.ring.stage == RingStage::Export) {
+            sinit[nud] = "dc_gid.x * " + N(o.ring.EsWaveBytes() / 64) + "u"; // es2gs_offset
+        } else if (o.ring.stage == RingStage::Geometry) {
+            sinit[nud] = "dc_gid.x * " + N(o.ring.GsGroupBytes() / 16) + "u"; // gs2vs_offset
+            sinit[nud + 1] = "dc_gid.x";                                       // gs_wave_id
+        }
     }
     for (u32 k = 0; k < std::max(max_sgpr, nud); ++k) {
         dl("uint s" + N(k) + " = " + sinit[k] + ";");
@@ -1748,6 +1796,16 @@ std::string Emitter::Run() {
         for (u32 k = 1; k <= 3 && k < vinit.size(); ++k) {
             if (k <= p.vgpr_comp_cnt) vinit[k] = "iid";
         }
+    } else if (p.stage == Stage::Compute && o.ring.stage == RingStage::Export) {
+        if (!vinit.empty()) vinit[0] = "dc_gtid.x"; // vertex index
+    } else if (p.stage == Stage::Compute && o.ring.stage == RingStage::Geometry) {
+        // Point input: primitive p's vertex is ES thread p, at ring dword
+        // es2gs/4 + lane of ES wave p / 64. v2 is the primitive id.
+        const std::string vtx = "(dc_gtid.x / 64u) * " + N(o.ring.EsWaveBytes() / 4) + "u + dc_gtid.x % 64u";
+        for (u32 k : {0u, 1u, 3u, 4u, 5u, 6u}) {
+            if (k < vinit.size()) vinit[k] = vtx;
+        }
+        if (vinit.size() > 2) vinit[2] = "dc_gtid.x";
     } else if (p.stage == Stage::Compute) {
         static const char* ids[3] = {"dc_tid.x", "dc_tid.y", "dc_tid.z"};
         for (u32 k = 0; k < 3 && k < vinit.size(); ++k) {
@@ -1941,9 +1999,14 @@ std::string Emitter::Run() {
                "uint3 dc_gid [[threadgroup_position_in_grid]], uint dc_lidx [[thread_index_in_threadgroup]], "
                "uint3 dc_gtid [[thread_position_in_grid]], " +
                mem_params + ", device uint* gds [[buffer(5)]], threadgroup uint* lds [[threadgroup(0)]]" + probe_param + TexParams(true) +
+               (o.ring.stage == RingStage::Geometry ? ", device uint* dc_gsidx [[buffer(" + N(Binding::GsIndex) + ")]]" : "") +
                ") {\n";
         src += "    " + MemInit() + "\n    uint dc_lane = dc_lidx & 63u;\n";
         src += "    (void)mem; (void)dc_lane; (void)lds; (void)gds;\n";
+        if (o.ring.stage != RingStage::None) {
+            // One thread per vertex / primitive exactly (dispatchThreads).
+            src += "    uint gs_emit_ = 0u, gs_cut_ = 0u; (void)gs_emit_; (void)gs_cut_;\n";
+        }
         src += decl + wrapped + "}\n";
     }
     return src;

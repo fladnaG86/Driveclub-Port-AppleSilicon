@@ -29,7 +29,30 @@ constexpr u32 MemMap = 3;   // constant DcMap
 constexpr u32 Draw = 4;     // constant DcDraw (vertex stage)
 constexpr u32 Gds = 5;      // device uint[16K]: the queue's 64 KB GDS partition (compute stage)
 constexpr u32 Linear = 8;   // constant uint[]: translated linear bases (MslOptions::linear_mask)
+constexpr u32 GsIndex = 9;  // device uint*: copy-VS indices a GS kernel writes (MslOptions::ring)
 } // namespace Binding
+
+// Geometry-shader emulation. Metal has no GS stage: the ES and the GS of a GS
+// pipeline run as compute kernels that write the ESGS / GSVS rings in guest
+// memory as the hardware would, and the copy VS then draws from the GSVS
+// ring. The ring offsets the hardware would hand out (es2gs, gs vertex
+// offsets, gs2vs, the copy VS's vertex) are chosen here, consistently with
+// the swizzled-buffer address math: ES waves are 64 threads, GS groups 16
+// (the GSVS ring's index stride), each with its own slice of the ring.
+enum class RingStage : u8 { None, Export, Geometry };
+struct RingInfo {
+    RingStage stage = RingStage::None;
+    u32 esgs_itemsize = 0; // dwords per ES vertex (VGT_ESGS_RING_ITEMSIZE)
+    u32 vert_itemsize = 0; // GS: dwords per emitted vertex (VGT_GS_VERT_ITEMSIZE)
+    u32 slots = 0;         // GS: emitted vertices per output-dword plane of a 16-lane group
+    bool operator==(const RingInfo&) const = default;
+
+    // Byte size of one ES wave's / one GS group's slice of its ring.
+    u32 EsWaveBytes() const { return esgs_itemsize * 64 * 4; }
+    u32 GsGroupBytes() const { return vert_itemsize * slots * 16 * 4; }
+    // Copy-VS indices a GS thread writes: its strip as a triangle list.
+    u32 IndicesPerPrim() const { return slots > 2 ? (slots - 2) * 3 : 0; }
+};
 
 // Host-side mirrors of the MSL structs in the prelude.
 // Header of the page table bound at Binding::MemMap; `pages` s32 entries
@@ -118,6 +141,8 @@ struct MslOptions {
     // Bases of linear_mask whose V# stride is a multiple of 4: buffer accesses on
     // them with constant, dword-aligned offsets drop the unaligned fallback.
     u32 linear_aligned = 0;
+    // Compute only: this program is the ES or GS of a GS pipeline (RingInfo).
+    RingInfo ring;
     // DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE: discard where the stored depth (a copy at
     // texture(kDepthBoundsTexture)) is outside [min, max] (buffer(kDepthBoundsBuffer)).
     bool depth_bounds = false;

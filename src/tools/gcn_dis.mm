@@ -40,6 +40,23 @@ static bool SetOption(Gpu::Shader::MslOptions& o, const std::string& key, unsign
         o.linear_aligned = static_cast<u32>(v);
         return true;
     }
+    // Geometry-shader emulation (with stage cs): ring_stage=1 ES, 2 GS.
+    if (key == "ring_stage") {
+        o.ring.stage = static_cast<Gpu::Shader::RingStage>(v);
+        return true;
+    }
+    if (key == "esgs_itemsize") {
+        o.ring.esgs_itemsize = static_cast<u32>(v);
+        return true;
+    }
+    if (key == "vert_itemsize") {
+        o.ring.vert_itemsize = static_cast<u32>(v);
+        return true;
+    }
+    if (key == "slots") {
+        o.ring.slots = static_cast<u32>(v);
+        return true;
+    }
     return false;
 }
 
@@ -58,6 +75,7 @@ int main(int argc, char** argv) {
     const bool cs = argc > 2 && std::strcmp(argv[2], "cs") == 0;
     bool print_msl = false;
     u32 uint_tex = 0; // uint_tex=<mask>: images sampled as uint (default float)
+    u32 user_sgprs = 16; // user_sgprs=<n>: user-data SGPRs (ES/GS: from their RSRC2)
     MslOptions o;
     // After the stage: --msl and MslOptions overrides as key=value.
     for (int k = 3; k < argc; ++k) {
@@ -71,6 +89,10 @@ int main(int argc, char** argv) {
             uint_tex = static_cast<u32>(std::strtoul(eq + 1, nullptr, 0));
             continue;
         }
+        if (eq && std::string(arg, eq - arg) == "user_sgprs") {
+            user_sgprs = static_cast<u32>(std::strtoul(eq + 1, nullptr, 0));
+            continue;
+        }
         if (!eq || !SetOption(o, std::string(arg, eq - arg), std::strtoul(eq + 1, nullptr, 0))) {
             std::fprintf(stderr, "unknown option %s\n", arg);
             return 1;
@@ -78,9 +100,10 @@ int main(int argc, char** argv) {
     }
 
     u32 ud[16] = {};
-    BuildInput in{cs ? Stage::Compute : ps ? Stage::Fragment : Stage::Vertex, 0x10000000, ud, 16, cs ? 2u : 3u,
+    BuildInput in{cs ? Stage::Compute : ps ? Stage::Fragment : Stage::Vertex, 0x10000000, ud, user_sgprs, cs ? 2u : 3u,
                   code.data()};
-    in.compute_rsrc2 = cs ? (7u << 7) : 0; // tests: all group ids enabled
+    // Tests: all group ids enabled (not for ES/GS, whose system SGPRs differ).
+    in.compute_rsrc2 = cs && o.ring.stage == RingStage::None ? (7u << 7) : 0;
     auto prog = BuildProgram(in);
     if (!prog) {
         std::fprintf(stderr, "cannot decode\n");

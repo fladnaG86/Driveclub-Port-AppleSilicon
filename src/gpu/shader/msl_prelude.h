@@ -88,6 +88,13 @@ static inline void dc_st_part(thread const M& m, ulong va, uint v, uint bytes) {
     atomic_fetch_and_explicit(a, ~mask, memory_order_relaxed);
     atomic_fetch_or_explicit(a, (v << sh) & mask, memory_order_relaxed);
 }
+// Swizzled buffer (V# SWIZZLE_EN / ADD_TID_ENABLE): index_stride records
+// interleave at element_size granularity (word 3 bits 21-22, 19-20).
+static inline ulong dc_swizzled(uint idx, uint off, uint stride, uint w3) {
+    uint is = 8u << ((w3 >> 21) & 3u);
+    uint es = 2u << ((w3 >> 19) & 3u);
+    return ulong(idx / is) * stride * is + ulong(off / es) * es * is + ulong(idx % is) * es + (off % es);
+}
 static inline ulong dc_vbase(uint a, uint b) { return ulong(a) | (ulong(b & 0xfffu) << 32); }
 static inline uint dc_vstride(uint b) { return (b >> 16) & 0x3fffu; }
 

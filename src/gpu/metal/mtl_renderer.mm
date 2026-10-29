@@ -3815,6 +3815,210 @@ struct MetalRenderer::Impl {
   void Dispatch(const RegFile &r, u32 x, u32 y, u32 z);
   u64 indirect_args = 0; // guest address of the group counts (DispatchIndirect)
 
+  // Runs the ES or GS of a GS pipeline as a compute kernel, one thread per
+  // vertex / primitive (Shader::RingInfo). Ring programs only touch memory
+  // (no textures). `index_va`: where a GS writes the copy-VS indices.
+  bool RunRing(const Shader::RingInfo &ring, u64 addr, const u32 *ud,
+               u32 num_user_sgprs, u32 threads, u32 group, u64 index_va) {
+    Program *p = GetProgram(Stage::Compute, addr, ud, num_user_sgprs, 0);
+    if (!p || !p->images.empty()) {
+      ReportOnce("gs emulation: ring program " + Hex(addr) +
+                 (p ? " samples textures" : " cannot be decoded"));
+      return false;
+    }
+    Shader::MslOptions o;
+    o.map_hoist = map_hoist;
+    o.ring = ring;
+    u64 key = Hash(p->hash);
+    key = Hash(o.map_hoist, key);
+    key = Hash(u64(ring.stage) | u64(ring.esgs_itemsize) << 8 |
+                   u64(ring.vert_itemsize) << 24 | u64(ring.slots) << 40,
+               key);
+    TakeCompiled();
+    auto it = compute_pipelines.find(key);
+    if (it == compute_pipelines.end()) {
+      if (!pending.count(key)) {
+        pending.insert(key);
+        compiler->Submit([this, src = MslSource(*p, o, key), key, addr] {
+          id<MTLComputePipelineState> pso = nil;
+          if (id<MTLFunction> fn = compiler->Function(key, src, addr)) {
+            NSError *err = nil;
+            pso = [device newComputePipelineStateWithFunction:fn error:&err];
+            if (!pso) {
+              DC_ERROR("gpu: ring pipeline %#llx: %s", addr,
+                       err ? err.localizedDescription.UTF8String : "?");
+            }
+          }
+          {
+            std::scoped_lock lk(done_lock);
+            done_compute.emplace_back(key, pso);
+          }
+          done_cv.notify_all();
+        }, /*urgent=*/true);
+      }
+      WaitCompiled(key);
+      it = compute_pipelines.find(key);
+    }
+    id<MTLComputePipelineState> pso = it->second;
+    if (!pso) {
+      return false;
+    }
+    EndPass();
+    EnsureCommandBuffer();
+    UpdateMemMap();
+    u32 cud[16];
+    std::memcpy(cud, ud, sizeof(cud));
+    PatchUserData(cud);
+    id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+    [e setComputePipelineState:pso];
+    [e setBytes:cud length:64 atIndex:Shader::Binding::UserData];
+    [e setBuffer:mem[0] offset:0 atIndex:Shader::Binding::Mem0];
+    [e setBuffer:mem[1] offset:0 atIndex:Shader::Binding::Mem1];
+    [e setBuffer:mem_map offset:0 atIndex:Shader::Binding::MemMap];
+    [e setBuffer:gds offset:Gpu::GdsBase() atIndex:Shader::Binding::Gds];
+    if (index_va) {
+      id<MTLBuffer> ib = nil;
+      u64 ioff = 0;
+      if (!Locate(index_va, 4, &ib, &ioff)) {
+        [e endEncoding];
+        return false;
+      }
+      [e setBuffer:ib offset:ioff atIndex:Shader::Binding::GsIndex];
+    }
+    [e setThreadgroupMemoryLength:16 atIndex:0];
+    // Exact thread count; the last group may be partial (lanes stay 0..n).
+    [e dispatchThreads:MTLSizeMake(threads, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(group, 1, 1)];
+    [e endEncoding];
+    return true;
+  }
+
+  // Geometry-shader pipeline (VGT_SHADER_STAGES_EN.GS_EN). Metal has no GS:
+  // the ES and GS run as compute kernels filling the guest's ESGS / GSVS
+  // rings, then the copy VS draws a triangle list from the GSVS ring through
+  // the indices the GS wrote. Handles point input, non-indexed, triangle-strip
+  // output; otherwise returns false and only the copy VS runs, as before.
+  // DC_NO_GS=1: always the old behavior; DC_GS_ONLY=<gs addr>: only that GS.
+  bool DrawGs(const RegFile &r, const DrawCall &dc) {
+    static const bool off = std::getenv("DC_NO_GS") != nullptr;
+    static const u64 only = std::getenv("DC_GS_ONLY") ? std::strtoull(std::getenv("DC_GS_ONLY"), nullptr, 16) : 0;
+    if (off || !dc.count || (only && r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_GS) != only)) {
+      return false;
+    }
+    // An indirect draw's count is the CP's read of its args, as for any draw.
+    if (r.Primitive() != PrimType::PointList || dc.indexed || dc.instances != 1 ||
+        (r[Reg::VGT_GS_OUT_PRIM_TYPE] & 0x3F) != 2 || (r[Reg::VGT_GS_INSTANCE_CNT] & 1)) {
+      ReportOnce("gs emulation: unsupported pipeline (prim " +
+                 std::to_string(static_cast<u32>(r.Primitive())) + ", out " +
+                 std::to_string(r[Reg::VGT_GS_OUT_PRIM_TYPE] & 0x3F) + ", indexed " +
+                 std::to_string(dc.indexed) + ", instances " + std::to_string(dc.instances) +
+                 ", indirect " + std::to_string(dc.indirect_args != 0) + ", gs instances " +
+                 std::to_string(r[Reg::VGT_GS_INSTANCE_CNT]) + ")");
+      return false;
+    }
+    // Emitted vertices per output-dword plane: the copy VS reads output
+    // dword k at k * plane bytes, a plane holding `slots` vertices of 16 lanes.
+    const u64 vs_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS);
+    Program *vs = GetProgram(Stage::Vertex, vs_addr, r.UserData(Reg::SPI_SHADER_USER_DATA_VS_0),
+                             Bits(r[Reg::SPI_SHADER_PGM_RSRC2_VS], 1, 5),
+                             Bits(r[Reg::SPI_SHADER_PGM_RSRC1_VS], 24, 2));
+    std::vector<u32> offsets;
+    for (const auto &i : vs ? vs->code : std::vector<Shader::Gcn::Inst>{}) {
+      if (i.enc == Shader::Gcn::Enc::MUBUF) {
+        offsets.push_back(i.offset);
+      }
+    }
+    std::sort(offsets.begin(), offsets.end());
+    u32 plane = 0;
+    for (size_t k = 1; k < offsets.size(); ++k) {
+      if (offsets[k] != offsets[k - 1]) {
+        plane = plane ? std::min(plane, offsets[k] - offsets[k - 1]) : offsets[k] - offsets[k - 1];
+      }
+    }
+    Shader::RingInfo ring;
+    ring.esgs_itemsize = r[Reg::VGT_ESGS_RING_ITEMSIZE] & 0x7FFF;
+    ring.vert_itemsize = r[Reg::VGT_GS_VERT_ITEMSIZE] & 0x7FFF;
+    ring.slots = plane / 64;
+    if (plane % 64 || ring.slots < 3 || ring.slots > 32 || !ring.esgs_itemsize ||
+        !ring.vert_itemsize) {
+      ReportOnce("gs emulation: copy shader layout not understood");
+      return false;
+    }
+    // Never write past the rings, whatever count the guest gave: points that
+    // do not fit are dropped. The guest does not set VGT_*_RING_SIZE in its
+    // command buffers, so the sizes come from the ring V#s: the one the GS's
+    // first buffer access reads (ESGS) and the copy VS's (GSVS).
+    auto ring_bytes = [&](Program *p, const u32 *ud) -> u64 {
+      for (const auto &i : p ? p->code : std::vector<Shader::Gcn::Inst>{}) {
+        if (i.enc != Shader::Gcn::Enc::MUBUF) {
+          continue;
+        }
+        const u32 k = p->LinearBaseOf(i.pc);
+        u64 va = 0, bytes = 0;
+        Shader::SgprReadCache cache;
+        return k < p->linear_bases.size() &&
+                       Shader::LinearBaseRange(p->linear_bases[k], ud, &cache, &va, &bytes)
+                   ? bytes
+                   : 0;
+      }
+      return 0;
+    };
+    const u32 *gs_ud = r.UserData(Reg::SPI_SHADER_USER_DATA_GS_0);
+    Program *gsp = GetProgram(Stage::Compute, r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_GS), gs_ud,
+                              Bits(r[Reg::SPI_SHADER_PGM_RSRC2_GS], 1, 5), 0);
+    u64 esgs_bytes = u64(r[Reg::VGT_ESGS_RING_SIZE]) << 8;
+    u64 gsvs_bytes = u64(r[Reg::VGT_GSVS_RING_SIZE]) << 8;
+    esgs_bytes = esgs_bytes ? esgs_bytes : ring_bytes(gsp, gs_ud);
+    gsvs_bytes = gsvs_bytes ? gsvs_bytes : ring_bytes(vs, r.UserData(Reg::SPI_SHADER_USER_DATA_VS_0));
+    if (!esgs_bytes || !gsvs_bytes) {
+      ReportOnce("gs emulation: ring sizes not set");
+      return false;
+    }
+    const u32 n = static_cast<u32>(std::min<u64>(
+        {dc.count, esgs_bytes / ring.EsWaveBytes() * 64, gsvs_bytes / ring.GsGroupBytes() * 16}));
+    const u64 index_bytes = u64(n) * ring.IndicesPerPrim() * 4;
+    if (!n || index_bytes > kArenaSize / 8) {
+      ReportOnce("gs emulation: " + std::to_string(dc.count) + " points do not fit");
+      return false;
+    }
+    const u64 index_va = ArenaAlloc(index_bytes);
+    if (!index_va) {
+      return false;
+    }
+    ring.stage = Shader::RingStage::Export;
+    if (!RunRing(ring, r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_ES),
+                 r.UserData(Reg::SPI_SHADER_USER_DATA_ES_0),
+                 Bits(r[Reg::SPI_SHADER_PGM_RSRC2_ES], 1, 5), n, 64, 0)) {
+      return false;
+    }
+    ring.stage = Shader::RingStage::Geometry;
+    if (!RunRing(ring, r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_GS),
+                 r.UserData(Reg::SPI_SHADER_USER_DATA_GS_0),
+                 Bits(r[Reg::SPI_SHADER_PGM_RSRC2_GS], 1, 5), n, 16, index_va)) {
+      return false;
+    }
+    if (trace) {
+      DC_INFO("gpu:   gs emulated: %u of %u points, %u slots, esgs %u of %llu B, gsvs %u of %llu B, "
+              "indices at %#llx",
+              n, dc.count, ring.slots, (n + 63) / 64 * ring.EsWaveBytes(), (unsigned long long)esgs_bytes,
+              (n + 15) / 16 * ring.GsGroupBytes(), (unsigned long long)gsvs_bytes,
+              (unsigned long long)index_va);
+    }
+    // The copy VS as an ordinary indexed triangle list (GS stage off).
+    auto copy = std::make_unique<RegFile>(r);
+    (*copy)[Reg::VGT_SHADER_STAGES_EN] &= ~0x20u;
+    (*copy)[Reg::VGT_PRIMITIVE_TYPE] = static_cast<u32>(PrimType::TriList);
+    DrawCall d = dc;
+    d.indexed = true;
+    d.count = n * ring.IndicesPerPrim();
+    d.index_base = index_va;
+    d.index_offset = 0;
+    d.index_size = 4;
+    d.indirect_args = 0; // the count is the GS output's, not the guest's args
+    Draw(*copy, d);
+    return true;
+  }
+
   // DC_FIND_ADDR=<addr>: in the traced frame, the draws and dispatches whose
   // user data, or tables it points to (two levels deep), hold a V# covering
   // that address (finds the shaders reading or writing a buffer).
@@ -3940,6 +4144,9 @@ struct MetalRenderer::Impl {
 };
 
 void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
+  if ((r[Reg::VGT_SHADER_STAGES_EN] & 0x20) && DrawGs(r, dc)) {
+    return;
+  }
   CpuTimer draw_timer(cpu_profile ? &cpu_draw_s : nullptr);
   DrawLap(0);
   ++draw_count;
