@@ -185,6 +185,12 @@ void CommandProcessor::Run(Ring& ring, std::stop_token stop) {
     char name[32];
     std::snprintf(name, sizeof(name), ring.index == 0 ? "GPU gfx" : "GPU compute %u", ring.index);
     pthread_setname_np(name);
+    // The CP threads are on every frame's critical path, among dozens of
+    // guest threads (some spin-waiting) at the default QoS: ask for P-cores and
+    // priority. DC_NO_QOS=1 leaves the default (A/B).
+    if (!std::getenv("DC_NO_QOS")) {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
     t_ring = &ring;
     t_regs = ring.index == 0 ? &regs : &ring.regs;
     Gpu::t_queue = ring.index;
