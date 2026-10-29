@@ -4,6 +4,8 @@
 #include <bit>
 #include <cstring>
 
+#include <dispatch/dispatch.h>
+
 namespace Gpu::Liverpool::Tiling {
 
 namespace {
@@ -241,13 +243,45 @@ u64 MipLayout(u32 tile_index, u32 pitch, u32 height, u32 layers, u32 levels, u32
     return total;
 }
 
+// One element: a fixed-size copy the compiler can inline (memcpy with a
+// runtime size is a call per pixel).
+inline void CopyEl(u8* dst, const u8* src, u32 bytes) {
+    switch (bytes) {
+    case 1: *dst = *src; break;
+    case 2: std::memcpy(dst, src, 2); break;
+    case 4: std::memcpy(dst, src, 4); break;
+    case 8: std::memcpy(dst, src, 8); break;
+    case 16: std::memcpy(dst, src, 16); break;
+    default: std::memcpy(dst, src, bytes); break;
+    }
+}
+
+// Runs fn(y0, y1) over [0, height): in parallel bands for big images (rows
+// are independent), inline for small ones. Track textures appearing during
+// loads were detiled on the GPU thread one pixel at a time.
+template <typename F>
+void ForRows(u32 height, u32 width, F&& fn) {
+    constexpr u32 kBand = 32;
+    if (u64(height) * width < (1u << 16) || height <= kBand) {
+        fn(0u, height);
+        return;
+    }
+    const u32 bands = (height + kBand - 1) / kBand;
+    dispatch_apply(bands, DISPATCH_APPLY_AUTO, ^(size_t b) {
+        const u32 y0 = static_cast<u32>(b) * kBand;
+        fn(y0, std::min(height, y0 + kBand));
+    });
+}
+
 void DetileSlice(u32 tile_index, const u8* src, u8* dst, u32 width_el, u32 height_el, u32 pitch_el,
                  u32 bytes_per_el, u32 z) {
     const u64 row = u64(width_el) * bytes_per_el;
     if (IsLinear(tile_index)) {
-        for (u32 y = 0; y < height_el; ++y) {
-            std::memcpy(dst + y * row, src + u64(y) * pitch_el * bytes_per_el, row);
-        }
+        ForRows(height_el, width_el, [&](u32 y0, u32 y1) {
+            for (u32 y = y0; y < y1; ++y) {
+                std::memcpy(dst + y * row, src + u64(y) * pitch_el * bytes_per_el, row);
+            }
+        });
         return;
     }
     if (const Micro type2d = MicroType2D(tile_index); type2d != Micro::None) {
@@ -259,13 +293,15 @@ void DetileSlice(u32 tile_index, const u8* src, u8* dst, u32 width_el, u32 heigh
                 order[y * 8 + x] = MicroIndex(type2d, bytes_per_el, x, y);
             }
         }
-        for (u32 y = 0; y < height_el; ++y) {
-            u8* out = dst + y * row;
-            for (u32 x = 0; x < width_el; ++x) {
-                std::memcpy(out + u64(x) * bytes_per_el, src + MacroOffset(x, y, pitch, m, order, bytes_per_el),
-                            bytes_per_el);
+        ForRows(height_el, width_el, [&](u32 y0, u32 y1) {
+            for (u32 y = y0; y < y1; ++y) {
+                u8* out = dst + y * row;
+                for (u32 x = 0; x < width_el; ++x) {
+                    CopyEl(out + u64(x) * bytes_per_el, src + MacroOffset(x, y, pitch, m, order, bytes_per_el),
+                           bytes_per_el);
+                }
             }
-        }
+        });
         return;
     }
     if (IsThick1D(tile_index)) {
@@ -280,16 +316,17 @@ void DetileSlice(u32 tile_index, const u8* src, u8* dst, u32 width_el, u32 heigh
                 order[y * 8 + x] = MicroIndex3D(bytes_per_el, x, y, z);
             }
         }
-        for (u32 y = 0; y < height_el; ++y) {
-            const u8* tile_row = src + u64(y / 8) * tiles_x * tile_bytes;
-            u8* out = dst + y * row;
-            for (u32 x = 0; x < width_el; ++x) {
-                const u8* tile = tile_row + u64(x / 8) * tile_bytes;
-                std::memcpy(out + u64(x) * bytes_per_el,
-                            tile + u64(order[(y & 7) * 8 + (x & 7)]) * bytes_per_el,
-                            bytes_per_el);
+        ForRows(height_el, width_el, [&](u32 y0, u32 y1) {
+            for (u32 y = y0; y < y1; ++y) {
+                const u8* tile_row = src + u64(y / 8) * tiles_x * tile_bytes;
+                u8* out = dst + y * row;
+                for (u32 x = 0; x < width_el; ++x) {
+                    const u8* tile = tile_row + u64(x / 8) * tile_bytes;
+                    CopyEl(out + u64(x) * bytes_per_el, tile + u64(order[(y & 7) * 8 + (x & 7)]) * bytes_per_el,
+                           bytes_per_el);
+                }
             }
-        }
+        });
         return;
     }
     const Micro type = MicroType1D(tile_index);
@@ -301,15 +338,17 @@ void DetileSlice(u32 tile_index, const u8* src, u8* dst, u32 width_el, u32 heigh
             order[y * 8 + x] = MicroIndex(type, bytes_per_el, x, y);
         }
     }
-    for (u32 y = 0; y < height_el; ++y) {
-        const u8* tile_row = src + u64(y / 8) * tiles_x * tile_bytes;
-        u8* out = dst + y * row;
-        for (u32 x = 0; x < width_el; ++x) {
-            const u8* tile = tile_row + u64(x / 8) * tile_bytes;
-            std::memcpy(out + u64(x) * bytes_per_el, tile + u64(order[(y & 7) * 8 + (x & 7)]) * bytes_per_el,
-                        bytes_per_el);
+    ForRows(height_el, width_el, [&](u32 y0, u32 y1) {
+        for (u32 y = y0; y < y1; ++y) {
+            const u8* tile_row = src + u64(y / 8) * tiles_x * tile_bytes;
+            u8* out = dst + y * row;
+            for (u32 x = 0; x < width_el; ++x) {
+                const u8* tile = tile_row + u64(x / 8) * tile_bytes;
+                CopyEl(out + u64(x) * bytes_per_el, tile + u64(order[(y & 7) * 8 + (x & 7)]) * bytes_per_el,
+                       bytes_per_el);
+            }
         }
-    }
+    });
 }
 
 } // namespace Gpu::Liverpool::Tiling
