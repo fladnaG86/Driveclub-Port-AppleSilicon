@@ -13,9 +13,22 @@
 > "PlayStation" are trademarks of their owners. No game files are included: you need
 > your own legitimate copy of the game.*
 
-[![Driveclub racing on an M1 Max under Rosetta 2 (click to play the video)](media/apple-silicon-race.jpg)](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/apple-silicon-video/driveclub-apple-silicon.mp4)
+[![Driveclub v0.2.15 racing in heavy rain on an M1 Max under Rosetta 2 (click to play the video)](media/apple-silicon-rain.jpg)](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/v0.2.15-apple-silicon/Driveclub-0.2.15-gameplay.mp4)
 
-*Gameplay on a MacBook Pro M1 Max under Rosetta 2, with the game's audio. Click the image to play the video (MP4, 3:57). The Metal Performance HUD (top right) shows the real frame rate and the GPU time per frame.*
+*v0.2.15 in heavy rain on a MacBook Pro M1 Max under Rosetta 2, at 30 fps: chase, bonnet and cockpit views, raindrops on the windscreen and the camera lens. Click the image to play the video (MP4, 0:28).*
+
+### What's new since the first video
+
+The [first gameplay video](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/download/apple-silicon-video/driveclub-apple-silicon.mp4) (October 18, v0.1, ~26 fps) showed dry races only. Since then:
+
+- **Rain and water effects.** Rain no longer turns the screen white (v0.2.9). Rain particles and spray from the cars are drawn (v0.2.10). Raindrops now run down the windscreen and land on the camera lens in chase view: the game makes them with geometry shaders, which Metal does not have, so they are emulated with compute shaders (v0.2.14).
+- **Lighting and colors.** Direct sunlight is back on cars and track (v0.2.11). Car liveries show their real colors instead of black (v0.2.5).
+- **Audio.** Correct stereo downmix of the game's surround mix (v0.2.10), with no more crackles or gaps (v0.2.13).
+- **Performance.** From ~26 to a steady **30 fps** in a race on an M1 Max: shorter GPU work per frame (v0.2.5, v0.2.12), less waiting between frames (v0.2.6), a memory leak fixed (v0.2.8).
+- **Loading and stutters.** Shorter shader freezes the first time you play (v0.2.7). Faster texture loading, a smoother countdown and background shader prewarm after an update (v0.2.15).
+- **App.** Driveclub.app with a game-folder picker, one log per session on your Desktop with your Mac model (v0.2.4).
+
+Full list: [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases).
 
 ## How to play on Apple Silicon
 
