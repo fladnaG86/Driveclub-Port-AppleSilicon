@@ -4329,7 +4329,11 @@ struct MetalRenderer::Impl {
 };
 
 void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
-  if ((r[Reg::VGT_SHADER_STAGES_EN] & 0x20) && DrawGs(r, dc)) {
+  // Without ES and GS the copy VS reads whatever earlier GS draws left in the
+  // GSVS ring: valid clip positions, so stray primitives on screen. A draw that
+  // was not emulated is skipped.
+  if (r[Reg::VGT_SHADER_STAGES_EN] & 0x20) {
+    DrawGs(r, dc);
     return;
   }
   CpuTimer draw_timer(cpu_profile ? &cpu_draw_s : nullptr);
