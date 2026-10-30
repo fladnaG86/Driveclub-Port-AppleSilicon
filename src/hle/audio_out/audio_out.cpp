@@ -35,6 +35,10 @@ constexpr s32 kErrorPortFull = static_cast<s32>(0x8026000A);
 constexpr s32 kErrorInvalidFormat = static_cast<s32>(0x80260005);
 constexpr u32 kRingBuffers = 3; // buffers a port can hold before Output blocks
 constexpr float kVolume0dB = 32768.0f;
+// SDL normalizes its 7.1 to stereo matrix (front left to left is 0.21, -13.5 dB).
+// The game sets 0 dB and mixes for a console output, so a stereo device got it
+// far too quiet. +12 dB: the sum of both ports peaks at 0.56 in a race.
+constexpr float kStereoDownmixGain = 4.0f;
 
 struct Port {
     bool open = false;
@@ -48,7 +52,8 @@ struct Port {
     std::vector<u8> ring;
     u64 read = 0, write = 0; // byte counters
     float gain = 1.0f;       // applied on the SDL thread
-    float applied_gain = 1.0f;
+    float applied_gain = -1.0f;
+    float downmix_gain = 1.0f;
     bool is_float = false;
     // Diagnostics: peak level, logged every few seconds while there is sound.
     float peak = 0.0f;
@@ -84,7 +89,7 @@ void SDLCALL Feed(void* user, SDL_AudioStream* stream, int additional, int /*tot
     Port& p = *static_cast<Port*>(user);
     std::unique_lock lk(p.lock);
     if (p.gain != p.applied_gain) {
-        SDL_SetAudioStreamGain(stream, p.gain);
+        SDL_SetAudioStreamGain(stream, p.gain * p.downmix_gain);
         p.applied_gain = p.gain;
     }
     const u64 size = p.ring.size();
@@ -231,6 +236,8 @@ s32 sceAudioOutOpen(s32 user_id, s32 port_type, s32 index, u32 len, u32 freq, u3
             }
             return kErrorPortFull;
         }
+        p.downmix_gain = channels == 8 && device_spec.channels == 2 ? kStereoDownmixGain : 1.0f;
+        p.applied_gain = -1.0f;
         p.open = true;
         if (const char* dir = DumpDir()) {
             char path[1024];
