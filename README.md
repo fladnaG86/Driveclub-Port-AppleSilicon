@@ -3,7 +3,7 @@
 > **Apple Silicon fork.** This repository is a fork of
 > [BlackLineInteractive/Driveclub-Port](https://github.com/BlackLineInteractive/Driveclub-Port)
 > that runs the macOS backend on **Apple Silicon Macs under Rosetta 2**
-> (playable races, ~26-28 fps on an M1 Max), with many GPU fixes and performance work.
+> (playable races, ~30 fps on an M1 Max), with many GPU fixes and performance work.
 > **Prebuilt download:** [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest). What was done, how to build it and what is left:
 > **[docs/APPLE_SILICON.md](docs/APPLE_SILICON.md)** · in italiano:
 > **[docs/APPLE_SILICON.it.md](docs/APPLE_SILICON.it.md)**.
@@ -24,7 +24,7 @@
 You need a Mac with Apple Silicon running **macOS 15 or later** and **your own copy of Driveclub v1.28 (CUSA00003)**,
 decrypted and extracted to a folder (the one with `eboot.bin`). No game files are included.
 
-1. Download `Driveclub-Native-0.2.14.dmg` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest), open it and drag **Driveclub** onto **Applications**.
+1. Download `Driveclub-Native-0.2.15.dmg` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest), open it and drag **Driveclub** onto **Applications**.
 2. First launch only (the app is not notarized): double-click it, click **Done**, then
    **System Settings → Privacy & Security → Open Anyway**. Accept if macOS offers to install Rosetta.
 3. Choose your game folder (the one with `eboot.bin`) when asked. The app remembers it

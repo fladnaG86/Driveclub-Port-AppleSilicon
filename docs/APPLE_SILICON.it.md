@@ -29,7 +29,7 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
 | Audio | Funziona |
 | Input | DualShock/DualSense via SDL3, oppure tastiera (vedi sotto) |
 | Grafica | Le scene di gara sono corrette, per quanto confrontato con video PS4; vedi *Lacune note* |
-| Prestazioni | ~26-28 fps in gara a 1920x1080 (M1 Max); erano ~12 fps all'inizio del lavoro |
+| Prestazioni | ~30 fps in gara a 1920x1080 (M1 Max); erano ~12 fps all'inizio del lavoro |
 | Stabilità | Gare di diversi minuti senza crash; un watchdog GPU chiude il processo in modo pulito se uno shader si blocca |
 
 ## Come giocare
@@ -42,7 +42,7 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
    cartelle, copia prima i file della patch sopra la cartella del gioco base
    (sostituendo `eboot.bin`). Altre versioni del gioco non partono: l'app ti
    avvisa se la tua è una di queste.
-2. **Installa l'app.** Scarica `Driveclub-Native-0.2.14.dmg` dalle
+2. **Installa l'app.** Scarica `Driveclub-Native-0.2.15.dmg` dalle
    [Release](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest),
    aprilo e trascina **Driveclub** su **Applicazioni**.
 3. **Solo al primo avvio: autorizza l'app.** Non è notarizzata da Apple, quindi
@@ -58,6 +58,9 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
    cartella con `eboot.bin` e clicca **Play**. Viene ricordata; tieni premuto
    **Opzione** mentre apri l'app per sceglierne un'altra.
 5. **Aspetta circa 40 secondi** per il caricamento. Il titolo della finestra mostra gli fps.
+   Se puoi, tieni la cartella del gioco su un disco APFS (per esempio quello
+   interno): su una chiavetta exFAT macOS la legge con un driver in user space
+   che in gara occupa circa mezzo core.
 6. **Nel gioco:** nella schermata *Start Event* premi **Croce** (`Invio`). Nella
    schermata *Controls* premi di nuovo **Croce**. La gara parte.
 7. **Per uscire** premi `Cmd+Q`.
@@ -136,7 +139,7 @@ Serve **una propria copia del gioco**, come pacchetto decrittato ed estratto
 
 Per impacchettare la build come `Driveclub.app` in un `.dmg` (firma ad-hoc), passa
 un SDL3 x86_64 compilato con `-ffile-prefix-map`, così non contiene percorsi locali:
-`tools/app/make_app.sh 0.2.14 /percorso/libSDL3.0.dylib` → `dist/`.
+`tools/app/make_app.sh 0.2.15 /percorso/libSDL3.0.dylib` → `dist/`.
 
 ## Cosa è stato fatto
 
@@ -187,6 +190,9 @@ Misure in gara, 1920x1080, M1 Max. Ogni passo è stato misurato A/B
 | **Basi di memoria tradotte dall'host** (sotto) | GPU 35.2 -> 27.2 ms/frame | d08a95f |
 | Risultati di Resolve riusati per programma e descrittori; basi di memoria tradotte una volta per draw | thread CP 22.7 -> 21.1 ms/frame, ~+1-2 fps | 4d6df28 |
 | **Load dai buffer senza percorso per indirizzi non allineati** dove l'allineamento è dimostrabile (sotto) | GPU 22.2 -> 20.65 ms/frame sommati sui pass | af2d82c |
+| Texture riordinate su più core e copiate con blit GPU da memoria di appoggio riciclata | caricamento texture prima della gara 1301 -> 203 ms, la gara parte 17.8 -> 13.3 s dopo la schermata dell'evento | c4bbb7f, e71266f |
+| Thread del command processor a QoS user-interactive | 1% low in gara ~20 -> ~22 fps | 261fe89 |
+| **Pipeline compute precompilate** da un elenco di quelle viste nelle partite precedenti (sotto) | prima partita dopo un aggiornamento: attese shader 6.8 -> 1.1 s, la più lunga 1.4 -> 0.3 s | ba8cb5b |
 
 **Basi tradotte dall'host (d08a95f).** Gli shader accedono alla memoria guest
 tramite una page table. La cattura Xcode dello shader più pesante (il TAA,
@@ -210,6 +216,18 @@ già allineata a 4; ora il renderer segnala anche quali basi hanno uno stride
 multiplo di 4, e gli accessi su di esse con offset costanti allineati leggono
 la memoria direttamente. TAA: 3073 -> 1306 istruzioni AGX, 79 -> 65 registri,
 1.35 -> 0.79 ms. `DC_NO_ALIGNED=1` ripristina il codice precedente.
+
+**Pipeline compute precompilate (ba8cb5b).** Gli shader compute devono essere
+compilati prima che il loro dispatch parta, quindi una pipeline mancante blocca
+il frame (i draw vengono compilati in background e saltati nel frattempo). Dopo
+un aggiornamento dell'app o di macOS la cache di Metal è vuota e la prima gara
+si bloccava per diversi secondi. Ora l'app scrive ogni pipeline compute che crea
+in `~/Library/Caches/DriveclubNative/compute_pipelines.bin` e all'avvio
+successivo compila quell'elenco in background, durante i video iniziali.
+`DC_NO_PREWARM=1` la disattiva.
+
+Con queste modifiche una gara su M1 Max tiene 30 fps di media senza secondi
+sotto i 29 fps; circa il 2% dei frame salta ancora un vblank (41 ms invece di 33).
 
 ## Cosa resta da fare
 

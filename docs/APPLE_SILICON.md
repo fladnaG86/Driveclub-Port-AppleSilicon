@@ -28,7 +28,7 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
 | Audio | Works |
 | Input | DualShock/DualSense via SDL3 gamepad, or keyboard (see below) |
 | Graphics | Race scenes render correctly as far as checked against PS4 footage; see *Known gaps* |
-| Performance | ~26-28 fps in a race at 1920x1080 (M1 Max); was ~12 fps at the start of this work |
+| Performance | ~30 fps in a race at 1920x1080 (M1 Max); was ~12 fps at the start of this work |
 | Stability | Races of several minutes without crashes; a GPU watchdog exits cleanly if a shader hangs |
 
 ## How to play
@@ -41,7 +41,7 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
    the 1.28 patch as two folders, copy the patch's files over the base game
    folder first (replacing `eboot.bin`). Other game versions do not start: the
    app tells you if yours is one.
-2. **Install the app.** Download `Driveclub-Native-0.2.14.dmg` from
+2. **Install the app.** Download `Driveclub-Native-0.2.15.dmg` from
    [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest),
    open it and drag **Driveclub** onto **Applications**.
 3. **First launch only: allow the app.** It is not notarized by Apple, so macOS
@@ -57,6 +57,9 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
    folder with `eboot.bin` and click **Play**. It is remembered; hold **Option**
    while opening the app to choose another one.
 5. **Wait about 40 seconds** for loading. The window title shows the frame rate.
+   Keep the game folder on an APFS disk (such as the internal one) if you can:
+   on an exFAT USB stick macOS reads it through a user-space driver that takes
+   about half a CPU core during a race.
 6. **In the game:** at the *Start Event* screen press **Cross** (`Enter`). At the
    *Controls* screen press **Cross** again. The race starts.
 7. **To quit**, press `Cmd+Q`.
@@ -135,7 +138,7 @@ You need **your own copy of the game** as a decrypted, extracted package
 
 To package the build as `Driveclub.app` in a `.dmg` (ad-hoc signed), pass an
 x86_64 SDL3 built with `-ffile-prefix-map` so it carries no local paths:
-`tools/app/make_app.sh 0.2.14 /path/to/libSDL3.0.dylib` → `dist/`.
+`tools/app/make_app.sh 0.2.15 /path/to/libSDL3.0.dylib` → `dist/`.
 
 ## What was done
 
@@ -186,6 +189,9 @@ Measured in a race, 1920x1080, M1 Max. Each step was A/B tested
 | **Host-translated memory bases** (see below) | GPU 35.2 -> 27.2 ms/frame | d08a95f |
 | Resolve results reused per program and descriptors; memory bases translated once per draw | CP thread 22.7 -> 21.1 ms/frame, ~+1-2 fps | 4d6df28 |
 | **Buffer loads without the unaligned fallback** where the address is provably aligned (see below) | GPU 22.2 -> 20.65 ms/frame summed over passes | af2d82c |
+| Texture uploads detiled on several cores and copied by GPU blits from recycled staging memory | texture upload before the race 1301 -> 203 ms, race starts 17.8 -> 13.3 s after the event screen | c4bbb7f, e71266f |
+| Command processor threads at user-interactive QoS | race 1% low ~20 -> ~22 fps | 261fe89 |
+| **Compute pipelines prewarmed** from a list of the ones seen in previous runs (see below) | first run after an update: shader waits 6.8 -> 1.1 s, longest 1.4 -> 0.3 s | ba8cb5b |
 
 **Host-translated bases (d08a95f).** Shaders reach guest memory through a page
 table. The Xcode capture of the heaviest shader (the TAA, 4.3 ms) showed 196
@@ -208,6 +214,18 @@ which bases have a stride that is a multiple of 4, and accesses on them with
 constant aligned offsets read memory directly. TAA: 3073 -> 1306 AGX
 instructions, 79 -> 65 registers, 1.35 -> 0.79 ms. `DC_NO_ALIGNED=1` restores
 the old code.
+
+**Prewarmed compute pipelines (ba8cb5b).** Compute shaders must be compiled
+before their dispatch runs, so a missing pipeline stalls the frame (draws are
+compiled in the background and skipped meanwhile). After an app update or a
+macOS update Metal's own cache is empty and the first race stalled for several
+seconds. The app now writes each compute pipeline it builds to
+`~/Library/Caches/DriveclubNative/compute_pipelines.bin` and compiles that list
+in the background at the next start, during the intro videos. `DC_NO_PREWARM=1`
+turns it off.
+
+With these changes a race on the M1 Max holds 30 fps on average with no second
+under 29 fps; about 2% of frames still miss one vblank (41 ms instead of 33).
 
 ## What is left
 
