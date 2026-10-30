@@ -1797,13 +1797,16 @@ std::string Emitter::Run() {
             if (k <= p.vgpr_comp_cnt) vinit[k] = "iid";
         }
     } else if (p.stage == Stage::Compute && o.ring.stage == RingStage::Export) {
-        if (!vinit.empty()) vinit[0] = "dc_gtid.x"; // vertex index
+        if (!vinit.empty()) vinit[0] = o.ring.index_size ? "uint(dc_esidx[dc_gtid.x])" : "dc_gtid.x"; // vertex index
     } else if (p.stage == Stage::Compute && o.ring.stage == RingStage::Geometry) {
-        // Point input: primitive p's vertex is ES thread p, at ring dword
-        // es2gs/4 + lane of ES wave p / 64. v2 is the primitive id.
-        const std::string vtx = "(dc_gtid.x / 64u) * " + N(o.ring.EsWaveBytes() / 4) + "u + dc_gtid.x % 64u";
+        // Primitive p's vertex v is ES thread p * input_verts + v, at ring dword
+        // es2gs/4 + lane of that thread's ES wave. v2 is the primitive id.
+        const auto vtx = [&](u32 v) {
+            const std::string t = "(dc_gtid.x * " + N(o.ring.input_verts) + "u + " + N(v) + "u)";
+            return "(" + t + " / 64u) * " + N(o.ring.EsWaveBytes() / 4) + "u + " + t + " % 64u";
+        };
         for (u32 k : {0u, 1u, 3u, 4u, 5u, 6u}) {
-            if (k < vinit.size()) vinit[k] = vtx;
+            if (k < vinit.size()) vinit[k] = vtx(k == 1 && o.ring.input_verts > 1 ? 1 : 0);
         }
         if (vinit.size() > 2) vinit[2] = "dc_gtid.x";
     } else if (p.stage == Stage::Compute) {
@@ -2000,6 +2003,9 @@ std::string Emitter::Run() {
                "uint3 dc_gtid [[thread_position_in_grid]], " +
                mem_params + ", device uint* gds [[buffer(5)]], threadgroup uint* lds [[threadgroup(0)]]" + probe_param + TexParams(true) +
                (o.ring.stage == RingStage::Geometry ? ", device uint* dc_gsidx [[buffer(" + N(Binding::GsIndex) + ")]]" : "") +
+               (o.ring.index_size ? std::string(", device const ") + (o.ring.index_size == 2 ? "ushort" : "uint") +
+                                        "* dc_esidx [[buffer(" + N(Binding::GsIndex) + ")]]"
+                                  : "") +
                ") {\n";
         src += "    " + MemInit() + "\n    uint dc_lane = dc_lidx & 63u;\n";
         src += "    (void)mem; (void)dc_lane; (void)lds; (void)gds;\n";

@@ -4017,7 +4017,8 @@ struct MetalRenderer::Impl {
     u64 key = Hash(p->hash);
     key = Hash(o.map_hoist, key);
     key = Hash(u64(ring.stage) | u64(ring.esgs_itemsize) << 8 |
-                   u64(ring.vert_itemsize) << 24 | u64(ring.slots) << 40,
+                   u64(ring.vert_itemsize) << 24 | u64(ring.slots) << 40 |
+                   u64(ring.input_verts) << 48 | u64(ring.index_size) << 52,
                key);
     TakeCompiled();
     auto it = compute_pipelines.find(key);
@@ -4081,9 +4082,9 @@ struct MetalRenderer::Impl {
   // Geometry-shader pipeline (VGT_SHADER_STAGES_EN.GS_EN). Metal has no GS:
   // the ES and GS run as compute kernels filling the guest's ESGS / GSVS
   // rings, then the copy VS draws a triangle list from the GSVS ring through
-  // the indices the GS wrote. Handles point input, non-indexed, triangle-strip
-  // output; otherwise returns false and only the copy VS runs, as before.
-  // DC_NO_GS=1: always the old behavior; DC_GS_ONLY=<gs addr>: only that GS.
+  // the indices the GS wrote. Handles non-indexed point input and line input,
+  // indexed or not, with triangle-strip output; otherwise returns false and the
+  // draw is skipped. DC_NO_GS=1: skip them all; DC_GS_ONLY=<gs addr>: only that GS.
   bool DrawGs(const RegFile &r, const DrawCall &dc) {
     static const bool off = std::getenv("DC_NO_GS") != nullptr;
     static const u64 only = std::getenv("DC_GS_ONLY") ? std::strtoull(std::getenv("DC_GS_ONLY"), nullptr, 16) : 0;
@@ -4091,7 +4092,8 @@ struct MetalRenderer::Impl {
       return false;
     }
     // An indirect draw's count is the CP's read of its args, as for any draw.
-    if (r.Primitive() != PrimType::PointList || dc.indexed || dc.instances != 1 ||
+    const bool lines = r.Primitive() == PrimType::LineList;
+    if ((!lines && (r.Primitive() != PrimType::PointList || dc.indexed)) || dc.instances != 1 ||
         (r[Reg::VGT_GS_OUT_PRIM_TYPE] & 0x3F) != 2 || (r[Reg::VGT_GS_INSTANCE_CNT] & 1)) {
       ReportOnce("gs emulation: unsupported pipeline (prim " +
                  std::to_string(static_cast<u32>(r.Primitive())) + ", out " +
@@ -4129,22 +4131,22 @@ struct MetalRenderer::Impl {
       ReportOnce("gs emulation: copy shader layout not understood");
       return false;
     }
-    // Never write past the rings, whatever count the guest gave: points that
-    // do not fit are dropped. The guest does not set VGT_*_RING_SIZE in its
+    // Never write past the rings, whatever count the guest gave: primitives
+    // that do not fit are dropped. The guest does not set VGT_*_RING_SIZE in its
     // command buffers, so the sizes come from the ring V#s: the one the GS's
-    // first buffer access reads (ESGS) and the copy VS's (GSVS).
+    // first buffer access with a known base reads (ESGS) and the copy VS's (GSVS).
     auto ring_bytes = [&](Program *p, const u32 *ud) -> u64 {
       for (const auto &i : p ? p->code : std::vector<Shader::Gcn::Inst>{}) {
         if (i.enc != Shader::Gcn::Enc::MUBUF) {
           continue;
         }
         const u32 k = p->LinearBaseOf(i.pc);
+        if (k >= p->linear_bases.size()) {
+          continue; // an SGPR soffset has no base; the next access has the same V#
+        }
         u64 va = 0, bytes = 0;
         Shader::SgprReadCache cache;
-        return k < p->linear_bases.size() &&
-                       Shader::LinearBaseRange(p->linear_bases[k], ud, &cache, &va, &bytes)
-                   ? bytes
-                   : 0;
+        return Shader::LinearBaseRange(p->linear_bases[k], ud, &cache, &va, &bytes) ? bytes : 0;
       }
       return 0;
     };
@@ -4159,11 +4161,13 @@ struct MetalRenderer::Impl {
       ReportOnce("gs emulation: ring sizes not set");
       return false;
     }
-    const u32 n = static_cast<u32>(std::min<u64>(
-        {dc.count, esgs_bytes / ring.EsWaveBytes() * 64, gsvs_bytes / ring.GsGroupBytes() * 16}));
+    ring.input_verts = lines ? 2 : 1;
+    const u32 n = static_cast<u32>(std::min<u64>({dc.count / ring.input_verts,
+                                                  esgs_bytes / ring.EsWaveBytes() * 64 / ring.input_verts,
+                                                  gsvs_bytes / ring.GsGroupBytes() * 16}));
     const u64 index_bytes = u64(n) * ring.IndicesPerPrim() * 4;
     if (!n || index_bytes > kArenaSize / 8) {
-      ReportOnce("gs emulation: " + std::to_string(dc.count) + " points do not fit");
+      ReportOnce("gs emulation: " + std::to_string(dc.count) + " vertices do not fit");
       return false;
     }
     const u64 index_va = ArenaAlloc(index_bytes);
@@ -4171,12 +4175,15 @@ struct MetalRenderer::Impl {
       return false;
     }
     ring.stage = Shader::RingStage::Export;
+    ring.index_size = dc.indexed ? dc.index_size : 0;
     if (!RunRing(ring, r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_ES),
                  r.UserData(Reg::SPI_SHADER_USER_DATA_ES_0),
-                 Bits(r[Reg::SPI_SHADER_PGM_RSRC2_ES], 1, 5), n, 64, 0)) {
+                 Bits(r[Reg::SPI_SHADER_PGM_RSRC2_ES], 1, 5), n * ring.input_verts, 64,
+                 dc.indexed ? dc.index_base + u64(dc.index_offset) * dc.index_size : 0)) {
       return false;
     }
     ring.stage = Shader::RingStage::Geometry;
+    ring.index_size = 0;
     if (!RunRing(ring, r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_GS),
                  r.UserData(Reg::SPI_SHADER_USER_DATA_GS_0),
                  Bits(r[Reg::SPI_SHADER_PGM_RSRC2_GS], 1, 5), n, 16, index_va)) {
@@ -4185,7 +4192,8 @@ struct MetalRenderer::Impl {
     if (trace) {
       DC_INFO("gpu:   gs emulated: %u of %u points, %u slots, esgs %u of %llu B, gsvs %u of %llu B, "
               "indices at %#llx",
-              n, dc.count, ring.slots, (n + 63) / 64 * ring.EsWaveBytes(), (unsigned long long)esgs_bytes,
+              n, dc.count, ring.slots, (n * ring.input_verts + 63) / 64 * ring.EsWaveBytes(),
+              (unsigned long long)esgs_bytes,
               (n + 15) / 16 * ring.GsGroupBytes(), (unsigned long long)gsvs_bytes,
               (unsigned long long)index_va);
     }

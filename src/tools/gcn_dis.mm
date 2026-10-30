@@ -57,6 +57,14 @@ static bool SetOption(Gpu::Shader::MslOptions& o, const std::string& key, unsign
         o.ring.slots = static_cast<u32>(v);
         return true;
     }
+    if (key == "input_verts") {
+        o.ring.input_verts = static_cast<u32>(v);
+        return true;
+    }
+    if (key == "index_size") {
+        o.ring.index_size = static_cast<u32>(v);
+        return true;
+    }
     return false;
 }
 

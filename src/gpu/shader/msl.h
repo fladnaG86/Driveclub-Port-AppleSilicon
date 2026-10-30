@@ -45,6 +45,8 @@ struct RingInfo {
     u32 esgs_itemsize = 0; // dwords per ES vertex (VGT_ESGS_RING_ITEMSIZE)
     u32 vert_itemsize = 0; // GS: dwords per emitted vertex (VGT_GS_VERT_ITEMSIZE)
     u32 slots = 0;         // GS: emitted vertices per output-dword plane of a 16-lane group
+    u32 input_verts = 1;   // vertices per input primitive: 1 point, 2 line
+    u32 index_size = 0;    // ES: bytes per index read from Binding::GsIndex; 0 = not indexed
     bool operator==(const RingInfo&) const = default;
 
     // Byte size of one ES wave's / one GS group's slice of its ring.
