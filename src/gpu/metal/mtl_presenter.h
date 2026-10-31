@@ -12,11 +12,15 @@ class Device;
 
 struct PresenterConfig {
     bool vsync = true;
+    bool edr = false; // Float layer with extended range, see EdrAvailable
 };
 
 class Presenter {
 public:
     static constexpr int kFramesInFlight = 3;
+
+    // The main screen can show more than SDR white, and DC_NO_EDR is not set.
+    static bool EdrAvailable();
 
     // `layer` is a CAMetalLayer* (e.g. from SDL_Metal_GetLayer).
     Presenter(Device& device, void* layer, const PresenterConfig& config);
@@ -36,7 +40,11 @@ public:
     void PresentClear(float r, float g, float b);
 
     // Draws a finished frame (id<MTLTexture> as void*) scaled to the drawable.
-    void PresentTexture(void* texture_handle);
+    // `boost_handle` (EDR, may be null): R16Float highlights for this frame.
+    void PresentTexture(void* texture_handle, void* boost_handle = nullptr);
+
+    // EDR highlight boost on/off; returns the new state.
+    bool ToggleEdr();
 
 private:
     struct Impl;

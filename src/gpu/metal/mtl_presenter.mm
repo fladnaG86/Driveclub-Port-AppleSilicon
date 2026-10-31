@@ -1,5 +1,6 @@
 #include "gpu/metal/mtl_presenter.h"
 
+#import <AppKit/AppKit.h>
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -34,6 +35,22 @@ fragment float4 fs_present(VertexOut in [[stage_in]],
                            sampler smp [[sampler(0)]]) {
     return tex.sample(smp, in.uv);
 }
+
+struct EdrParams {
+    float gain, knee, limit;
+};
+
+// Output is extended linear sRGB: 1.0 is SDR white, above that is EDR.
+fragment float4 fs_edr(VertexOut in [[stage_in]],
+                       texture2d<float> tex [[texture(0)]],
+                       texture2d<float> peak [[texture(1)]],
+                       sampler smp [[sampler(0)]],
+                       constant EdrParams& p [[buffer(0)]]) {
+    float3 c = tex.sample(smp, in.uv).rgb;
+    float3 lin = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
+    float over = max(peak.sample(smp, in.uv).r - p.knee, 0.0);
+    return float4(lin * min(1.0 + p.gain * over, p.limit), 1.0);
+}
 )";
 
 } // namespace
@@ -49,6 +66,13 @@ struct Presenter::Impl {
     bool upscale = true; // DC_NO_METALFX or M key: plain bilinear present
     id<MTLFXSpatialScaler> scaler;
     id<MTLTexture> scaled; // Scaler output; the drawable is framebufferOnly
+
+    // EDR: float layer, boost applied in fs_edr.
+    bool edr = false;
+    bool edr_boost = true;
+    float edr_gain = 4.0f, edr_knee = 0.7f;
+    id<MTLRenderPipelineState> edr_pipeline;
+    id<MTLTexture> edr_black; // Stands in when a frame has no boost map
 
     // The scaler for this frame and drawable, nil when there is nothing to
     // upscale or MetalFX can't. Rebuilt when either size changes.
@@ -101,6 +125,11 @@ struct Presenter::Impl {
     }
 };
 
+bool Presenter::EdrAvailable() {
+    return std::getenv("DC_NO_EDR") == nullptr &&
+           NSScreen.mainScreen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0;
+}
+
 Presenter::Presenter(Device& device, void* layer, const PresenterConfig& config)
     : impl(std::make_unique<Impl>()) {
     impl->device = (__bridge id<MTLDevice>)device.Handle();
@@ -140,6 +169,42 @@ Presenter::Presenter(Device& device, void* layer, const PresenterConfig& config)
     sDesc.minFilter = MTLSamplerMinMagFilterLinear;
     sDesc.magFilter = MTLSamplerMinMagFilterLinear;
     impl->sampler = [impl->device newSamplerStateWithDescriptor:sDesc];
+
+    if (config.edr) {
+        impl->edr = true;
+        if (const char* e = std::getenv("DC_EDR_GAIN")) {
+            impl->edr_gain = std::strtof(e, nullptr);
+        }
+        if (const char* e = std::getenv("DC_EDR_KNEE")) {
+            impl->edr_knee = std::strtof(e, nullptr);
+        }
+        l.pixelFormat = MTLPixelFormatRGBA16Float;
+        l.wantsExtendedDynamicRangeContent = YES;
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+        l.colorspace = cs;
+        CGColorSpaceRelease(cs);
+
+        pDesc.fragmentFunction = [lib newFunctionWithName:@"fs_edr"];
+        pDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+        impl->edr_pipeline = [impl->device newRenderPipelineStateWithDescriptor:pDesc error:&err];
+        if (err) {
+            NSLog(@"Presenter EDR pipeline creation failed: %@", err);
+        }
+        MTLTextureDescriptor* t =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float
+                                                               width:1
+                                                              height:1
+                                                           mipmapped:NO];
+        impl->edr_black = [impl->device newTextureWithDescriptor:t];
+        const uint16_t zero = 0;
+        [impl->edr_black replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+                           mipmapLevel:0
+                             withBytes:&zero
+                           bytesPerRow:2];
+        DC_INFO("present: EDR gain %g knee %g, screen headroom potential %g",
+                impl->edr_gain, impl->edr_knee,
+                NSScreen.mainScreen.maximumPotentialExtendedDynamicRangeColorComponentValue);
+    }
 }
 
 Presenter::~Presenter() {
@@ -164,6 +229,11 @@ void Presenter::SetVsync(bool enabled) {
 bool Presenter::ToggleUpscaling() {
     impl->upscale = !impl->upscale;
     return impl->upscale;
+}
+
+bool Presenter::ToggleEdr() {
+    impl->edr_boost = !impl->edr_boost;
+    return impl->edr_boost;
 }
 
 void Presenter::PresentClear(float r, float g, float b) {
@@ -195,7 +265,7 @@ void Presenter::PresentClear(float r, float g, float b) {
     }
 }
 
-void Presenter::PresentTexture(void* texture_handle) {
+void Presenter::PresentTexture(void* texture_handle, void* boost_handle) {
     if (!texture_handle || !impl->pipeline) {
         return;
     }
@@ -223,7 +293,17 @@ void Presenter::PresentTexture(void* texture_handle) {
             tex = impl->scaled;
         }
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
-        [enc setRenderPipelineState:impl->pipeline];
+        if (impl->edr && impl->edr_pipeline) {
+            id<MTLTexture> boost = boost_handle ? (__bridge id<MTLTexture>)boost_handle : impl->edr_black;
+            const float params[3] = {
+                impl->edr_boost ? impl->edr_gain : 0.0f, impl->edr_knee,
+                static_cast<float>(NSScreen.mainScreen.maximumExtendedDynamicRangeColorComponentValue)};
+            [enc setRenderPipelineState:impl->edr_pipeline];
+            [enc setFragmentTexture:boost atIndex:1];
+            [enc setFragmentBytes:params length:sizeof(params) atIndex:0];
+        } else {
+            [enc setRenderPipelineState:impl->pipeline];
+        }
         [enc setFragmentTexture:tex atIndex:0];
         [enc setFragmentSamplerState:impl->sampler atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];

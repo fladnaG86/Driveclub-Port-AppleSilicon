@@ -250,6 +250,24 @@ fragment ZOut zcopy_fs(V in [[stage_in]], texture2d<float> src [[texture(0)]]) {
     o.d = src.read(uint2(in.pos.xy)).r;
     return o;
 }
+// EDR: the value the game's tonemap feeds its LUT, which clamps it to 1.
+kernel void edr_peak(texture2d<float> scene [[texture(0)]], texture2d<float> bloom [[texture(1)]],
+                     texture2d<float, access::write> out [[texture(2)]],
+                     constant float& exposure [[buffer(0)]], uint2 id [[thread_position_in_grid]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float2 uv = (float2(id) + 0.5) / float2(out.get_width(), out.get_height());
+    float3 c = bloom.sample(s, uv, level(0)).rgb + exposure * scene.sample(s, uv, level(0)).rgb;
+    out.write(float4(max(c.r, max(c.g, c.b))), id);
+}
+// EDR: keep the peak only where nothing was drawn over the tonemapped image.
+kernel void edr_mask(texture2d<float, access::read> base [[texture(0)]],
+                     texture2d<float, access::read> final_frame [[texture(1)]],
+                     texture2d<float, access::read> peak [[texture(2)]],
+                     texture2d<float, access::write> out [[texture(3)]],
+                     uint2 id [[thread_position_in_grid]]) {
+    float3 d = abs(base.read(id).rgb - final_frame.read(id).rgb);
+    out.write(float4(all(d < 2.0 / 255.0) ? peak.read(id).r : 0.0), id);
+}
 kernel void fill32(device uint* dst [[buffer(0)]], constant uint2& vc [[buffer(1)]],
                    uint i [[thread_position_in_grid]]) {
     if (i < vc.y) dst[i] = vc.x;
@@ -720,6 +738,15 @@ struct MetalRenderer::Impl {
   id<MTLTexture> frames[3] = {nil, nil, nil};
   u32 frame_index = 0;
   std::atomic<void *> latest_frame{nullptr};
+  // EDR highlights, see EdrCapture. Set once before the renderer is in use.
+  bool edr_on = false;
+  bool edr_armed = false, edr_have = false;
+  u64 edr_final = 0, edr_scene = 0, edr_bloom = 0;
+  float edr_exposure = 0;
+  id<MTLComputePipelineState> edr_peak_pipeline = nil, edr_mask_pipeline = nil;
+  id<MTLTexture> edr_base = nil, edr_base_view = nil, edr_peak = nil;
+  id<MTLTexture> edr_out[3] = {nil, nil, nil};
+  std::atomic<void *> latest_boost{nullptr};
   u64 frame_count = 0;
 
   // ---- diagnostics ----
@@ -1101,6 +1128,12 @@ struct MetalRenderer::Impl {
                                       error:&err];
     htile_pipeline = [device
         newComputePipelineStateWithFunction:[lib newFunctionWithName:@"htile_build"]
+                                      error:&err];
+    edr_peak_pipeline = [device
+        newComputePipelineStateWithFunction:[lib newFunctionWithName:@"edr_peak"]
+                                      error:&err];
+    edr_mask_pipeline = [device
+        newComputePipelineStateWithFunction:[lib newFunctionWithName:@"edr_mask"]
                                       error:&err];
     if (!htile_pipeline) {
       DC_ERROR("gpu: htile pipeline: %s", err.localizedDescription.UTF8String);
@@ -3812,6 +3845,64 @@ struct MetalRenderer::Impl {
   // Compute shaders may write a depth surface's memory as a color image
   // (Driveclub's half-resolution depth for rain and particles): when that
   // image is newer than the depth texture, the depth takes it over.
+  // Right after the tonemap draw, before the HUD: keeps the tonemapped image
+  // and the unclamped peak per pixel. Flip masks out what the HUD covered.
+  void EdrCapture() {
+    edr_armed = false;
+    RenderTarget *fin = Latest(color_targets, edr_final);
+    RenderTarget *scene = Latest(color_targets, edr_scene);
+    RenderTarget *bloom = Latest(color_targets, edr_bloom);
+    if (!fin || !fin->tex || !scene || !scene->tex || !bloom || !bloom->tex ||
+        !edr_peak_pipeline) {
+      return;
+    }
+    EndPass();
+    EnsureCommandBuffer();
+    id<MTLTexture> f = fin->tex;
+    if (!edr_base || edr_base.width != f.width || edr_base.height != f.height) {
+      MTLTextureDescriptor *d = [MTLTextureDescriptor
+          texture2DDescriptorWithPixelFormat:f.pixelFormat
+                                       width:f.width
+                                      height:f.height
+                                   mipmapped:NO];
+      d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+      d.storageMode = MTLStorageModePrivate;
+      edr_base = [device newTextureWithDescriptor:d];
+      edr_base_view = [edr_base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
+      d = [MTLTextureDescriptor
+          texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float
+                                       width:f.width
+                                      height:f.height
+                                   mipmapped:NO];
+      d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+      d.storageMode = MTLStorageModePrivate;
+      edr_peak = [device newTextureWithDescriptor:d];
+      DC_INFO("edr: capture %lux%lu fmt %d exposure %g", (unsigned long)f.width,
+              (unsigned long)f.height, (int)f.pixelFormat, edr_exposure);
+    }
+    id<MTLBlitCommandEncoder> b = [cmd blitCommandEncoder];
+    [b copyFromTexture:f
+           sourceSlice:0
+           sourceLevel:0
+          sourceOrigin:MTLOriginMake(0, 0, 0)
+            sourceSize:MTLSizeMake(f.width, f.height, 1)
+             toTexture:edr_base
+      destinationSlice:0
+      destinationLevel:0
+     destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [b endEncoding];
+    id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+    [e setComputePipelineState:edr_peak_pipeline];
+    [e setTexture:scene->tex atIndex:0];
+    [e setTexture:bloom->tex atIndex:1];
+    [e setTexture:edr_peak atIndex:2];
+    [e setBytes:&edr_exposure length:sizeof(edr_exposure) atIndex:0];
+    [e dispatchThreads:MTLSizeMake(f.width, f.height, 1)
+        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    [e endEncoding];
+    edr_have = true;
+  }
+
   void DepthFromColor(RenderTarget &z) {
     static const bool off = std::getenv("DC_NO_DEPTH_FROM_COLOR") != nullptr; // A/B
     RenderTarget *c = off ? nullptr : Latest(color_targets, z.addr, TexDim::Tex2D, z.width, z.height);
@@ -4351,6 +4442,24 @@ void MetalRenderer::Impl::Draw(const RegFile &r, const DrawCall &dc) {
   ++work_since_commit;
   const u64 vs_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_VS);
   const u64 ps_addr = r.ProgramAddr(Reg::SPI_SHADER_PGM_LO_PS);
+  if (edr_armed) {
+    EdrCapture();
+  }
+  if (edr_on && ps_addr == 0x7003d7ef00) {
+    const u32 *ud = r.UserData(Reg::SPI_SHADER_USER_DATA_PS_0);
+    const u64 table = (u64(ud[12]) | (u64(ud[13] & 0xFFFF) << 32)) & kGpuAddrMask;
+    if (Readable(table, 160)) {
+      const u32 *t = reinterpret_cast<const u32 *>(table);
+      const u64 cb = (u64(t[36]) | (u64(t[37] & 0xFFF) << 32)) & kGpuAddrMask;
+      if (Readable(cb, 600)) {
+        edr_exposure = reinterpret_cast<const float *>(cb)[146];
+        edr_scene = (u64(ud[0]) | (u64(ud[1] & 0xFF) << 32)) << 8;
+        edr_bloom = (u64(t[0]) | (u64(t[1] & 0xFF) << 32)) << 8;
+        edr_final = u64(r.ColorTarget(0, Reg::CB_BASE)) << 8;
+        edr_armed = true;
+      }
+    }
+  }
   if (trace && (scan_all || !scan_addrs.empty())) {
     scan_label = "pass with draw #" + std::to_string(draw_count) + " ps " + Hex(ps_addr);
   }
@@ -6019,6 +6128,9 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
       stat_t0 = now;
     }
   }
+  if (edr_armed) {
+    EdrCapture();
+  }
   EndPass();
   EnsureCommandBuffer();
 
@@ -6074,6 +6186,31 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
   }
+  id<MTLTexture> edr_frame = nil;
+  if (edr_have && src && edr_peak.width == dst.width && edr_peak.height == dst.height) {
+    __strong id<MTLTexture> &o = edr_out[frame_index];
+    if (!o) {
+      MTLTextureDescriptor *d = [MTLTextureDescriptor
+          texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float
+                                       width:dst.width
+                                      height:dst.height
+                                   mipmapped:NO];
+      d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+      d.storageMode = MTLStorageModePrivate;
+      o = [device newTextureWithDescriptor:d];
+    }
+    id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+    [e setComputePipelineState:edr_mask_pipeline];
+    [e setTexture:edr_base_view atIndex:0];
+    [e setTexture:dst atIndex:1];
+    [e setTexture:edr_peak atIndex:2];
+    [e setTexture:o atIndex:3];
+    [e dispatchThreads:MTLSizeMake(dst.width, dst.height, 1)
+        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    [e endEncoding];
+    edr_frame = o;
+  }
+  edr_have = false;
   if (debug_vs_buf) {
     Commit(true);
     EnsureCommandBuffer();
@@ -6127,6 +6264,7 @@ void MetalRenderer::Impl::Flip(const FlipInfo &f) {
   }
   Commit(false);
   if (src) {
+    latest_boost.store((__bridge void *)edr_frame, std::memory_order_release);
     latest_frame.store((__bridge void *)dst, std::memory_order_release);
     frame_index = (frame_index + 1) % 3;
   }
@@ -6296,6 +6434,12 @@ std::uint8_t *MetalRenderer::Gds() {
 
 void *MetalRenderer::LatestFrame() const {
   return impl->latest_frame.load(std::memory_order_acquire);
+}
+
+void MetalRenderer::SetEdr(bool enabled) { impl->edr_on = enabled; }
+
+void *MetalRenderer::LatestBoost() const {
+  return impl->latest_boost.load(std::memory_order_acquire);
 }
 
 } // namespace Gpu::Metal

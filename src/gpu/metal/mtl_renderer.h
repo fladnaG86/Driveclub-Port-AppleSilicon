@@ -42,6 +42,11 @@ public:
     // Main thread: the last flipped frame as id<MTLTexture> (void*), or null.
     // It stays valid until two more flips have happened.
     void* LatestFrame() const;
+    // EDR: per-pixel unclamped tonemap input for that frame, or null.
+    void* LatestBoost() const;
+
+    // Before the renderer receives work: capture what LatestBoost needs.
+    void SetEdr(bool enabled);
 
     // Any thread: frames the game has flipped so far (its real frame rate,
     // unlike how often the window presents).

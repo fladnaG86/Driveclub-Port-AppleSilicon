@@ -105,9 +105,11 @@ int Run(int argc, char** argv) {
 
     Gpu::Metal::PresenterConfig config{};
     config.vsync = std::getenv("DC_NO_VSYNC") == nullptr; // DC_NO_VSYNC: uncap fps, for measurement
+    config.edr = Gpu::Metal::Presenter::EdrAvailable();
     auto device = std::make_unique<Gpu::Metal::Device>();
     auto presenter = std::make_unique<Gpu::Metal::Presenter>(*device, SDL_Metal_GetLayer(view), config);
     auto renderer = std::make_unique<Gpu::Metal::MetalRenderer>(*device);
+    renderer->SetEdr(config.edr);
     Gpu::Liverpool::Instance().SetRenderer(renderer.get());
     const std::string gpu_name = device->Info().name;
 
@@ -144,6 +146,12 @@ int Run(int argc, char** argv) {
                 case SDLK_M:
                     if (pressed) {
                         DC_INFO("metalfx: %d", presenter->ToggleUpscaling());
+                        present_again = true;
+                    }
+                    break;
+                case SDLK_H:
+                    if (pressed) {
+                        DC_INFO("edr: %d", presenter->ToggleEdr());
                         present_again = true;
                     }
                     break;
@@ -308,7 +316,7 @@ int Run(int argc, char** argv) {
         if (void* tex = renderer->LatestFrame()) {
             const std::uint64_t flip = renderer->FlipCount();
             if (flip != presented_flip || present_again) {
-                presenter->PresentTexture(tex);
+                presenter->PresentTexture(tex, renderer->LatestBoost());
                 presented_flip = flip;
                 present_again = false;
             } else {
