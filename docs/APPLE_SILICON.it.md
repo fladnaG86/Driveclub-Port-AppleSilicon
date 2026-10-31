@@ -107,6 +107,7 @@ Tasti del port:
 | Tasto | Funzione |
 | --- | --- |
 | `V` | Vsync sì/no |
+| `M` | Upscaling MetalFX sì/no (finestra più grande di 1080p; `DC_NO_METALFX=1` parte spento) |
 | `F12` | Debug: salva il trace del frame successivo in `../bench/f12_<frame>` |
 | `F11` | Debug: cattura GPU Xcode di due frame (serve `MTL_CAPTURE_ENABLED=1`; molto grande) |
 

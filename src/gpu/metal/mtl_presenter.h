@@ -28,6 +28,10 @@ public:
     void Resize(int width_px, int height_px);
     void SetVsync(bool enabled);
 
+    // MetalFX spatial upscaling on/off (when the drawable is larger than the
+    // frame); returns the new state.
+    bool ToggleUpscaling();
+
     // Placeholder frame: clears the drawable.
     void PresentClear(float r, float g, float b);
 

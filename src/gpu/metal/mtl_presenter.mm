@@ -1,8 +1,12 @@
 #include "gpu/metal/mtl_presenter.h"
 
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <cstdlib>
+
+#include "common/log.h"
 #include "gpu/metal/mtl_device.h"
 
 namespace Gpu::Metal {
@@ -41,6 +45,60 @@ struct Presenter::Impl {
     id<MTLRenderPipelineState> pipeline;
     id<MTLSamplerState> sampler;
     dispatch_semaphore_t frames_in_flight;
+
+    bool upscale = true; // DC_NO_METALFX or M key: plain bilinear present
+    id<MTLFXSpatialScaler> scaler;
+    id<MTLTexture> scaled; // Scaler output; the drawable is framebufferOnly
+
+    // The scaler for this frame and drawable, nil when there is nothing to
+    // upscale or MetalFX can't. Rebuilt when either size changes.
+    id<MTLFXSpatialScaler> ScalerFor(id<MTLTexture> frame, id<MTLTexture> target) {
+        if (!upscale || target.width < frame.width || target.height < frame.height ||
+            (target.width == frame.width && target.height == frame.height)) {
+            return nil;
+        }
+        if (scaler && scaled.width == target.width && scaled.height == target.height &&
+            scaler.inputWidth == frame.width && scaler.inputHeight == frame.height) {
+            return scaler;
+        }
+        scaler = nil;
+        scaled = nil;
+        if (![MTLFXSpatialScalerDescriptor supportsDevice:device]) {
+            DC_INFO("present: MetalFX not supported, using bilinear");
+            upscale = false;
+            return nil;
+        }
+        MTLFXSpatialScalerDescriptor* d = [MTLFXSpatialScalerDescriptor new];
+        d.inputWidth = frame.width;
+        d.inputHeight = frame.height;
+        d.outputWidth = target.width;
+        d.outputHeight = target.height;
+        d.colorTextureFormat = frame.pixelFormat;
+        d.outputTextureFormat = frame.pixelFormat;
+        // Frames hold the gamma-encoded bytes the PS4 would scan out.
+        d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+        scaler = [d newSpatialScalerWithDevice:device];
+        if (scaler) {
+            MTLTextureDescriptor* t =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:frame.pixelFormat
+                                                                   width:target.width
+                                                                  height:target.height
+                                                               mipmapped:NO];
+            t.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
+            t.storageMode = MTLStorageModePrivate;
+            scaled = [device newTextureWithDescriptor:t];
+        }
+        if (!scaler || !scaled) {
+            DC_INFO("present: MetalFX scaler creation failed, using bilinear");
+            scaler = nil;
+            upscale = false;
+            return nil;
+        }
+        DC_INFO("present: MetalFX spatial %lux%lu -> %lux%lu", (unsigned long)frame.width,
+                (unsigned long)frame.height, (unsigned long)target.width,
+                (unsigned long)target.height);
+        return scaler;
+    }
 };
 
 Presenter::Presenter(Device& device, void* layer, const PresenterConfig& config)
@@ -49,6 +107,7 @@ Presenter::Presenter(Device& device, void* layer, const PresenterConfig& config)
     impl->queue = (__bridge id<MTLCommandQueue>)device.Queue();
     impl->layer = (__bridge CAMetalLayer*)layer;
     impl->frames_in_flight = dispatch_semaphore_create(kFramesInFlight);
+    impl->upscale = std::getenv("DC_NO_METALFX") == nullptr;
 
     CAMetalLayer* l = impl->layer;
     l.device = impl->device;
@@ -102,6 +161,11 @@ void Presenter::SetVsync(bool enabled) {
     impl->layer.displaySyncEnabled = enabled;
 }
 
+bool Presenter::ToggleUpscaling() {
+    impl->upscale = !impl->upscale;
+    return impl->upscale;
+}
+
 void Presenter::PresentClear(float r, float g, float b) {
     dispatch_semaphore_wait(impl->frames_in_flight, DISPATCH_TIME_FOREVER);
 
@@ -152,6 +216,12 @@ void Presenter::PresentTexture(void* texture_handle) {
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 
         id<MTLCommandBuffer> cmd = [impl->queue commandBuffer];
+        if (id<MTLFXSpatialScaler> scaler = impl->ScalerFor(tex, drawable.texture)) {
+            scaler.colorTexture = tex;
+            scaler.outputTexture = impl->scaled;
+            [scaler encodeToCommandBuffer:cmd];
+            tex = impl->scaled;
+        }
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
         [enc setRenderPipelineState:impl->pipeline];
         [enc setFragmentTexture:tex atIndex:0];

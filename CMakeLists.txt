@@ -163,6 +163,7 @@ target_link_libraries(driveclub PRIVATE
     SDL3::SDL3
     libatrac9
     "-framework Metal"
+    "-framework MetalFX"
     "-framework QuartzCore"
     "-framework Foundation"
     "-framework AppKit"

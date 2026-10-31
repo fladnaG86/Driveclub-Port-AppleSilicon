@@ -141,6 +141,12 @@ int Run(int argc, char** argv) {
             case SDL_EVENT_KEY_UP: {
                 const bool pressed = (ev.type == SDL_EVENT_KEY_DOWN);
                 switch (ev.key.key) {
+                case SDLK_M:
+                    if (pressed) {
+                        DC_INFO("metalfx: %d", presenter->ToggleUpscaling());
+                        present_again = true;
+                    }
+                    break;
                 case SDLK_F11:
                     if (pressed) {
                         Gpu::Metal::RequestGpuCapture(); // .gputrace of the next frames

@@ -106,6 +106,7 @@ Keys of the port itself:
 | Key | Function |
 | --- | --- |
 | `V` | Vsync on/off |
+| `M` | MetalFX upscaling on/off (window larger than 1080p; `DC_NO_METALFX=1` starts with it off) |
 | `F12` | Debug: record a trace of the next frame into `../bench/f12_<frame>` |
 | `F11` | Debug: Xcode GPU capture of two frames (needs `MTL_CAPTURE_ENABLED=1`; very large) |
 
