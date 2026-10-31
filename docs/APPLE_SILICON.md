@@ -41,7 +41,7 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
    the 1.28 patch as two folders, copy the patch's files over the base game
    folder first (replacing `eboot.bin`). Other game versions do not start: the
    app tells you if yours is one.
-2. **Install the app.** Download `Driveclub-Native-0.2.16.dmg` from
+2. **Install the app.** Download `Driveclub-Native-0.2.17.dmg` from
    [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest),
    open it and drag **Driveclub** onto **Applications**.
 3. **First launch only: allow the app.** It is not notarized by Apple, so macOS
@@ -138,7 +138,7 @@ You need **your own copy of the game** as a decrypted, extracted package
 
 To package the build as `Driveclub.app` in a `.dmg` (ad-hoc signed), pass an
 x86_64 SDL3 built with `-ffile-prefix-map` so it carries no local paths:
-`tools/app/make_app.sh 0.2.16 /path/to/libSDL3.0.dylib` → `dist/`.
+`tools/app/make_app.sh 0.2.17 /path/to/libSDL3.0.dylib` → `dist/`.
 
 ## What was done
 
@@ -246,6 +246,9 @@ under 29 fps; about 2% of frames still miss one vblank (41 ms instead of 33).
 
 **Known gaps:**
 
+- Car paint can turn black: in 4 of 57 test runs (fe_458) it was already black at
+  frame 300 and stayed black for the whole run. Cause unknown, possibly related
+  to issue #10.
 - Texture format `dfmt=49 nfmt=4` (R4G4) is not supported.
 - Shader op `IMAGE_ATOMIC_ADD` is not translated.
 - Unimplemented HLE functions still called, without visible effect so far:

@@ -42,7 +42,7 @@ macOS 27.2, gioco v1.28 (CUSA00003)**. Altri chip Apple Silicon non sono stati p
    cartelle, copia prima i file della patch sopra la cartella del gioco base
    (sostituendo `eboot.bin`). Altre versioni del gioco non partono: l'app ti
    avvisa se la tua è una di queste.
-2. **Installa l'app.** Scarica `Driveclub-Native-0.2.16.dmg` dalle
+2. **Installa l'app.** Scarica `Driveclub-Native-0.2.17.dmg` dalle
    [Release](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest),
    aprilo e trascina **Driveclub** su **Applicazioni**.
 3. **Solo al primo avvio: autorizza l'app.** Non è notarizzata da Apple, quindi
@@ -139,7 +139,7 @@ Serve **una propria copia del gioco**, come pacchetto decrittato ed estratto
 
 Per impacchettare la build come `Driveclub.app` in un `.dmg` (firma ad-hoc), passa
 un SDL3 x86_64 compilato con `-ffile-prefix-map`, così non contiene percorsi locali:
-`tools/app/make_app.sh 0.2.16 /percorso/libSDL3.0.dylib` → `dist/`.
+`tools/app/make_app.sh 0.2.17 /percorso/libSDL3.0.dylib` → `dist/`.
 
 ## Cosa è stato fatto
 
@@ -248,6 +248,9 @@ lavoro per frame), mentre il frame dura ~40 ms. I limiti sono:
 
 **Lacune note:**
 
+- La vernice dell'auto può diventare nera: in 4 test su 57 (fe_458) era già nera al
+  frame 300 ed è rimasta nera per tutta la corsa. Causa ignota, forse legata alla
+  issue #10.
 - Formato texture `dfmt=49 nfmt=4` (R4G4) non supportato.
 - L'operazione shader `IMAGE_ATOMIC_ADD` non è tradotta.
 - Funzioni HLE ancora chiamate e non implementate, finora senza effetti
