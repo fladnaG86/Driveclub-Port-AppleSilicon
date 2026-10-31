@@ -23,6 +23,7 @@ The [first gameplay video](https://github.com/fladnaG86/Driveclub-Port-AppleSili
 
 - **Rain and water effects.** Rain no longer turns the screen white (v0.2.9). Rain particles and spray from the cars are drawn (v0.2.10). Raindrops now run down the windscreen and land on the camera lens in chase view: the game makes them with geometry shaders, which Metal does not have, so they are emulated with compute shaders (v0.2.14). Tyre marks now stay on the road, using the same emulation (v0.2.17).
 - **Lighting and colors.** Direct sunlight is back on cars and track (v0.2.11). Car liveries show their real colors instead of black (v0.2.5).
+- **Image quality.** The game still renders at 1080p, but MetalFX now upscales the finished frame to your window, so edges and text stay sharp on Retina and 4K screens. Press `M` to compare on and off (v0.2.18).
 - **Audio.** Correct stereo downmix of the game's surround mix (v0.2.10), with no more crackles or gaps (v0.2.13) and the right volume on stereo outputs (v0.2.16).
 - **Performance.** From ~26 to a steady **30 fps** in a race on an M1 Max: shorter GPU work per frame (v0.2.5, v0.2.12), less waiting between frames (v0.2.6), a memory leak fixed (v0.2.8).
 - **Loading and stutters.** Shorter shader freezes the first time you play (v0.2.7). Faster texture loading, a smoother countdown and background shader prewarm after an update (v0.2.15).
@@ -37,7 +38,7 @@ Full list: [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/r
 You need a Mac with Apple Silicon running **macOS 15 or later** and **your own copy of Driveclub v1.28 (CUSA00003)**,
 decrypted and extracted to a folder (the one with `eboot.bin`). No game files are included.
 
-1. Download `Driveclub-Native-0.2.17.dmg` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest), open it and drag **Driveclub** onto **Applications**.
+1. Download `Driveclub-Native-0.2.18.dmg` from [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest), open it and drag **Driveclub** onto **Applications**.
 2. First launch only (the app is not notarized): double-click it, click **Done**, then
    **System Settings → Privacy & Security → Open Anyway**. Accept if macOS offers to install Rosetta.
 3. Choose your game folder (the one with `eboot.bin`) when asked. The app remembers it
