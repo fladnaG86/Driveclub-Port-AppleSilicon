@@ -41,7 +41,7 @@ macOS 27.2, game v1.28 (CUSA00003)**. Other Apple Silicon chips have not been te
    the 1.28 patch as two folders, copy the patch's files over the base game
    folder first (replacing `eboot.bin`). Other game versions do not start: the
    app tells you if yours is one.
-2. **Install the app.** Download `Driveclub-Native-0.2.18.dmg` from
+2. **Install the app.** Download `Driveclub-Native-0.2.19.dmg` from
    [Releases](https://github.com/fladnaG86/Driveclub-Port-AppleSilicon/releases/latest),
    open it and drag **Driveclub** onto **Applications**.
 3. **First launch only: allow the app.** It is not notarized by Apple, so macOS
@@ -107,6 +107,7 @@ Keys of the port itself:
 | --- | --- |
 | `V` | Vsync on/off |
 | `M` | MetalFX upscaling on/off (window larger than 1080p; `DC_NO_METALFX=1` starts with it off) |
+| `H` | Brighter highlights on HDR (EDR) screens on/off (`DC_NO_EDR=1` turns EDR off) |
 | `F12` | Debug: record a trace of the next frame into `../bench/f12_<frame>` |
 | `F11` | Debug: Xcode GPU capture of two frames (needs `MTL_CAPTURE_ENABLED=1`; very large) |
 
@@ -139,7 +140,7 @@ You need **your own copy of the game** as a decrypted, extracted package
 
 To package the build as `Driveclub.app` in a `.dmg` (ad-hoc signed), pass an
 x86_64 SDL3 built with `-ffile-prefix-map` so it carries no local paths:
-`tools/app/make_app.sh 0.2.18 /path/to/libSDL3.0.dylib` → `dist/`.
+`tools/app/make_app.sh 0.2.19 /path/to/libSDL3.0.dylib` → `dist/`.
 
 ## What was done
 
