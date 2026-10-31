@@ -5,7 +5,9 @@
 #import <MetalFX/MetalFX.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <algorithm>
 #include <cstdlib>
+#include <vector>
 
 #include "common/log.h"
 #include "gpu/metal/mtl_device.h"
@@ -66,6 +68,35 @@ struct Presenter::Impl {
     bool upscale = true; // DC_NO_METALFX or M key: plain bilinear present
     id<MTLFXSpatialScaler> scaler;
     id<MTLTexture> scaled; // Scaler output; the drawable is framebufferOnly
+
+    // At most one frame per `pace` s on screen: on a 120 Hz display an unpaced
+    // 30 fps game lands frames 25 or 41.7 ms apart, which reads as stutter. The
+    // game caps at 30. DC_NO_PACE turns it off. DC_PACE_STATS logs the intervals
+    // between frames as the display showed them.
+    double pace = 1.0 / 30.0;
+    bool pace_stats = false;
+    double last_shown = 0;
+    std::vector<float> shown_ms;
+    void NotePresented(double t) { // Metal callback thread
+        if (t <= 0) {
+            return;
+        }
+        if (last_shown > 0) {
+            shown_ms.push_back(static_cast<float>((t - last_shown) * 1000.0));
+        }
+        last_shown = t;
+        if (shown_ms.size() >= 300) {
+            std::sort(shown_ms.begin(), shown_ms.end());
+            int off = 0;
+            for (const float v : shown_ms) {
+                off += v < 30.0f || v > 36.0f;
+            }
+            const size_t n = shown_ms.size();
+            DC_INFO("pace: p1 %.1f p50 %.1f p99 %.1f max %.1f ms, %.1f%% off 33 ms", shown_ms[n / 100],
+                    shown_ms[n / 2], shown_ms[n - n / 100 - 1], shown_ms[n - 1], 100.0 * off / n);
+            shown_ms.clear();
+        }
+    }
 
     // EDR: float layer, boost applied in fs_edr.
     bool edr = false;
@@ -137,6 +168,10 @@ Presenter::Presenter(Device& device, void* layer, const PresenterConfig& config)
     impl->layer = (__bridge CAMetalLayer*)layer;
     impl->frames_in_flight = dispatch_semaphore_create(kFramesInFlight);
     impl->upscale = std::getenv("DC_NO_METALFX") == nullptr;
+    if (std::getenv("DC_NO_PACE") || !config.vsync) {
+        impl->pace = 0;
+    }
+    impl->pace_stats = std::getenv("DC_PACE_STATS") != nullptr;
 
     CAMetalLayer* l = impl->layer;
     l.device = impl->device;
@@ -313,7 +348,17 @@ void Presenter::PresentTexture(void* texture_handle, void* boost_handle) {
         [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
           dispatch_semaphore_signal(sem);
         }];
-        [cmd presentDrawable:drawable];
+        if (impl->pace > 0) {
+            [cmd presentDrawable:drawable afterMinimumDuration:impl->pace];
+        } else {
+            [cmd presentDrawable:drawable];
+        }
+        if (impl->pace_stats) {
+            Impl* self = impl.get();
+            [drawable addPresentedHandler:^(id<MTLDrawable> d) {
+              self->NotePresented(d.presentedTime);
+            }];
+        }
         [cmd commit];
     }
 }
