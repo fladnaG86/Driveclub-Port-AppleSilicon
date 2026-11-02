@@ -101,7 +101,8 @@ struct Presenter::Impl {
     // EDR: float layer, boost applied in fs_edr.
     bool edr = false;
     bool edr_boost = true;
-    float edr_gain = 4.0f, edr_knee = 0.7f;
+    // Knee at the LUT's clamp: a clear sky sits at 0.7-1.0, only above is a highlight.
+    float edr_gain = 4.0f, edr_knee = 1.0f;
     id<MTLRenderPipelineState> edr_pipeline;
     id<MTLTexture> edr_black; // Stands in when a frame has no boost map
 
