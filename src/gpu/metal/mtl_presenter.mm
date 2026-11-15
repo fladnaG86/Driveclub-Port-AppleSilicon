@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 
 #include "common/log.h"
@@ -15,6 +16,19 @@
 namespace Gpu::Metal {
 
 namespace {
+
+// Fit the game's image inside the drawable without stretching it.
+constexpr std::pair<size_t, size_t> FitSize(size_t source_w, size_t source_h,
+                                            size_t drawable_w, size_t drawable_h) {
+    if (drawable_w * source_h <= drawable_h * source_w) {
+        return {drawable_w, (drawable_w * source_h + source_w / 2) / source_w};
+    }
+    return {(drawable_h * source_w + source_h / 2) / source_h, drawable_h};
+}
+
+static_assert(FitSize(1920, 1080, 1920, 1200) == std::pair<size_t, size_t>{1920, 1080});
+static_assert(FitSize(1920, 1080, 2560, 1080) == std::pair<size_t, size_t>{1920, 1080});
+static_assert(FitSize(1280, 720, 2560, 1440) == std::pair<size_t, size_t>{2560, 1440});
 
 constexpr const char* kPresentShaderSrc = R"(
 #include <metal_stdlib>
@@ -108,12 +122,12 @@ struct Presenter::Impl {
 
     // The scaler for this frame and drawable, nil when there is nothing to
     // upscale or MetalFX can't. Rebuilt when either size changes.
-    id<MTLFXSpatialScaler> ScalerFor(id<MTLTexture> frame, id<MTLTexture> target) {
-        if (!upscale || target.width < frame.width || target.height < frame.height ||
-            (target.width == frame.width && target.height == frame.height)) {
+    id<MTLFXSpatialScaler> ScalerFor(id<MTLTexture> frame, size_t width, size_t height) {
+        if (!upscale || width < frame.width || height < frame.height ||
+            (width == frame.width && height == frame.height)) {
             return nil;
         }
-        if (scaler && scaled.width == target.width && scaled.height == target.height &&
+        if (scaler && scaled.width == width && scaled.height == height &&
             scaler.inputWidth == frame.width && scaler.inputHeight == frame.height) {
             return scaler;
         }
@@ -127,8 +141,8 @@ struct Presenter::Impl {
         MTLFXSpatialScalerDescriptor* d = [MTLFXSpatialScalerDescriptor new];
         d.inputWidth = frame.width;
         d.inputHeight = frame.height;
-        d.outputWidth = target.width;
-        d.outputHeight = target.height;
+        d.outputWidth = width;
+        d.outputHeight = height;
         d.colorTextureFormat = frame.pixelFormat;
         d.outputTextureFormat = frame.pixelFormat;
         // Frames hold the gamma-encoded bytes the PS4 would scan out.
@@ -137,8 +151,8 @@ struct Presenter::Impl {
         if (scaler) {
             MTLTextureDescriptor* t =
                 [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:frame.pixelFormat
-                                                                   width:target.width
-                                                                  height:target.height
+                                                                   width:width
+                                                                  height:height
                                                                mipmapped:NO];
             t.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
             t.storageMode = MTLStorageModePrivate;
@@ -151,8 +165,8 @@ struct Presenter::Impl {
             return nil;
         }
         DC_INFO("present: MetalFX spatial %lux%lu -> %lux%lu", (unsigned long)frame.width,
-                (unsigned long)frame.height, (unsigned long)target.width,
-                (unsigned long)target.height);
+                (unsigned long)frame.height, (unsigned long)width,
+                (unsigned long)height);
         return scaler;
     }
 };
@@ -267,6 +281,10 @@ bool Presenter::ToggleUpscaling() {
     return impl->upscale;
 }
 
+bool Presenter::UpscalingEnabled() const {
+    return impl->upscale;
+}
+
 bool Presenter::ToggleEdr() {
     impl->edr_boost = !impl->edr_boost;
     return impl->edr_boost;
@@ -318,17 +336,26 @@ void Presenter::PresentTexture(void* texture_handle, void* boost_handle) {
 
         MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = drawable.texture;
-        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        const auto [width, height] = FitSize(tex.width, tex.height,
+                                            drawable.texture.width, drawable.texture.height);
+        pass.colorAttachments[0].loadAction =
+            width == drawable.texture.width && height == drawable.texture.height
+                ? MTLLoadActionDontCare : MTLLoadActionClear;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
 
         id<MTLCommandBuffer> cmd = [impl->queue commandBuffer];
-        if (id<MTLFXSpatialScaler> scaler = impl->ScalerFor(tex, drawable.texture)) {
+        if (id<MTLFXSpatialScaler> scaler = impl->ScalerFor(tex, width, height)) {
             scaler.colorTexture = tex;
             scaler.outputTexture = impl->scaled;
             [scaler encodeToCommandBuffer:cmd];
             tex = impl->scaled;
         }
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+        const MTLViewport viewport = {static_cast<double>((drawable.texture.width - width) / 2),
+                                      static_cast<double>((drawable.texture.height - height) / 2),
+                                      static_cast<double>(width), static_cast<double>(height), 0, 1};
+        [enc setViewport:viewport];
         if (impl->edr && impl->edr_pipeline) {
             id<MTLTexture> boost = boost_handle ? (__bridge id<MTLTexture>)boost_handle : impl->edr_black;
             const float params[3] = {

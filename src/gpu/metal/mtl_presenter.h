@@ -35,6 +35,7 @@ public:
     // MetalFX spatial upscaling on/off (when the drawable is larger than the
     // frame); returns the new state.
     bool ToggleUpscaling();
+    bool UpscalingEnabled() const;
 
     // Placeholder frame: clears the drawable.
     void PresentClear(float r, float g, float b);

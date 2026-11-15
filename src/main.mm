@@ -18,6 +18,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
 
+#import <AppKit/AppKit.h>
+
 #include "common/log.h"
 #include "core/address_space.h"
 #include "core/benchmark.h"
@@ -34,6 +36,53 @@
 #include "gpu/metal/mtl_device.h"
 #include "gpu/metal/mtl_presenter.h"
 #include "gpu/metal/mtl_renderer.h"
+
+@interface MetalFXMenuController : NSObject {
+    Gpu::Metal::Presenter* presenter;
+    bool* present_again;
+    NSMenuItem* item;
+    bool shown_enabled;
+    bool has_shown;
+}
+- (instancetype)initWithPresenter:(Gpu::Metal::Presenter*)presenter
+                    presentAgain:(bool*)presentAgain
+                           item:(NSMenuItem*)item;
+- (void)toggle:(id)sender;
+- (void)refresh;
+@end
+
+@implementation MetalFXMenuController
+- (instancetype)initWithPresenter:(Gpu::Metal::Presenter*)p
+                    presentAgain:(bool*)redraw
+                           item:(NSMenuItem*)menuItem {
+    if ((self = [super init])) {
+        presenter = p;
+        present_again = redraw;
+        item = menuItem;
+        has_shown = false;
+        [self refresh];
+    }
+    return self;
+}
+
+- (void)toggle:(id)sender {
+    const bool enabled = presenter->ToggleUpscaling();
+    *present_again = true;
+    [self refresh];
+    DC_INFO("metalfx: %d", enabled);
+}
+
+- (void)refresh {
+    const bool enabled = presenter->UpscalingEnabled();
+    if (has_shown && shown_enabled == enabled) {
+        return;
+    }
+    shown_enabled = enabled;
+    has_shown = true;
+    item.title = enabled ? @"MetalFX Upscaling: On" : @"MetalFX Upscaling: Off";
+    item.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
+}
+@end
 
 namespace {
 
@@ -124,6 +173,20 @@ int Run(int argc, char** argv) {
     std::uint64_t presented_flip = 0;
     bool present_again = false;
 
+    NSMenu* graphics_menu = [[NSMenu alloc] initWithTitle:@"Graphics"];
+    NSMenuItem* metalfx_item = [[NSMenuItem alloc] initWithTitle:@"" action:@selector(toggle:)
+                                                   keyEquivalent:@""];
+    MetalFXMenuController* metalfx_menu =
+        [[MetalFXMenuController alloc] initWithPresenter:presenter.get()
+                                          presentAgain:&present_again
+                                                 item:metalfx_item];
+    metalfx_item.target = metalfx_menu;
+    [graphics_menu addItem:metalfx_item];
+    NSMenuItem* graphics_item = [[NSMenuItem alloc] initWithTitle:@"Graphics" action:nil
+                                                   keyEquivalent:@""];
+    graphics_item.submenu = graphics_menu;
+    [[NSApp mainMenu] addItem:graphics_item];
+
     bool running = true;
     while (running) {
         SDL_Event ev;
@@ -145,8 +208,7 @@ int Run(int argc, char** argv) {
                 switch (ev.key.key) {
                 case SDLK_M:
                     if (pressed) {
-                        DC_INFO("metalfx: %d", presenter->ToggleUpscaling());
-                        present_again = true;
+                        [metalfx_menu toggle:nil];
                     }
                     break;
                 case SDLK_H:
@@ -317,6 +379,7 @@ int Run(int argc, char** argv) {
             const std::uint64_t flip = renderer->FlipCount();
             if (flip != presented_flip || present_again) {
                 presenter->PresentTexture(tex, renderer->LatestBoost());
+                [metalfx_menu refresh];
                 presented_flip = flip;
                 present_again = false;
             } else {
