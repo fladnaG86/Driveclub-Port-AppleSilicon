@@ -157,6 +157,15 @@ tools/elfinfo.py extracted/Image0/eboot.bin
 tools/elfinfo.py extracted/Image0/eboot.bin --lib libSceGnmDriver
 ```
 
+## Support the project
+
+If this project is useful to you, you can support my work by buying me a coffee and/or starring this repository, which helps other Mac players find it.
+
+<p>
+  <a href="https://ko-fi.com/mauriziolante"><img src=".github/assets/support-kofi.svg" height="44" alt="Buy me a coffee on Ko-fi"></a>
+  <a href="https://www.linkedin.com/in/maurizio-lanterna-1a519323b/"><img src=".github/assets/support-linkedin.svg" height="44" alt="Maurizio on LinkedIn"></a>
+</p>
+
 ## Legal Disclaimer
 
 - **No Proprietary Game Files**: This project does not distribute, host, or link to any copyrighted material, proprietary game assets, PKG dumps, ROMs, executables (`eboot.bin`), libraries (`.prx`), engine archives (`.dat`), audio, or textures. Users must provide their own legitimately acquired copy of Driveclub (CUSA00003).
