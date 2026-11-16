@@ -111,6 +111,8 @@ Keys of the port itself:
 | `F12` | Debug: record a trace of the next frame into `../bench/f12_<frame>` |
 | `F11` | Debug: Xcode GPU capture of two frames (needs `MTL_CAPTURE_ENABLED=1`; very large) |
 
+The **Graphics → MetalFX Upscaling** menu item shows the current setting and toggles it. The `M` key updates the same item.
+
 ## Build and run
 
 You can skip this section if you use the prebuilt app (see *How to play*). To build it yourself:
